@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+*.py[cod]
+prototype_data/
+outlook_downloads/
+runtime_data/

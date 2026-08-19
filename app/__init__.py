@@ -1,0 +1,2 @@
+"""Invoice intake prototype."""
+

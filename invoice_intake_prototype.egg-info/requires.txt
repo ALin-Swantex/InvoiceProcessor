@@ -1,0 +1,10 @@
+fastapi<1,>=0.116
+httpx<1,>=0.28
+mcp<2,>=1.13
+msal<2,>=1.32
+python-dotenv<2,>=1
+uvicorn[standard]<1,>=0.35
+
+[test]
+httpx<1,>=0.28
+pytest<9,>=8
