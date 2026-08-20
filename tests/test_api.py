@@ -19,11 +19,10 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert "Company being invoiced" in home.text
     assert "Supplier invoice number" in home.text
     assert "Purchase Order number" in home.text
-    assert "Net amount" in home.text
-    assert "VAT amount" in home.text
-    assert "Total amount" in home.text
+    assert "Invoice value" in home.text
     assert "Overall confidence" in home.text
     assert "Purchase Ledger: confirm invoice" in home.text
+    assert "Manually add an invoice to Incoming Invoices" in home.text
     assert "Confirmation and automatic routing" not in home.text
     assert "Purchase Order number detected" not in home.text
     assert "Simulate incoming email" not in home.text

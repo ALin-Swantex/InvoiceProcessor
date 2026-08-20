@@ -1,4 +1,4 @@
-# Outlook MCP Setup
+# Outlook Graph Setup
 
 ## Important architecture note
 
@@ -6,19 +6,19 @@ The official Microsoft MCP Server for Enterprise is currently a preview focused
 on read-only Microsoft Entra directory data. It does not currently provide an
 Outlook invoice-email trigger.
 
-This project therefore includes a private read-only MCP server that calls
-Microsoft Graph. It exposes four tools:
+This project therefore calls Microsoft Graph directly from `app/outlook_graph.py`.
+The `OutlookGraphClient` exposes four read-only operations:
 
 - `list_invoice_emails`
 - `get_invoice_email`
 - `list_pdf_attachments`
 - `download_pdf_attachment`
 
-The tools cannot send, delete, move, or mark email as read.
+These operations cannot send, delete, move, or mark email as read.
 
-MCP is request/response based; it does not push an event when a new message
-arrives. The project now uses a Microsoft Graph change-notification webhook for
-that trigger.
+Microsoft Graph webhooks push the new-email event; the worker then calls Graph
+directly (no separate MCP server, request/response tool layer, or additional
+hop is required).
 
 ## Automatic new-email trigger
 
@@ -37,8 +37,8 @@ When Graph reports a newly created Inbox message, the notification endpoint:
 
 It deliberately does not download or process the invoice inside the webhook
 request. Microsoft expects a response within three seconds. The included worker
-claims the queued event, calls the Outlook MCP, downloads its PDFs, and creates
-the invoice records used by the web interface.
+claims the queued event, calls Microsoft Graph directly, downloads its PDFs,
+and creates the invoice records used by the web interface.
 
 ## 1. Register an Entra application
 
@@ -73,41 +73,34 @@ The project entry points load this `.env` file automatically.
 For production, use a certificate or managed identity instead of a long-lived
 client secret.
 
-## 3. Install and run the MCP server
+## 3. Install dependencies
 
 ```bash
 source .venv/bin/activate
 python -m pip install -e '.[test]'
-python -m app.outlook_mcp
 ```
 
-The default Streamable HTTP endpoint is:
-
-```text
-http://127.0.0.1:8001/mcp
-```
-
-The server validates its Outlook configuration on the first tool call. It will
-fail clearly if any required value is missing.
-
-Keep this terminal running.
+The worker and subscription CLI validate the Outlook configuration on first
+use. They fail clearly if any required value is missing.
 
 ## 4. Run the web application and worker
 
-In a second terminal, run:
+In one terminal, run:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-In a third terminal, run:
+In a second terminal, run:
 
 ```bash
 python -m app.outlook_worker
 ```
 
-The worker polls the local notification queue, connects to
-`OUTLOOK_MCP_URL`, and stores received invoice records in `INVOICE_DB_PATH`.
+The worker polls the local notification queue, calls Microsoft Graph directly
+using the `OUTLOOK_MCP_TENANT_ID` / `OUTLOOK_MCP_CLIENT_ID` /
+`OUTLOOK_MCP_CLIENT_SECRET` / `OUTLOOK_MCP_MAILBOX` settings, and stores
+received invoice records in `INVOICE_DB_PATH`.
 
 ## 5. Create the Graph subscription
 
@@ -134,7 +127,7 @@ mailbox Inbox.
 ### Local test without a public webhook
 
 For local development only, the worker can poll unread messages through the
-read-only MCP instead:
+same direct Microsoft Graph connection instead:
 
 ```dotenv
 OUTLOOK_LOCAL_POLLING_ENABLED=true
@@ -183,23 +176,7 @@ duplicate Graph delivery does not create a duplicate invoice.
 SQLite is for local development only. Production should use Azure SQL with Azure
 Service Bus or Storage Queue before processing live invoices.
 
-## 8. Configure an MCP client
-
-MCP client configuration formats differ. Use these generic values:
-
-```json
-{
-  "name": "invoice-outlook",
-  "transport": "streamable-http",
-  "url": "http://127.0.0.1:8001/mcp"
-}
-```
-
-Keep the endpoint bound to `127.0.0.1` during development. Do not expose it to a
-network without authentication, TLS, request limits, and an explicit deployment
-review.
-
-## 9. Test the complete email-to-screen flow
+## 8. Test the complete email-to-screen flow
 
 Run the mocked test suite before using credentials:
 
@@ -209,7 +186,7 @@ pytest
 
 After tenant approval:
 
-1. Confirm the MCP, web application, worker, and HTTPS tunnel are running.
+1. Confirm the web application, worker, and HTTPS tunnel are running.
 2. Set `OUTLOOK_WEBHOOK_URL` and `OUTLOOK_LIFECYCLE_URL` to the public HTTPS
    endpoints.
 3. Create the Graph subscription.
@@ -231,10 +208,10 @@ sqlite3 runtime_data/invoices.db \
   "select id,message_id,original_filename,status from invoices order by id desc limit 10;"
 ```
 
-An email without a PDF, an MCP failure, or a Graph download error is retained as
-`failed` with `last_error`. It is not silently discarded.
+An email without a PDF or a Graph download error is retained as `failed` with
+`last_error`. It is not silently discarded.
 
-## 10. Next production step
+## 9. Next production step
 
 After read-only access is proven:
 

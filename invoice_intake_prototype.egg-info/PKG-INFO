@@ -5,7 +5,6 @@ Summary: Safe prototype for receiving invoice PDFs by email
 Requires-Python: >=3.11
 Requires-Dist: fastapi<1,>=0.116
 Requires-Dist: httpx<1,>=0.28
-Requires-Dist: mcp<2,>=1.13
 Requires-Dist: msal<2,>=1.32
 Requires-Dist: python-dotenv<2,>=1
 Requires-Dist: uvicorn[standard]<1,>=0.35

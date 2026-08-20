@@ -5,8 +5,6 @@ app/environment.py
 app/invoices.py
 app/main.py
 app/outlook_graph.py
-app/outlook_mcp.py
-app/outlook_mcp_client.py
 app/outlook_notifications.py
 app/outlook_subscription.py
 app/outlook_worker.py

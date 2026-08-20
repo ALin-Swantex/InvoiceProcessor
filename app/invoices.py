@@ -28,6 +28,40 @@ CREATE INDEX IF NOT EXISTS idx_invoices_created_at
 ON invoices(created_at DESC);
 """
 
+# Columns added after the initial release. Stored as name -> SQL type so
+# they can be added with ALTER TABLE without a separate migration tool.
+# Every store instance ensures these exist on start-up.
+LIFECYCLE_COLUMNS: dict[str, str] = {
+    "sharepoint_item_id": "TEXT",
+    "sharepoint_web_url": "TEXT",
+    "irj_number": "TEXT",
+    "company": "TEXT",
+    "supplier": "TEXT",
+    "supplier_invoice_number": "TEXT",
+    "po_number": "TEXT",
+    "invoice_type": "TEXT",
+    "invoice_date": "TEXT",
+    "invoice_value": "REAL",
+    "currency": "TEXT",
+    "approver1_name": "TEXT",
+    "approver1_email": "TEXT",
+    "approver1_decision": "TEXT",
+    "approver1_date": "TEXT",
+    "approver1_comments": "TEXT",
+    "approver2_name": "TEXT",
+    "approver2_email": "TEXT",
+    "approver2_decision": "TEXT",
+    "approver2_date": "TEXT",
+    "approver2_comments": "TEXT",
+    "po_query_notes": "TEXT",
+    "payment_date": "TEXT",
+    "payment_reference": "TEXT",
+    "reconciliation_date": "TEXT",
+    "reconciliation_notes": "TEXT",
+    "rejection_reason": "TEXT",
+    "review_reason": "TEXT",
+}
+
 
 @dataclass(frozen=True)
 class InvoiceRecord:
@@ -44,6 +78,34 @@ class InvoiceRecord:
     size_bytes: int | None
     status: str
     created_at: str
+    sharepoint_item_id: str | None = None
+    sharepoint_web_url: str | None = None
+    irj_number: str | None = None
+    company: str | None = None
+    supplier: str | None = None
+    supplier_invoice_number: str | None = None
+    po_number: str | None = None
+    invoice_type: str | None = None
+    invoice_date: str | None = None
+    invoice_value: float | None = None
+    currency: str | None = None
+    approver1_name: str | None = None
+    approver1_email: str | None = None
+    approver1_decision: str | None = None
+    approver1_date: str | None = None
+    approver1_comments: str | None = None
+    approver2_name: str | None = None
+    approver2_email: str | None = None
+    approver2_decision: str | None = None
+    approver2_date: str | None = None
+    approver2_comments: str | None = None
+    po_query_notes: str | None = None
+    payment_date: str | None = None
+    payment_reference: str | None = None
+    reconciliation_date: str | None = None
+    reconciliation_notes: str | None = None
+    rejection_reason: str | None = None
+    review_reason: str | None = None
 
 
 class InvoiceStore:
@@ -52,6 +114,8 @@ class InvoiceStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            self._ensure_lifecycle_columns(connection)
+            connection.commit()
 
     def add_from_outlook(
         self,
@@ -112,12 +176,92 @@ class InvoiceStore:
             ).fetchall()
         return [InvoiceRecord(**dict(row)) for row in rows]
 
+    def list_by_status(self, statuses: list[str], limit: int = 200) -> list[InvoiceRecord]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM invoices
+                WHERE status IN ({placeholders})
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (*statuses, limit),
+            ).fetchall()
+        return [InvoiceRecord(**dict(row)) for row in rows]
+
     def get(self, invoice_id: int) -> InvoiceRecord | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM invoices WHERE id = ?", (invoice_id,)
             ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
+
+    def update_status(self, invoice_id: int, status: str) -> None:
+        self.update_fields(invoice_id, status=status)
+
+    def update_sharepoint(
+        self,
+        invoice_id: int,
+        *,
+        sharepoint_item_id: str,
+        sharepoint_web_url: str | None,
+        status: str,
+    ) -> None:
+        """Record the SharePoint item ID and web URL after a successful upload
+        or move, and update the processing status."""
+        self.update_fields(
+            invoice_id,
+            sharepoint_item_id=sharepoint_item_id,
+            sharepoint_web_url=sharepoint_web_url,
+            status=status,
+        )
+
+    def update_fields(self, invoice_id: int, **fields: object) -> InvoiceRecord:
+        """Generic column update used by the invoice lifecycle module for
+        every state transition (routing, approvals, payment, reconciliation).
+
+        Only columns declared on InvoiceRecord may be updated; anything else
+        raises immediately rather than silently failing.
+        """
+        allowed = set(InvoiceRecord.__dataclass_fields__) - {"id"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"Unknown invoice fields: {', '.join(sorted(unknown))}.")
+        if not fields:
+            record = self.get(invoice_id)
+            if record is None:
+                raise KeyError(f"Invoice {invoice_id} was not found.")
+            return record
+
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        values = list(fields.values())
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE invoices SET {assignments} WHERE id = ?",
+                (*values, invoice_id),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                raise KeyError(f"Invoice {invoice_id} was not found.")
+            row = connection.execute(
+                "SELECT * FROM invoices WHERE id = ?", (invoice_id,)
+            ).fetchone()
+        return InvoiceRecord(**dict(row))
+
+    @staticmethod
+    def _ensure_lifecycle_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(invoices)").fetchall()
+        }
+        for column, sql_type in LIFECYCLE_COLUMNS.items():
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE invoices ADD COLUMN {column} {sql_type}"
+                )
 
     @staticmethod
     def _required_string(data: dict[str, object], key: str) -> str:
@@ -153,4 +297,3 @@ class InvoiceStore:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         return connection
-

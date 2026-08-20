@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -288,3 +289,22 @@ class OutlookGraphClient:
             if not candidate.exists():
                 return candidate
             counter += 1
+
+
+def settings_from_environment() -> OutlookSettings:
+    return OutlookSettings(
+        tenant_id=os.environ.get("OUTLOOK_MCP_TENANT_ID", ""),
+        client_id=os.environ.get("OUTLOOK_MCP_CLIENT_ID", ""),
+        client_secret=os.environ.get("OUTLOOK_MCP_CLIENT_SECRET", ""),
+        mailbox=os.environ.get("OUTLOOK_MCP_MAILBOX", ""),
+        download_directory=Path(
+            os.environ.get("OUTLOOK_MCP_DOWNLOAD_DIR", "outlook_downloads")
+        ),
+        max_pdf_bytes=int(
+            os.environ.get("OUTLOOK_MCP_MAX_PDF_BYTES", str(20 * 1024 * 1024))
+        ),
+    )
+
+
+def graph_client_from_environment() -> OutlookGraphClient:
+    return OutlookGraphClient(settings_from_environment())

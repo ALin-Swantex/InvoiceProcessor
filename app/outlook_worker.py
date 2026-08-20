@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from app.environment import load_project_environment
 from app.invoices import InvoiceStore
-from app.outlook_mcp_client import OutlookMcpClient
+from app.outlook_graph import OutlookGraphClient, graph_client_from_environment
 from app.outlook_notifications import OutlookNotificationStore
 
 
@@ -28,6 +28,47 @@ class OutlookRetriever(Protocol):
     async def download_pdf_attachment(
         self, message_id: str, attachment_id: str, filename: str
     ) -> str: ...
+
+
+class OutlookGraphRetriever:
+    """Adapts the synchronous OutlookGraphClient to the async OutlookRetriever
+    interface expected by the worker, calling Microsoft Graph directly instead
+    of going through an MCP server."""
+
+    def __init__(self, graph_client: OutlookGraphClient) -> None:
+        self.graph_client = graph_client
+
+    async def list_invoice_emails(
+        self, limit: int = 20, unread_only: bool = True
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self.graph_client.list_invoice_emails,
+            limit=limit,
+            unread_only=unread_only,
+        )
+
+    async def get_invoice_email(self, message_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.graph_client.get_invoice_email, message_id
+        )
+
+    async def list_pdf_attachments(
+        self, message_id: str
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self.graph_client.list_pdf_attachments, message_id
+        )
+
+    async def download_pdf_attachment(
+        self, message_id: str, attachment_id: str, filename: str
+    ) -> str:
+        stored_path = await asyncio.to_thread(
+            self.graph_client.download_pdf_attachment,
+            message_id,
+            attachment_id,
+            filename,
+        )
+        return str(stored_path)
 
 
 class OutlookInvoiceWorker:
@@ -123,9 +164,7 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
     return OutlookInvoiceWorker(
         notification_store,
         invoice_store,
-        OutlookMcpClient(
-            os.environ.get("OUTLOOK_MCP_URL", "http://127.0.0.1:8001/mcp")
-        ),
+        OutlookGraphRetriever(graph_client_from_environment()),
     )
 
 

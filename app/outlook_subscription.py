@@ -3,27 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 
 from app.environment import load_project_environment
-from app.outlook_graph import OutlookGraphClient, OutlookSettings
+from app.outlook_graph import graph_client_from_environment
 
 
 load_project_environment()
-
-
-def graph_client_from_environment() -> OutlookGraphClient:
-    return OutlookGraphClient(
-        OutlookSettings(
-            tenant_id=os.environ.get("OUTLOOK_MCP_TENANT_ID", ""),
-            client_id=os.environ.get("OUTLOOK_MCP_CLIENT_ID", ""),
-            client_secret=os.environ.get("OUTLOOK_MCP_CLIENT_SECRET", ""),
-            mailbox=os.environ.get("OUTLOOK_MCP_MAILBOX", ""),
-            download_directory=Path(
-                os.environ.get("OUTLOOK_MCP_DOWNLOAD_DIR", "outlook_downloads")
-            ),
-        )
-    )
 
 
 def main() -> None:

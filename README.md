@@ -4,18 +4,18 @@ This project connects the first stage of the invoice workflow:
 
 1. Microsoft Graph sends a webhook when an email reaches the invoice Inbox.
 2. The web application queues the Outlook message ID.
-3. A worker calls the read-only Outlook MCP.
-4. The MCP retrieves email metadata and downloads each PDF attachment.
-5. The worker creates an invoice record.
-6. The web interface lists the received invoices and displays the selected PDF.
+3. A worker calls Microsoft Graph directly to read the email and download
+   each PDF attachment.
+4. The worker creates an invoice record.
+5. The web interface lists the received invoices and displays the selected PDF.
 
 AI extraction, SharePoint upload, Sage, approvals, and payment processing are
 not connected yet.
 
 For local testing without a public HTTPS webhook, set
 `OUTLOOK_LOCAL_POLLING_ENABLED=true`. The worker will poll unread messages
-through the same read-only Outlook MCP. Production should continue to use Graph
-webhooks.
+through the same direct Microsoft Graph connection. Production should continue
+to use Graph webhooks.
 
 ## Implemented interface
 
@@ -53,16 +53,13 @@ python3 -m pip install -e '.[test]'
 cp .env.example .env
 ```
 
-The application commands load `.env` automatically. Run the three components:
+The application commands load `.env` automatically. Run the two components:
 
 ```bash
-# Terminal 1: read-only Outlook MCP
-python -m app.outlook_mcp
-
-# Terminal 2: webhook and web interface
+# Terminal 1: webhook and web interface
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-# Terminal 3: queue worker
+# Terminal 2: queue worker (calls Microsoft Graph directly)
 python -m app.outlook_worker
 ```
 
@@ -88,23 +85,23 @@ pytest
 
 ## Integration boundary
 
-Downloaded PDFs are stored on the same local machine as the MCP and worker.
-SQLite stores the notification queue and invoice records. Production should
-replace these with managed storage/queues before processing live invoices.
+Downloaded PDFs are stored on the same local machine as the worker. SQLite
+stores the notification queue and invoice records. Production should replace
+these with managed storage/queues before processing live invoices.
 
-## Read-only Outlook MCP
+## Direct Microsoft Graph access
 
-The project includes an optional custom MCP server for reading invoice email
-metadata and PDF attachments through Microsoft Graph:
+The worker and subscription CLI call Microsoft Graph directly through
+`app/outlook_graph.py`:
 
-```bash
-python -m app.outlook_mcp
-```
+- List invoice-relevant messages and read one message's metadata.
+- List and download non-inline PDF attachments.
+- Create and renew the Inbox change-notification subscription.
 
 It does not send, delete, move, or mark email as read. See
 `OUTLOOK_MCP_SETUP.md` for Entra registration, mailbox restriction, environment
-configuration, and the distinction between MCP tool calls and the Graph email
-trigger.
+configuration, and the distinction between direct Graph calls and the Graph
+email trigger.
 
 ## Outlook new-email webhook
 
@@ -117,5 +114,5 @@ python -m app.outlook_subscription renew "$OUTLOOK_SUBSCRIPTION_ID"
 ```
 
 Graph notifications are validated and queued without downloading the PDF inside
-the webhook request. The worker performs that work through the MCP. See
-`OUTLOOK_MCP_SETUP.md` for the complete live test sequence.
+the webhook request. The worker performs that work through a direct Microsoft
+Graph call. See `OUTLOOK_MCP_SETUP.md` for the complete live test sequence.
