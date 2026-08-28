@@ -54,12 +54,18 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "approver2_date": "TEXT",
     "approver2_comments": "TEXT",
     "po_query_notes": "TEXT",
+    "po_query_category": "TEXT",
+    "po_query_contact": "TEXT",
     "payment_date": "TEXT",
     "payment_reference": "TEXT",
+    "payment_method": "TEXT",
     "reconciliation_date": "TEXT",
     "reconciliation_notes": "TEXT",
     "rejection_reason": "TEXT",
     "review_reason": "TEXT",
+    "duplicate_of_invoice_id": "INTEGER",
+    "hold_reason": "TEXT",
+    "hold_level": "INTEGER",
 }
 
 
@@ -100,12 +106,18 @@ class InvoiceRecord:
     approver2_date: str | None = None
     approver2_comments: str | None = None
     po_query_notes: str | None = None
+    po_query_category: str | None = None
+    po_query_contact: str | None = None
     payment_date: str | None = None
     payment_reference: str | None = None
+    payment_method: str | None = None
     reconciliation_date: str | None = None
     reconciliation_notes: str | None = None
     rejection_reason: str | None = None
     review_reason: str | None = None
+    duplicate_of_invoice_id: int | None = None
+    hold_reason: str | None = None
+    hold_level: int | None = None
 
 
 class InvoiceStore:

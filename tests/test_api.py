@@ -1,11 +1,23 @@
 from fastapi.testclient import TestClient
 
+from app.approval_matrix import ApprovalMatrixStore
+from app.auth import AuthStore
+from app.companies import CompanyStore
 from app.invoices import InvoiceStore
 from app.main import create_app
+from app.suppliers import SupplierStore
 
 
 def client_for(tmp_path) -> TestClient:
-    return TestClient(create_app(invoice_store=InvoiceStore(tmp_path / "invoices.db")))
+    return TestClient(
+        create_app(
+            invoice_store=InvoiceStore(tmp_path / "invoices.db"),
+            auth_store=AuthStore(tmp_path / "auth.db"),
+            companies_store=CompanyStore(tmp_path / "config.db"),
+            suppliers_store=SupplierStore(tmp_path / "config.db"),
+            approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+        )
+    )
 
 
 def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:

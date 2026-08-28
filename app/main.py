@@ -7,13 +7,26 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response as FastAPIResponse, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
-from app.approval_matrix import list_matrix
-from app.companies import list_companies
+from app.approval_matrix import ApprovalMatrixStore
+from app.auth import (
+    AuthError,
+    AuthStore,
+    ROLE_ADMIN,
+    ROLE_APPROVER_1,
+    ROLE_APPROVER_2,
+    SESSION_COOKIE_NAME,
+    User,
+    auth_store_from_environment,
+    get_current_user,
+    require_role,
+)
+from app.companies import CompanyStore
+from app.config_db import config_database_path, set_setting
 from app.environment import load_project_environment
 from app.invoice_lifecycle import InvoiceLifecycle, InvoiceLifecycleError
 from app.invoices import InvoiceStore
@@ -23,6 +36,7 @@ from app.outlook_notifications import (
     extract_message_id,
 )
 from app.sharepoint import SharePointClient
+from app.suppliers import SupplierStore
 from app.workflow import (
     ConfirmedInvoice,
     RoutingValidationError,
@@ -30,6 +44,18 @@ from app.workflow import (
 )
 
 load_project_environment()
+
+
+# ---------------------------------------------------------------------------
+# Role access map — mirrors MANUAL_VS_AUTOMATED.md. Every state-changing
+# endpoint and every admin configuration endpoint is restricted to the
+# role(s) that should be able to perform that action; read endpoints are
+# open to any signed-in user so every role can see the full pipeline (the
+# frontend nav then only surfaces the sections/actions relevant to the
+# signed-in role).
+# ---------------------------------------------------------------------------
+ROLES_PURCHASE_LEDGER_ADMIN = (ROLE_PURCHASE_LEDGER, ROLE_ADMIN)
+ROLES_APPROVERS_ADMIN = (ROLE_APPROVER_1, ROLE_APPROVER_2, ROLE_ADMIN)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +90,7 @@ class InvoiceConfirmRequest(BaseModel):
     invoice_date: str | None = None
     invoice_value: float | None = None
     currency: str | None = "GBP"
+    override_duplicate: bool = False
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -75,6 +102,8 @@ class ApprovalDecisionRequest(BaseModel):
 class PoMatchRequest(BaseModel):
     matched: bool
     notes: str | None = None
+    query_category: str | None = None
+    purchasing_contact: str | None = None
 
 
 class FlagReviewRequest(BaseModel):
@@ -84,11 +113,81 @@ class FlagReviewRequest(BaseModel):
 class PaymentRequest(BaseModel):
     payment_date: str
     payment_reference: str | None = None
+    payment_method: str | None = None
 
 
 class ReconciliationRequest(BaseModel):
     reconciliation_date: str
     notes: str | None = None
+
+
+class ResumeApprovalRequest(BaseModel):
+    resolution_notes: str | None = None
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class CompanyRequest(BaseModel):
+    name: str
+    company_folder: str
+    po_matching_folder: str
+    aliases: list[str] | None = None
+    vat_number: str | None = None
+    address: str | None = None
+
+
+class CompanyUpdateRequest(BaseModel):
+    company_folder: str | None = None
+    po_matching_folder: str | None = None
+    aliases: list[str] | None = None
+    vat_number: str | None = None
+    address: str | None = None
+
+
+class SupplierRequest(BaseModel):
+    name: str
+    aliases: list[str] | None = None
+    default_company: str | None = None
+    contact_email: str | None = None
+
+
+class SupplierUpdateRequest(BaseModel):
+    aliases: list[str] | None = None
+    default_company: str | None = None
+    contact_email: str | None = None
+
+
+class ApprovalMatrixRequest(BaseModel):
+    company: str
+    supplier: str
+    approver1_name: str
+    approver1_email: str
+    approver2_name: str | None = None
+    approver2_email: str | None = None
+
+
+class ApprovalMatrixUpdateRequest(BaseModel):
+    company: str | None = None
+    supplier: str | None = None
+    approver1_name: str | None = None
+    approver1_email: str | None = None
+    approver2_name: str | None = None
+    approver2_email: str | None = None
+
+
+class ThresholdUpdateRequest(BaseModel):
+    threshold: float
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    display_name: str
+    email: str | None = None
+    role: str
+    password: str
 
 
 def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore:
@@ -125,6 +224,10 @@ def create_app(
     sharepoint_client: SharePointClient | None = None,
     irj_generator: IrjNumberGenerator | None = None,
     activity_feed: ActivityFeedStore | None = None,
+    auth_store: AuthStore | None = None,
+    companies_store: CompanyStore | None = None,
+    suppliers_store: SupplierStore | None = None,
+    approval_matrix_store: ApprovalMatrixStore | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Invoice Intake Prototype", version="0.1.0")
     app.state.notification_store = notification_store or OutlookNotificationStore(
@@ -149,11 +252,23 @@ def create_app(
     app.state.activity_feed = activity_feed or ActivityFeedStore(
         Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
     )
+    app.state.auth_store = auth_store or auth_store_from_environment()
+    app.state.companies_store = companies_store or CompanyStore(
+        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
+    )
+    app.state.suppliers_store = suppliers_store or SupplierStore(
+        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
+    )
+    app.state.approval_matrix_store = approval_matrix_store or ApprovalMatrixStore(
+        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
+    )
     app.state.lifecycle = InvoiceLifecycle(
         app.state.invoice_store,
         app.state.irj_generator,
         app.state.activity_feed,
         app.state.sharepoint_client,
+        companies_store=app.state.companies_store,
+        approval_matrix_store=app.state.approval_matrix_store,
     )
 
     def _lifecycle() -> InvoiceLifecycle:
@@ -343,22 +458,58 @@ def create_app(
               .grid, .grid.three { grid-template-columns: 1fr; }
               header { align-items: flex-start; flex-direction: column; }
             }
+            #login-screen {
+              position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center;
+              background: #0b1f33;
+            }
+            #login-screen.hidden { display: none; }
+            .login-card {
+              width: min(360px, 90vw); background: white; border-radius: 12px;
+              padding: 1.6rem; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+            }
+            .login-card h1 { font-size: 1.1rem; margin: 0 0 .3rem; }
+            .login-card p { margin: 0 0 1rem; color: #52606d; font-size: .82rem; }
+            .login-card label { margin-bottom: .7rem; }
+            #login-error { color: #c53030; font-size: .8rem; min-height: 1.1em; margin-bottom: .5rem; }
+            #app-root.hidden { display: none; }
+            .user-chip {
+              display: flex; align-items: center; gap: .5rem;
+              padding: .3rem .7rem; border-radius: 999px; border: 1px solid #325377;
+              background: #1c3a5e; color: #bee3f8; font-size: .78rem; font-weight: 600;
+            }
+            .user-chip button {
+              background: transparent; border: 1px solid rgba(255,255,255,.4); color: white;
+              padding: .25rem .55rem; font-size: .72rem; border-radius: 999px;
+            }
+            .admin-block { margin-bottom: 1.5rem; }
+            .admin-block h3 { margin: 0 0 .6rem; font-size: .95rem; }
+            .admin-form { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .8rem; }
+            .admin-form input, .admin-form select { width: auto; flex: 1 1 140px; min-height: 36px; }
+            .admin-form button { white-space: nowrap; }
           </style>
         </head>
         <body>
           <div id="toast-container"></div>
+
+          <div id="login-screen">
+            <form class="login-card" id="login-form">
+              <h1>Invoice Processing</h1>
+              <p>Sign in with your staff account to continue.</p>
+              <div id="login-error"></div>
+              <label>Username<input id="login-username" autocomplete="username" required></label>
+              <label>Password<input id="login-password" type="password" autocomplete="current-password" required></label>
+              <button type="submit" class="primary" style="width: 100%">Sign in</button>
+            </form>
+          </div>
+
+          <div id="app-root" class="hidden">
           <header>
             <h1>Invoice Processing</h1>
             <div class="header-controls">
-              <label class="role-switcher-label" for="role-switcher">
-                🧪 Testing: view as role
-                <select id="role-switcher" class="role-switcher">
-                  <option value="purchase_ledger">Purchase Ledger</option>
-                  <option value="approver1">Approver 1</option>
-                  <option value="approver2">Approver 2</option>
-                  <option value="purchasing">Purchasing</option>
-                </select>
-              </label>
+              <span class="user-chip" id="user-chip">
+                <span id="user-chip-label">Signed in</span>
+                <button type="button" id="logout-button">Sign out</button>
+              </span>
               <div class="prototype">OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED</div>
             </div>
           </header>
@@ -367,10 +518,12 @@ def create_app(
             <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
             <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
             <button data-tab="approver2">Approver 2<span class="count" id="count-approver2">0</span></button>
+            <button data-tab="on-hold">On Hold / Query<span class="count" id="count-on-hold">0</span></button>
             <button data-tab="approved">Approved<span class="count" id="count-approved">0</span></button>
             <button data-tab="reconciliation">Bank Reconciliation<span class="count" id="count-reconciliation">0</span></button>
             <button data-tab="complete">Complete / Filed<span class="count" id="count-complete">0</span></button>
             <button data-tab="rejected">Rejected<span class="count" id="count-rejected">0</span></button>
+            <button data-tab="admin">Admin</button>
           </nav>
           <main>
             <div class="tab-panel active" data-tab-panel="incoming">
@@ -505,9 +658,14 @@ def create_app(
                         <input id="confirm-currency" value="GBP">
                       </label>
                     </div>
+                    <div class="notice" id="duplicate-warning" style="display: none; background: #fef2f2; border-color: #f5b5b5; color: #9b1c1c;">
+                      <strong>⚠</strong>
+                      <div id="duplicate-warning-text"></div>
+                    </div>
                   </div>
                   <div class="actions">
                     <button class="secondary" id="flag-review-button">Flag for review</button>
+                    <button class="danger" id="override-duplicate-button" style="display: none">This is not a duplicate — route anyway</button>
                     <button class="primary" id="confirm-invoice-button">Purchase Ledger: confirm invoice</button>
                   </div>
                 </section>
@@ -532,6 +690,13 @@ def create_app(
               <section class="card">
                 <div class="card-header"><h2>Approver 2 — Pending Approvals</h2></div>
                 <div class="content" id="approver2-table"></div>
+              </section>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="on-hold">
+              <section class="card">
+                <div class="card-header"><h2>On Hold / Approval Queries</h2></div>
+                <div class="content" id="on-hold-table"></div>
               </section>
             </div>
 
@@ -562,20 +727,98 @@ def create_app(
                 <div class="content" id="rejected-table"></div>
               </section>
             </div>
+
+            <div class="tab-panel" data-tab-panel="admin">
+              <section class="card">
+                <div class="content" id="admin-panel">
+                  <div class="admin-block">
+                    <h3>Companies</h3>
+                    <form class="admin-form" id="admin-company-form">
+                      <input id="admin-company-name" placeholder="Company name" required>
+                      <input id="admin-company-folder" placeholder="Company folder path" required>
+                      <input id="admin-company-po-folder" placeholder="PO matching folder path" required>
+                      <input id="admin-company-aliases" placeholder="Aliases (comma separated)">
+                      <button type="submit" class="primary">Add company</button>
+                    </form>
+                    <div id="admin-companies-table"></div>
+                  </div>
+
+                  <div class="admin-block">
+                    <h3>Suppliers</h3>
+                    <form class="admin-form" id="admin-supplier-form">
+                      <input id="admin-supplier-name" placeholder="Supplier name" required>
+                      <input id="admin-supplier-aliases" placeholder="Aliases (comma separated)">
+                      <input id="admin-supplier-default-company" placeholder="Default company (optional)">
+                      <input id="admin-supplier-contact" placeholder="Contact email (optional)">
+                      <button type="submit" class="primary">Add supplier</button>
+                    </form>
+                    <div id="admin-suppliers-table"></div>
+                  </div>
+
+                  <div class="admin-block">
+                    <h3>Approval matrix</h3>
+                    <form class="admin-form" id="admin-matrix-form">
+                      <input id="admin-matrix-company" placeholder="Company" required>
+                      <input id="admin-matrix-supplier" placeholder="Supplier" required>
+                      <input id="admin-matrix-approver1-name" placeholder="Approver 1 name" required>
+                      <input id="admin-matrix-approver1-email" placeholder="Approver 1 email" required>
+                      <input id="admin-matrix-approver2-name" placeholder="Approver 2 name (optional)">
+                      <input id="admin-matrix-approver2-email" placeholder="Approver 2 email (optional)">
+                      <button type="submit" class="primary">Add entry</button>
+                    </form>
+                    <div id="admin-matrix-table"></div>
+                  </div>
+
+                  <div class="admin-block">
+                    <h3>AI extraction confidence threshold</h3>
+                    <form class="admin-form" id="admin-threshold-form">
+                      <input id="admin-threshold-value" type="number" min="0" max="1" step="0.01" placeholder="0.80" style="max-width: 120px">
+                      <button type="submit" class="primary">Save threshold</button>
+                    </form>
+                  </div>
+
+                  <div class="admin-block">
+                    <h3>Users</h3>
+                    <form class="admin-form" id="admin-user-form">
+                      <input id="admin-user-username" placeholder="Username" required>
+                      <input id="admin-user-display-name" placeholder="Display name" required>
+                      <input id="admin-user-email" placeholder="Email (optional)">
+                      <select id="admin-user-role">
+                        <option value="admin">Admin</option>
+                        <option value="purchase_ledger">Purchase Ledger</option>
+                        <option value="approver1">Approver 1</option>
+                        <option value="approver2">Approver 2</option>
+                        <option value="purchasing">Purchasing</option>
+                      </select>
+                      <input id="admin-user-password" placeholder="Password" type="password" required>
+                      <button type="submit" class="primary">Add user</button>
+                    </form>
+                    <div id="admin-users-table"></div>
+                  </div>
+                </div>
+              </section>
+            </div>
           </main>
+          </div>
           <script>
             const SECTION_STATUSES = {
               "incoming": ["Awaiting AI Extraction", "Needs Review"],
               "po-matching": ["Awaiting PO Matching", "PO Query / Matching Issue"],
               "approver1": ["Awaiting Approval 1"],
               "approver2": ["Awaiting Approval 2"],
+              "on-hold": ["Approval Query / On Hold"],
               "approved": ["Approved"],
               "reconciliation": ["Paid / Awaiting Bank Reconciliation"],
               "complete": ["Reconciled / Complete"],
               "rejected": ["Rejected"],
             };
+            // Which nav tabs each signed-in role may view. "admin" is a
+            // config panel, not an invoice-status tab, and is only ever
+            // shown to the admin role. Every other tab maps 1:1 onto
+            // MANUAL_VS_AUTOMATED.md's manual decision steps.
             const ROLE_TABS = {
-              "purchase_ledger": ["incoming", "po-matching", "approved", "reconciliation", "complete", "rejected"],
+              "admin": ["incoming", "po-matching", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
+              "purchase_ledger": ["incoming", "po-matching", "on-hold", "approved", "reconciliation", "complete", "rejected"],
               "approver1": ["approver1"],
               "approver2": ["approver2"],
               "purchasing": ["po-matching"],
@@ -586,12 +829,14 @@ def create_app(
             const pdfEmpty = document.getElementById("pdf-empty");
             const documentBadge = document.getElementById("document-badge");
             const processingBadge = document.getElementById("processing-badge");
-            const roleSwitcher = document.getElementById("role-switcher");
             const toastContainer = document.getElementById("toast-container");
+            const loginScreen = document.getElementById("login-screen");
+            const appRoot = document.getElementById("app-root");
             let invoices = [];
             let displayedInvoiceId = null;
             let currentTab = "incoming";
             let lastActivityId = null;
+            let currentUser = null;
 
             function setValue(id, value) {
               const el = document.getElementById(id);
@@ -625,6 +870,25 @@ def create_app(
               document.getElementById("intake-notice").textContent =
                 invoice.review_reason ||
                 "This PDF and its email metadata were retrieved from Outlook. AI extraction has not run yet.";
+              const duplicateWarning = document.getElementById("duplicate-warning");
+              const overrideButton = document.getElementById("override-duplicate-button");
+              if (invoice.duplicate_of_invoice_id) {
+                duplicateWarning.style.display = "grid";
+                document.getElementById("duplicate-warning-text").textContent =
+                  invoice.review_reason ||
+                  `Possible duplicate of invoice #${invoice.duplicate_of_invoice_id}.`;
+                overrideButton.style.display = "";
+              } else {
+                duplicateWarning.style.display = "none";
+                overrideButton.style.display = "none";
+              }
+              setValue("confirm-company", invoice.company || "");
+              setValue("confirm-supplier", invoice.supplier);
+              setValue("confirm-supplier-invoice", invoice.supplier_invoice_number);
+              setValue("confirm-po", invoice.po_number);
+              setValue("confirm-invoice-date", invoice.invoice_date);
+              setValue("confirm-invoice-value", invoice.invoice_value);
+              setValue("confirm-currency", invoice.currency || "GBP");
               if (displayedInvoiceId !== invoice.id) {
                 pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
                 displayedInvoiceId = invoice.id;
@@ -759,6 +1023,7 @@ def create_app(
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="approve" data-level="1" data-id="${invoice.id}">Approve</button>
+                  <button data-action="hold" data-level="1" data-id="${invoice.id}" class="secondary">Hold / query</button>
                   <button data-action="reject" data-level="1" data-id="${invoice.id}" class="danger">Reject</button>
                 `
               );
@@ -769,7 +1034,17 @@ def create_app(
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="approve" data-level="2" data-id="${invoice.id}">Approve</button>
+                  <button data-action="hold" data-level="2" data-id="${invoice.id}" class="secondary">Hold / query</button>
                   <button data-action="reject" data-level="2" data-id="${invoice.id}" class="danger">Reject</button>
+                `
+              );
+              renderSectionTable(
+                "on-hold-table",
+                SECTION_STATUSES["on-hold"],
+                [...BASE_COLUMNS, { label: "Hold reason", value: i => i.hold_reason || "—" }],
+                invoice => `
+                  ${pdfLinkButton(invoice)}
+                  <button data-action="resume" data-id="${invoice.id}">Resume approval</button>
                 `
               );
               renderSectionTable(
@@ -826,7 +1101,16 @@ def create_app(
                 } else if (action === "po-query") {
                   const notes = window.prompt("Describe the PO matching issue:");
                   if (notes === null) return;
-                  await postJson(`/api/invoices/${id}/po-match`, { matched: false, notes });
+                  const queryCategory = window.prompt(
+                    "Query category (e.g. price discrepancy, missing PO, quantity mismatch):"
+                  );
+                  const purchasingContact = window.prompt("Purchasing contact to route this query to (optional):");
+                  await postJson(`/api/invoices/${id}/po-match`, {
+                    matched: false,
+                    notes,
+                    query_category: queryCategory || null,
+                    purchasing_contact: purchasingContact || null,
+                  });
                 } else if (action === "approve" || action === "reject") {
                   const comments = window.prompt(
                     action === "reject" ? "Reason for rejection:" : "Approval comments (optional):"
@@ -837,13 +1121,26 @@ def create_app(
                     decision: action === "approve" ? "approved" : "rejected",
                     comments: comments || null,
                   });
+                } else if (action === "hold") {
+                  const comments = window.prompt("Reason for placing this invoice on hold / query (required):");
+                  if (!comments) return;
+                  await postJson(`/api/invoices/${id}/approve`, {
+                    level: Number(button.dataset.level),
+                    decision: "on_hold",
+                    comments,
+                  });
+                } else if (action === "resume") {
+                  const notes = window.prompt("Resolution notes for resuming approval (optional):");
+                  await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
                 } else if (action === "pay") {
                   const paymentDate = window.prompt("Payment date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
                   if (!paymentDate) return;
                   const paymentReference = window.prompt("Payment reference (optional):");
+                  const paymentMethod = window.prompt("Payment method (e.g. BACS, CHAPS, card):");
                   await postJson(`/api/invoices/${id}/pay`, {
                     payment_date: paymentDate,
                     payment_reference: paymentReference || null,
+                    payment_method: paymentMethod || null,
                   });
                 } else if (action === "reconcile") {
                   const reconciliationDate = window.prompt("Reconciliation date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
@@ -874,6 +1171,14 @@ def create_app(
             });
 
             document.getElementById("confirm-invoice-button").addEventListener("click", async () => {
+              await submitConfirm(false);
+            });
+
+            document.getElementById("override-duplicate-button").addEventListener("click", async () => {
+              await submitConfirm(true);
+            });
+
+            async function submitConfirm(overrideDuplicate) {
               const invoiceId = picker.value;
               if (!invoiceId) return;
               const company = document.getElementById("confirm-company").value;
@@ -892,6 +1197,7 @@ def create_app(
                   ? Number(document.getElementById("confirm-invoice-value").value)
                   : null,
                 currency: document.getElementById("confirm-currency").value || "GBP",
+                override_duplicate: overrideDuplicate,
               };
               try {
                 await postJson(`/api/invoices/${invoiceId}/confirm`, body);
@@ -900,7 +1206,7 @@ def create_app(
               } catch (error) {
                 showToast(error.message, true);
               }
-            });
+            }
 
             document.getElementById("manual-upload-form").addEventListener("submit", async event => {
               event.preventDefault();
@@ -951,8 +1257,7 @@ def create_app(
               });
             });
 
-            roleSwitcher.addEventListener("change", () => {
-              const role = roleSwitcher.value;
+            function applyRoleVisibility(role) {
               const allowedTabs = ROLE_TABS[role] || Object.keys(SECTION_STATUSES);
               document.querySelectorAll("#section-nav button[data-tab]").forEach(button => {
                 const isAllowed = allowedTabs.includes(button.dataset.tab);
@@ -962,8 +1267,7 @@ def create_app(
                 const fallback = document.querySelector(`#section-nav button[data-tab="${allowedTabs[0]}"]`);
                 if (fallback) fallback.click();
               }
-            });
-            roleSwitcher.dispatchEvent(new Event("change"));
+            }
 
             async function pollActivity() {
               try {
@@ -974,7 +1278,7 @@ def create_app(
                 if (!response.ok) return;
                 const events = await response.json();
                 if (!events.length) return;
-                const currentRole = roleSwitcher.value;
+                const currentRole = currentUser ? currentUser.role : null;
                 let sawInvoiceEvent = false;
                 for (const event of events) {
                   lastActivityId = event.id;
@@ -996,34 +1300,311 @@ def create_app(
               lastActivityId = events.length ? events[events.length - 1].id : 0;
             }
 
-            loadInvoices();
-            loadCompanies();
-            initActivityCursor().then(() => {
-              setInterval(pollActivity, 3000);
+            // ---------------------------------------------------------
+            // Authentication + admin config panel
+            // ---------------------------------------------------------
+
+            function splitCommaList(value) {
+              return (value || "")
+                .split(",")
+                .map(part => part.trim())
+                .filter(Boolean);
+            }
+
+            function renderSimpleTable(container, columns, rows, onDelete, idKey = "id") {
+              if (!rows.length) {
+                container.innerHTML = '<p class="empty">Nothing here yet.</p>';
+                return;
+              }
+              const head = columns.map(c => `<th>${c.label}</th>`).join("") + (onDelete ? "<th></th>" : "");
+              const body = rows
+                .map(row => {
+                  const cells = columns.map(c => `<td>${c.value(row) ?? "—"}</td>`).join("");
+                  const deleteCell = onDelete
+                    ? `<td><button class="danger" data-delete-id="${row[idKey]}">Delete</button></td>`
+                    : "";
+                  return `<tr>${cells}${deleteCell}</tr>`;
+                })
+                .join("");
+              container.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+              if (onDelete) {
+                container.querySelectorAll("[data-delete-id]").forEach(button => {
+                  button.addEventListener("click", () => onDelete(button.dataset.deleteId));
+                });
+              }
+            }
+
+            async function loadAdminPanel() {
+              try {
+                const [companies, suppliers, matrix, threshold, users] = await Promise.all([
+                  fetch("/api/admin/companies").then(r => r.json()),
+                  fetch("/api/admin/suppliers").then(r => r.json()),
+                  fetch("/api/admin/approval-matrix").then(r => r.json()),
+                  fetch("/api/admin/ai-threshold").then(r => r.json()),
+                  fetch("/api/admin/users").then(r => r.json()),
+                ]);
+                renderSimpleTable(
+                  document.getElementById("admin-companies-table"),
+                  [
+                    { label: "Name", value: c => c.name },
+                    { label: "Invoice folder", value: c => c.company_folder },
+                    { label: "PO folder", value: c => c.po_matching_folder },
+                    { label: "Aliases", value: c => (c.aliases || []).join(", ") },
+                  ],
+                  companies,
+                  async name => {
+                    await fetch(`/api/admin/companies/${encodeURIComponent(name)}`, { method: "DELETE" });
+                    await loadAdminPanel();
+                  },
+                  "name"
+                );
+                renderSimpleTable(
+                  document.getElementById("admin-suppliers-table"),
+                  [
+                    { label: "Name", value: s => s.name },
+                    { label: "Aliases", value: s => (s.aliases || []).join(", ") },
+                    { label: "Default company", value: s => s.default_company },
+                    { label: "Contact", value: s => s.contact_email },
+                  ],
+                  suppliers,
+                  async name => {
+                    await fetch(`/api/admin/suppliers/${encodeURIComponent(name)}`, { method: "DELETE" });
+                    await loadAdminPanel();
+                  },
+                  "name"
+                );
+                renderSimpleTable(
+                  document.getElementById("admin-matrix-table"),
+                  [
+                    { label: "Company", value: m => m.company },
+                    { label: "Supplier", value: m => m.supplier },
+                    { label: "Approver 1", value: m => `${m.approver1_name} <${m.approver1_email}>` },
+                    { label: "Approver 2", value: m => (m.approver2_name ? `${m.approver2_name} <${m.approver2_email}>` : "—") },
+                  ],
+                  matrix,
+                  async id => {
+                    await fetch(`/api/admin/approval-matrix/${id}`, { method: "DELETE" });
+                    await loadAdminPanel();
+                  }
+                );
+                document.getElementById("admin-threshold-value").value = threshold.threshold ?? 0.8;
+                renderSimpleTable(
+                  document.getElementById("admin-users-table"),
+                  [
+                    { label: "Username", value: u => u.username },
+                    { label: "Display name", value: u => u.display_name },
+                    { label: "Role", value: u => u.role },
+                  ],
+                  users,
+                  async username => {
+                    await fetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: "DELETE" });
+                    await loadAdminPanel();
+                  },
+                  "username"
+                );
+              } catch (error) {
+                showToast(`Failed to load admin panel: ${error.message}`, true);
+              }
+            }
+
+            document.getElementById("admin-company-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              try {
+                await postJson("/api/admin/companies", {
+                  name: document.getElementById("admin-company-name").value,
+                  company_folder: document.getElementById("admin-company-folder").value,
+                  po_matching_folder: document.getElementById("admin-company-po-folder").value,
+                  aliases: splitCommaList(document.getElementById("admin-company-aliases").value),
+                });
+                event.target.reset();
+                await loadAdminPanel();
+              } catch (error) {
+                showToast(error.message, true);
+              }
             });
-            setInterval(loadInvoices, 5000);
+
+            document.getElementById("admin-supplier-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              try {
+                await postJson("/api/admin/suppliers", {
+                  name: document.getElementById("admin-supplier-name").value,
+                  aliases: splitCommaList(document.getElementById("admin-supplier-aliases").value),
+                  default_company: document.getElementById("admin-supplier-default-company").value || null,
+                  contact_email: document.getElementById("admin-supplier-contact").value || null,
+                });
+                event.target.reset();
+                await loadAdminPanel();
+              } catch (error) {
+                showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("admin-matrix-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              try {
+                await postJson("/api/admin/approval-matrix", {
+                  company: document.getElementById("admin-matrix-company").value,
+                  supplier: document.getElementById("admin-matrix-supplier").value,
+                  approver1_name: document.getElementById("admin-matrix-approver1-name").value,
+                  approver1_email: document.getElementById("admin-matrix-approver1-email").value,
+                  approver2_name: document.getElementById("admin-matrix-approver2-name").value || null,
+                  approver2_email: document.getElementById("admin-matrix-approver2-email").value || null,
+                });
+                event.target.reset();
+                await loadAdminPanel();
+              } catch (error) {
+                showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("admin-threshold-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              try {
+                const threshold = Number(document.getElementById("admin-threshold-value").value);
+                const response = await fetch("/api/admin/ai-threshold", {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ threshold }),
+                });
+                if (!response.ok) throw new Error("Failed to save threshold.");
+                showToast("AI confidence threshold saved.");
+              } catch (error) {
+                showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("admin-user-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              try {
+                await postJson("/api/admin/users", {
+                  username: document.getElementById("admin-user-username").value,
+                  display_name: document.getElementById("admin-user-display-name").value,
+                  email: document.getElementById("admin-user-email").value || null,
+                  role: document.getElementById("admin-user-role").value,
+                  password: document.getElementById("admin-user-password").value,
+                });
+                event.target.reset();
+                await loadAdminPanel();
+              } catch (error) {
+                showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("logout-button").addEventListener("click", async () => {
+              await fetch("/api/auth/logout", { method: "POST" });
+              currentUser = null;
+              appRoot.classList.add("hidden");
+              loginScreen.classList.remove("hidden");
+            });
+
+            document.getElementById("login-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              const errorEl = document.getElementById("login-error");
+              errorEl.textContent = "";
+              const username = document.getElementById("login-username").value;
+              const password = document.getElementById("login-password").value;
+              try {
+                const response = await fetch("/api/auth/login", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ username, password }),
+                });
+                if (!response.ok) {
+                  const detail = await response.json().catch(() => ({}));
+                  throw new Error(detail.detail || "Invalid username or password.");
+                }
+                await enterApp();
+              } catch (error) {
+                errorEl.textContent = error.message;
+              }
+            });
+
+            async function enterApp() {
+              const response = await fetch("/api/auth/me");
+              if (!response.ok) {
+                loginScreen.classList.remove("hidden");
+                appRoot.classList.add("hidden");
+                return;
+              }
+              currentUser = await response.json();
+              loginScreen.classList.add("hidden");
+              appRoot.classList.remove("hidden");
+              document.getElementById("user-chip-label").textContent =
+                `${currentUser.display_name} (${currentUser.role})`;
+              applyRoleVisibility(currentUser.role);
+              await loadInvoices();
+              await loadCompanies();
+              if (currentUser.role === "admin") await loadAdminPanel();
+              await initActivityCursor();
+              setInterval(pollActivity, 3000);
+              setInterval(loadInvoices, 5000);
+            }
+
+            enterApp();
           </script>
         </body>
         </html>
         """
+
+    # ------------------------------------------------------------------
+    # Authentication (see app/auth.py — local placeholder for Entra ID SSO)
+    # ------------------------------------------------------------------
+
+    @app.post("/api/auth/login")
+    def login(request: LoginRequest, response: FastAPIResponse) -> dict[str, object]:
+        try:
+            user = app.state.auth_store.authenticate(request.username, request.password)
+        except AuthError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+        token = app.state.auth_store.create_session(user.username)
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            token,
+            httponly=True,
+            samesite="lax",
+            max_age=12 * 60 * 60,
+        )
+        return {
+            "username": user.username,
+            "display_name": user.display_name,
+            "email": user.email,
+            "role": user.role,
+        }
+
+    @app.post("/api/auth/logout")
+    def logout(request: Request, response: FastAPIResponse) -> dict[str, str]:
+        token = request.cookies.get(SESSION_COOKIE_NAME)
+        if token:
+            app.state.auth_store.delete_session(token)
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return {"status": "signed_out"}
+
+    @app.get("/api/auth/me")
+    def me(user: User = Depends(get_current_user)) -> dict[str, object]:
+        return {
+            "username": user.username,
+            "display_name": user.display_name,
+            "email": user.email,
+            "role": user.role,
+        }
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "mode": "outlook-intake"}
 
     @app.get("/api/companies")
-    def companies() -> list[dict[str, str]]:
+    def companies(user: User = Depends(get_current_user)) -> list[dict[str, str]]:
         return [
             {
                 "name": profile.name,
                 "company_folder": profile.company_folder,
                 "po_matching_folder": profile.po_matching_folder,
             }
-            for profile in list_companies()
+            for profile in app.state.companies_store.list()
         ]
 
     @app.get("/api/approval-matrix")
-    def approval_matrix() -> list[dict[str, object]]:
+    def approval_matrix(user: User = Depends(get_current_user)) -> list[dict[str, object]]:
         return [
             {
                 "company": entry.company,
@@ -1035,15 +1616,19 @@ def create_app(
                     else None
                 ),
             }
-            for entry in list_matrix()
+            for entry in app.state.approval_matrix_store.list()
         ]
 
     @app.get("/api/activity")
-    def activity(since_id: int = Query(0, ge=0)) -> list[dict[str, object]]:
+    def activity(
+        since_id: int = Query(0, ge=0), user: User = Depends(get_current_user)
+    ) -> list[dict[str, object]]:
         return [asdict(event) for event in app.state.activity_feed.list_since(since_id)]
 
     @app.get("/api/invoices")
-    def list_invoices(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, object]]:
+    def list_invoices(
+        limit: int = Query(100, ge=1, le=500), user: User = Depends(get_current_user)
+    ) -> list[dict[str, object]]:
         return [asdict(invoice) for invoice in app.state.invoice_store.list(limit)]
 
     @app.post("/api/invoices/manual-upload")
@@ -1053,6 +1638,7 @@ def create_app(
         sender_address: str | None = Form(None),
         subject: str | None = Form(None),
         received_at: str | None = Form(None),
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
     ) -> dict[str, object]:
         """Manually add an invoice PDF into the same Incoming Invoices
         workflow used for Outlook-sourced invoices, per SOFTWARE_SPEC.md
@@ -1119,14 +1705,16 @@ def create_app(
         return asdict(record)
 
     @app.get("/api/invoices/{invoice_id}")
-    def get_invoice(invoice_id: int) -> dict[str, object]:
+    def get_invoice(invoice_id: int, user: User = Depends(get_current_user)) -> dict[str, object]:
         invoice = app.state.invoice_store.get(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice was not found.")
         return asdict(invoice)
 
     @app.get("/api/invoices/{invoice_id}/pdf")
-    def get_invoice_pdf(invoice_id: int) -> FileResponse:
+    def get_invoice_pdf(
+        invoice_id: int, user: User = Depends(get_current_user)
+    ) -> FileResponse:
         invoice = app.state.invoice_store.get(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice was not found.")
@@ -1141,7 +1729,9 @@ def create_app(
         )
 
     @app.post("/api/invoices/{invoice_id}/extract")
-    def extract_invoice(invoice_id: int) -> dict[str, object]:
+    def extract_invoice(
+        invoice_id: int, user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN))
+    ) -> dict[str, object]:
         try:
             record = _lifecycle().run_extraction(invoice_id)
         except InvoiceLifecycleError as error:
@@ -1150,7 +1740,9 @@ def create_app(
 
     @app.post("/api/invoices/{invoice_id}/confirm")
     def confirm_and_route_invoice(
-        invoice_id: int, request: InvoiceConfirmRequest
+        invoice_id: int,
+        request: InvoiceConfirmRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
     ) -> dict[str, object]:
         try:
             record = _lifecycle().confirm_and_route(
@@ -1162,23 +1754,48 @@ def create_app(
                 invoice_date=request.invoice_date,
                 invoice_value=request.invoice_value,
                 currency=request.currency,
+                override_duplicate=request.override_duplicate,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/po-match")
-    def po_match_invoice(invoice_id: int, request: PoMatchRequest) -> dict[str, object]:
+    def po_match_invoice(
+        invoice_id: int,
+        request: PoMatchRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
         try:
             record = _lifecycle().record_po_match(
-                invoice_id, matched=request.matched, notes=request.notes
+                invoice_id,
+                matched=request.matched,
+                notes=request.notes,
+                query_category=request.query_category,
+                purchasing_contact=request.purchasing_contact,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/approve")
-    def approve_invoice(invoice_id: int, request: ApprovalDecisionRequest) -> dict[str, object]:
+    def approve_invoice(
+        invoice_id: int,
+        request: ApprovalDecisionRequest,
+        user: User = Depends(require_role(*ROLES_APPROVERS_ADMIN)),
+    ) -> dict[str, object]:
+        # Approver 1 may only decide level-1 approvals, Approver 2 only
+        # level-2 -- per MANUAL_VS_AUTOMATED.md each approver is a distinct
+        # human decision step and must not be able to act on the other
+        # level. Admin may act at either level (support/break-glass).
+        if user.role == ROLE_APPROVER_1 and request.level != 1:
+            raise HTTPException(
+                status_code=403, detail="Approver 1 can only decide level-1 approvals."
+            )
+        if user.role == ROLE_APPROVER_2 and request.level != 2:
+            raise HTTPException(
+                status_code=403, detail="Approver 2 can only decide level-2 approvals."
+            )
         try:
             record = _lifecycle().decide_approval(
                 invoice_id,
@@ -1190,9 +1807,25 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
+    @app.post("/api/invoices/{invoice_id}/resume-approval")
+    def resume_approval_invoice(
+        invoice_id: int,
+        request: ResumeApprovalRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().resume_approval(
+                invoice_id, resolution_notes=request.resolution_notes
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
     @app.post("/api/invoices/{invoice_id}/flag-review")
     def flag_invoice_for_review(
-        invoice_id: int, request: FlagReviewRequest
+        invoice_id: int,
+        request: FlagReviewRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
     ) -> dict[str, object]:
         try:
             record = _lifecycle().flag_for_review(invoice_id, reason=request.reason)
@@ -1201,19 +1834,28 @@ def create_app(
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/pay")
-    def pay_invoice(invoice_id: int, request: PaymentRequest) -> dict[str, object]:
+    def pay_invoice(
+        invoice_id: int,
+        request: PaymentRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
         try:
             record = _lifecycle().mark_paid(
                 invoice_id,
                 payment_date=request.payment_date,
                 payment_reference=request.payment_reference,
+                payment_method=request.payment_method,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/reconcile")
-    def reconcile_invoice(invoice_id: int, request: ReconciliationRequest) -> dict[str, object]:
+    def reconcile_invoice(
+        invoice_id: int,
+        request: ReconciliationRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
         try:
             record = _lifecycle().mark_reconciled(
                 invoice_id,
@@ -1223,6 +1865,206 @@ def create_app(
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
+
+    # ------------------------------------------------------------------
+    # Admin configuration — Companies, Suppliers, Approval Matrix, AI
+    # confidence threshold, and user management. All admin-only (see
+    # SOFTWARE_SPEC.md section 7: config must be maintainable by an
+    # authorised staff member without touching code).
+    # ------------------------------------------------------------------
+
+    @app.get("/api/admin/companies")
+    def admin_list_companies(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> list[dict[str, object]]:
+        return [asdict(profile) for profile in app.state.companies_store.list()]
+
+    @app.post("/api/admin/companies")
+    def admin_create_company(
+        request: CompanyRequest, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, object]:
+        try:
+            profile = app.state.companies_store.create(**request.model_dump())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(profile)
+
+    @app.put("/api/admin/companies/{name}")
+    def admin_update_company(
+        name: str,
+        request: CompanyUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        try:
+            profile = app.state.companies_store.update(name, **fields)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(profile)
+
+    @app.delete("/api/admin/companies/{name}")
+    def admin_delete_company(
+        name: str, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, str]:
+        try:
+            app.state.companies_store.delete(name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"status": "deleted"}
+
+    @app.get("/api/admin/suppliers")
+    def admin_list_suppliers(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> list[dict[str, object]]:
+        return [asdict(profile) for profile in app.state.suppliers_store.list()]
+
+    @app.post("/api/admin/suppliers")
+    def admin_create_supplier(
+        request: SupplierRequest, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, object]:
+        try:
+            profile = app.state.suppliers_store.create(**request.model_dump())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(profile)
+
+    @app.put("/api/admin/suppliers/{name}")
+    def admin_update_supplier(
+        name: str,
+        request: SupplierUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        try:
+            profile = app.state.suppliers_store.update(name, **fields)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(profile)
+
+    @app.delete("/api/admin/suppliers/{name}")
+    def admin_delete_supplier(
+        name: str, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, str]:
+        try:
+            app.state.suppliers_store.delete(name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"status": "deleted"}
+
+    @app.get("/api/admin/approval-matrix")
+    def admin_list_approval_matrix(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "id": entry.id,
+                "company": entry.company,
+                "supplier": entry.supplier,
+                "approver1_name": entry.approver1.name,
+                "approver1_email": entry.approver1.email,
+                "approver2_name": entry.approver2.name if entry.approver2 else None,
+                "approver2_email": entry.approver2.email if entry.approver2 else None,
+            }
+            for entry in app.state.approval_matrix_store.list()
+        ]
+
+    @app.post("/api/admin/approval-matrix")
+    def admin_create_approval_matrix_entry(
+        request: ApprovalMatrixRequest, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, object]:
+        try:
+            entry = app.state.approval_matrix_store.create(**request.model_dump())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {
+            "id": entry.id,
+            "company": entry.company,
+            "supplier": entry.supplier,
+            "approver1_name": entry.approver1.name,
+            "approver1_email": entry.approver1.email,
+            "approver2_name": entry.approver2.name if entry.approver2 else None,
+            "approver2_email": entry.approver2.email if entry.approver2 else None,
+        }
+
+    @app.put("/api/admin/approval-matrix/{entry_id}")
+    def admin_update_approval_matrix_entry(
+        entry_id: int,
+        request: ApprovalMatrixUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        try:
+            entry = app.state.approval_matrix_store.update(entry_id, **fields)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {
+            "id": entry.id,
+            "company": entry.company,
+            "supplier": entry.supplier,
+            "approver1_name": entry.approver1.name,
+            "approver1_email": entry.approver1.email,
+            "approver2_name": entry.approver2.name if entry.approver2 else None,
+            "approver2_email": entry.approver2.email if entry.approver2 else None,
+        }
+
+    @app.delete("/api/admin/approval-matrix/{entry_id}")
+    def admin_delete_approval_matrix_entry(
+        entry_id: int, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, str]:
+        try:
+            app.state.approval_matrix_store.delete(entry_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"status": "deleted"}
+
+    @app.get("/api/admin/ai-threshold")
+    def admin_get_ai_threshold(user: User = Depends(require_role(ROLE_ADMIN))) -> dict[str, float]:
+        from app.ai_extraction import confidence_threshold
+
+        return {"threshold": confidence_threshold()}
+
+    @app.put("/api/admin/ai-threshold")
+    def admin_set_ai_threshold(
+        request: ThresholdUpdateRequest, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, float]:
+        if not 0.0 <= request.threshold <= 1.0:
+            raise HTTPException(status_code=422, detail="Threshold must be between 0.0 and 1.0.")
+        set_setting(
+            "ai_confidence_threshold", str(request.threshold), database_path=config_database_path()
+        )
+        return {"threshold": request.threshold}
+
+    @app.get("/api/admin/users")
+    def admin_list_users(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> list[dict[str, object]]:
+        return [asdict(u) for u in app.state.auth_store.list_users()]
+
+    @app.post("/api/admin/users")
+    def admin_create_user(
+        request: UserCreateRequest, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, object]:
+        try:
+            created = app.state.auth_store.create_user(**request.model_dump())
+        except AuthError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(created)
+
+    @app.delete("/api/admin/users/{username}")
+    def admin_delete_user(
+        username: str, user: User = Depends(require_role(ROLE_ADMIN))
+    ) -> dict[str, str]:
+        try:
+            app.state.auth_store.delete_user(username)
+        except AuthError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"status": "deleted"}
 
     @app.post("/api/outlook/notifications")
     async def outlook_notifications(
