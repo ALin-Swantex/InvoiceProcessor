@@ -3,6 +3,7 @@ from pathlib import Path
 import httpx
 from fastapi.testclient import TestClient
 
+from app.auth import AuthStore
 from app.main import create_app
 from app.outlook_graph import OutlookGraphClient, OutlookSettings
 from app.outlook_notifications import OutlookNotificationStore
@@ -16,7 +17,11 @@ def webhook_client(
 ) -> tuple[TestClient, OutlookNotificationStore]:
     store = OutlookNotificationStore(tmp_path / "notifications.db")
     client = TestClient(
-        create_app(notification_store=store, webhook_client_state=CLIENT_STATE)
+        create_app(
+            notification_store=store,
+            webhook_client_state=CLIENT_STATE,
+            auth_store=AuthStore(tmp_path / "auth.db"),
+        )
     )
     return client, store
 

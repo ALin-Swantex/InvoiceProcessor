@@ -11,8 +11,11 @@ from app.activity_feed import (
     ActivityFeedStore,
 )
 from app.ai_extraction import run_ai_extraction
-from app.approval_matrix import find_approvers
-from app.companies import get_company
+from app.approval_matrix import ApprovalMatrixStore
+from app.approval_matrix import find_approvers as _default_find_approvers
+from app.companies import CompanyStore
+from app.companies import get_company as _default_get_company
+from app.duplicates import find_possible_duplicate
 from app.email_notifications import send_email_notification
 from app.invoices import InvoiceRecord, InvoiceStore
 from app.irj import IrjNumberGenerator
@@ -36,6 +39,15 @@ class InvoiceLifecycle:
     SharePoint move is simply skipped and recorded as a pending integration
     step in the activity feed, so the rest of the process can be tested
     before SharePoint credentials exist.
+
+    `companies_store` / `approval_matrix_store` are optional. When omitted,
+    the module-level default stores (the process-wide singletons in
+    app/companies.py and app/approval_matrix.py) are used, which is fine for
+    a single running server. Pass explicit stores (e.g. the same instances
+    attached to app.state) when isolation matters, such as in tests, so
+    admin edits made through /api/admin/* are immediately visible here
+    instead of going through a different singleton bound to a different
+    database file.
     """
 
     def __init__(
@@ -44,11 +56,25 @@ class InvoiceLifecycle:
         irj_generator: IrjNumberGenerator,
         activity_feed: ActivityFeedStore,
         sharepoint_client: SharePointClient | None,
+        companies_store: CompanyStore | None = None,
+        approval_matrix_store: ApprovalMatrixStore | None = None,
     ) -> None:
         self.invoice_store = invoice_store
         self.irj_generator = irj_generator
         self.activity_feed = activity_feed
         self.sharepoint_client = sharepoint_client
+        self.companies_store = companies_store
+        self.approval_matrix_store = approval_matrix_store
+
+    def _get_company(self, name: str):
+        if self.companies_store is not None:
+            return self.companies_store.get(name)
+        return _default_get_company(name)
+
+    def _find_approvers(self, company: str, supplier: str):
+        if self.approval_matrix_store is not None:
+            return self.approval_matrix_store.find(company, supplier)
+        return _default_find_approvers(company, supplier)
 
     # ------------------------------------------------------------------
     # Stage 1: AI extraction (placeholder)
@@ -105,14 +131,60 @@ class InvoiceLifecycle:
         invoice_date: str | None,
         invoice_value: float | None,
         currency: str | None,
+        override_duplicate: bool = False,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
-        company_profile = get_company(company)
+        company_profile = self._get_company(company)
         if company_profile is None:
             raise InvoiceLifecycleError(
                 f"'{company}' is not a recognised company. Add it to app/companies.py "
                 "(or the production Companies SharePoint List) first."
             )
+
+        # Stage 6 (GENERAL_PROCESS.md): duplicate detection on
+        # Company + Supplier + Supplier Invoice Number. A possible duplicate
+        # is NEVER silently dropped or auto-merged -- it is flagged for
+        # Purchase Ledger, who can then set override_duplicate=True (via the
+        # "This is not a duplicate" action) once they have manually
+        # confirmed it is a genuinely separate invoice.
+        if not override_duplicate:
+            duplicate = find_possible_duplicate(
+                self.invoice_store,
+                exclude_invoice_id=invoice_id,
+                company=company,
+                supplier=supplier,
+                supplier_invoice_number=supplier_invoice_number,
+            )
+            if duplicate is not None:
+                record = self.invoice_store.update_fields(
+                    invoice_id,
+                    company=company,
+                    supplier=supplier,
+                    supplier_invoice_number=supplier_invoice_number,
+                    po_number=purchase_order_number or None,
+                    invoice_date=invoice_date,
+                    invoice_value=invoice_value,
+                    currency=currency,
+                    status="Needs Review",
+                    duplicate_of_invoice_id=duplicate.invoice_id,
+                    review_reason=(
+                        f"Possible duplicate of invoice #{duplicate.invoice_id} "
+                        f"(IRJ {duplicate.irj_number or 'not yet assigned'}, "
+                        f"status {duplicate.status}). Purchase Ledger must "
+                        "confirm this is a genuinely separate invoice before it "
+                        "can be routed."
+                    ),
+                )
+                self.activity_feed.add_event(
+                    event_type="possible_duplicate",
+                    target_role=ROLE_PURCHASE_LEDGER,
+                    message=(
+                        f"Invoice {invoice.original_filename} looks like a possible "
+                        f"duplicate of invoice #{duplicate.invoice_id}."
+                    ),
+                    invoice_id=invoice_id,
+                )
+                return record
 
         irj_number = self.irj_generator.generate()
         try:
@@ -163,7 +235,7 @@ class InvoiceLifecycle:
             )
             return record
 
-        entry = find_approvers(company, supplier)
+        entry = self._find_approvers(company, supplier)
         if entry is None:
             record = self.invoice_store.update_fields(
                 invoice_id,
@@ -215,7 +287,13 @@ class InvoiceLifecycle:
     # ------------------------------------------------------------------
 
     def record_po_match(
-        self, invoice_id: int, *, matched: bool, notes: str | None
+        self,
+        invoice_id: int,
+        *,
+        matched: bool,
+        notes: str | None,
+        query_category: str | None = None,
+        purchasing_contact: str | None = None,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
         if invoice.status not in ("Awaiting PO Matching", "PO Query / Matching Issue"):
@@ -234,13 +312,25 @@ class InvoiceLifecycle:
             )
             return record
 
+        # GENERAL_PROCESS.md "Matching issue": Purchase Ledger records a
+        # query category, details, and the Purchasing contact who will
+        # investigate. The invoice stays outstanding -- it must not be
+        # registered in Sage or moved to Approved -- until the query is
+        # resolved and record_po_match is called again with matched=True.
         record = self.invoice_store.update_fields(
-            invoice_id, status="PO Query / Matching Issue", po_query_notes=notes
+            invoice_id,
+            status="PO Query / Matching Issue",
+            po_query_notes=notes,
+            po_query_category=query_category,
+            po_query_contact=purchasing_contact,
         )
         self.activity_feed.add_event(
             event_type="po_query",
             target_role=ROLE_PURCHASING,
-            message=f"Invoice {invoice.irj_number}: PO matching issue — {notes or 'see notes'}.",
+            message=(
+                f"Invoice {invoice.irj_number}: PO matching issue"
+                f"{f' ({query_category})' if query_category else ''} — {notes or 'see notes'}."
+            ),
             invoice_id=invoice_id,
         )
         return record
@@ -259,8 +349,10 @@ class InvoiceLifecycle:
     ) -> InvoiceRecord:
         if level not in (1, 2):
             raise InvoiceLifecycleError("Approval level must be 1 or 2.")
-        if decision not in ("approved", "rejected"):
-            raise InvoiceLifecycleError("Decision must be 'approved' or 'rejected'.")
+        if decision not in ("approved", "rejected", "on_hold"):
+            raise InvoiceLifecycleError(
+                "Decision must be 'approved', 'rejected', or 'on_hold'."
+            )
 
         invoice = self._require_invoice(invoice_id)
         expected_status = f"Awaiting Approval {level}"
@@ -270,6 +362,35 @@ class InvoiceLifecycle:
             )
 
         now = datetime.now(timezone.utc).isoformat()
+
+        if decision == "on_hold":
+            # SOFTWARE_SPEC.md section 8: approvers can place an invoice on
+            # hold with a required comment (e.g. "price under query", "waiting
+            # for a credit note") so Purchase Ledger can see why approval is
+            # delayed without having to chase the approver separately. The
+            # invoice never proceeds automatically from here -- Purchase
+            # Ledger must call resume_approval once the issue is resolved.
+            if not comments:
+                raise InvoiceLifecycleError(
+                    "A comment explaining the hold is required."
+                )
+            fields = {
+                "status": "Approval Query / On Hold",
+                "hold_level": level,
+                "hold_reason": comments,
+                f"approver{level}_comments": comments,
+            }
+            record = self.invoice_store.update_fields(invoice_id, **fields)
+            self.activity_feed.add_event(
+                event_type="approval_on_hold",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Invoice {invoice.irj_number}: Approver {level} placed it "
+                    f"on hold — {comments}"
+                ),
+                invoice_id=invoice_id,
+            )
+            return record
 
         if decision == "rejected":
             fields = {
@@ -327,6 +448,38 @@ class InvoiceLifecycle:
         )
         return record
 
+    def resume_approval(self, invoice_id: int, *, resolution_notes: str | None) -> InvoiceRecord:
+        """Purchase Ledger resumes an invoice that an approver placed on
+        hold, once the underlying question has been resolved. This always
+        returns the invoice to the same approval level it was held at --
+        never auto-approves it."""
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Approval Query / On Hold":
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} is not on hold (status: {invoice.status})."
+            )
+        level = invoice.hold_level or 1
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status=f"Awaiting Approval {level}",
+            hold_reason=(
+                f"{invoice.hold_reason or ''} — resolved by Purchase Ledger: "
+                f"{resolution_notes}"
+                if resolution_notes
+                else invoice.hold_reason
+            ),
+        )
+        self.activity_feed.add_event(
+            event_type="approval_resumed",
+            target_role=ROLE_APPROVER_1 if level == 1 else ROLE_APPROVER_2,
+            message=(
+                f"Invoice {invoice.irj_number}: hold resolved, awaiting "
+                f"Approver {level} again."
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
     # ------------------------------------------------------------------
     # Manual review flag
     # ------------------------------------------------------------------
@@ -349,7 +502,12 @@ class InvoiceLifecycle:
     # ------------------------------------------------------------------
 
     def mark_paid(
-        self, invoice_id: int, *, payment_date: str, payment_reference: str | None
+        self,
+        invoice_id: int,
+        *,
+        payment_date: str,
+        payment_reference: str | None,
+        payment_method: str | None = None,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
         if invoice.status != "Approved":
@@ -361,6 +519,7 @@ class InvoiceLifecycle:
             status="Paid / Awaiting Bank Reconciliation",
             payment_date=payment_date,
             payment_reference=payment_reference,
+            payment_method=payment_method,
         )
         self.activity_feed.add_event(
             event_type="paid",
