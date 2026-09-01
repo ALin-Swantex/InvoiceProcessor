@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.activity_feed import ActivityFeedStore
 from app.auth import AuthStore
 from app.invoices import InvoiceStore
 from app.main import create_app
@@ -90,7 +91,14 @@ def test_worker_persists_outlook_pdf_and_completes_notification(
     assert completed[0].attempts == 1
 
     client = TestClient(
-        create_app(invoice_store=invoices, auth_store=AuthStore(tmp_path / "auth.db"))
+        create_app(
+            invoice_store=invoices,
+            auth_store=AuthStore(tmp_path / "auth.db"),
+            activity_feed=ActivityFeedStore(tmp_path / "activity_feed.db"),
+            notification_store=OutlookNotificationStore(
+                tmp_path / "outlook_notifications.db"
+            ),
+        )
     )
     login = client.post(
         "/api/auth/login",

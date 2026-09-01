@@ -1,10 +1,12 @@
 from fastapi.testclient import TestClient
 
+from app.activity_feed import ActivityFeedStore
 from app.approval_matrix import ApprovalMatrixStore
 from app.auth import AuthStore
 from app.companies import CompanyStore
 from app.invoices import InvoiceStore
 from app.main import create_app
+from app.outlook_notifications import OutlookNotificationStore
 from app.suppliers import SupplierStore
 
 
@@ -16,6 +18,10 @@ def client_for(tmp_path) -> TestClient:
             companies_store=CompanyStore(tmp_path / "config.db"),
             suppliers_store=SupplierStore(tmp_path / "config.db"),
             approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+            activity_feed=ActivityFeedStore(tmp_path / "activity_feed.db"),
+            notification_store=OutlookNotificationStore(
+                tmp_path / "outlook_notifications.db"
+            ),
         )
     )
 

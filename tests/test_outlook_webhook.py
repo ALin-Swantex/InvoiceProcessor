@@ -3,7 +3,9 @@ from pathlib import Path
 import httpx
 from fastapi.testclient import TestClient
 
+from app.activity_feed import ActivityFeedStore
 from app.auth import AuthStore
+from app.invoices import InvoiceStore
 from app.main import create_app
 from app.outlook_graph import OutlookGraphClient, OutlookSettings
 from app.outlook_notifications import OutlookNotificationStore
@@ -21,6 +23,8 @@ def webhook_client(
             notification_store=store,
             webhook_client_state=CLIENT_STATE,
             auth_store=AuthStore(tmp_path / "auth.db"),
+            invoice_store=InvoiceStore(tmp_path / "invoices.db"),
+            activity_feed=ActivityFeedStore(tmp_path / "activity_feed.db"),
         )
     )
     return client, store

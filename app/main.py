@@ -259,7 +259,21 @@ def create_app(
         else os.environ.get("OUTLOOK_WEBHOOK_CLIENT_STATE", "")
     )
     app.state.sharepoint_client = sharepoint_client
-    app.state.irj_generator = irj_generator or IrjNumberGenerator(invoice_db_path)
+    # The IRJ generator must share a database with whichever invoice_store is
+    # actually in use (see app/irj.py docstring) so IRJ numbering and invoice
+    # records stay in the same file. Previously this always fell back to
+    # invoice_db_path (the env-derived default), completely ignoring a custom
+    # invoice_store passed in by a caller -- e.g. every pytest run injected an
+    # isolated tmp_path InvoiceStore but the IRJ generator (and, via the same
+    # bug, the activity feed below) still silently pointed at the real
+    # runtime_data/invoices.db and runtime_data/activity_feed.db. That meant
+    # every test run permanently bumped the *production* IRJ sequence and
+    # wrote fabricated "approval_pending" / "approved" / "paid" / "reconciled"
+    # activity events into the *live* Activity Feed the user actually
+    # watches in the app -- making genuinely still-pending invoices look like
+    # they had skipped approvers and gone straight to Approved.
+    irj_db_path = getattr(app.state.invoice_store, "database_path", invoice_db_path)
+    app.state.irj_generator = irj_generator or IrjNumberGenerator(irj_db_path)
     app.state.activity_feed = activity_feed or ActivityFeedStore(
         Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
     )

@@ -6,15 +6,21 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.activity_feed import ActivityFeedStore
 from app.approval_matrix import ApprovalMatrixStore
 from app.auth import AuthStore
 from app.companies import CompanyStore
 from app.invoices import InvoiceStore
 from app.main import create_app
+from app.outlook_notifications import OutlookNotificationStore
 from app.suppliers import SupplierStore
 
 
 def make_client(tmp_path: Path) -> TestClient:
+    # Every store must be pointed at tmp_path -- create_app() otherwise
+    # falls back to the real runtime_data/*.db files, which would let test
+    # runs silently write fabricated invoices/IRJ numbers/activity events
+    # into whatever the live dev server is using.
     return TestClient(
         create_app(
             invoice_store=InvoiceStore(tmp_path / "invoices.db"),
@@ -22,6 +28,10 @@ def make_client(tmp_path: Path) -> TestClient:
             companies_store=CompanyStore(tmp_path / "config.db"),
             suppliers_store=SupplierStore(tmp_path / "config.db"),
             approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+            activity_feed=ActivityFeedStore(tmp_path / "activity_feed.db"),
+            notification_store=OutlookNotificationStore(
+                tmp_path / "outlook_notifications.db"
+            ),
         )
     )
 
