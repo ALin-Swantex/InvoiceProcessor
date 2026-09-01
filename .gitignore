@@ -7,3 +7,5 @@ prototype_data/
 outlook_downloads/
 runtime_data/
 manual_uploads/
+
+*.egg-info/
