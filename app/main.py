@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import uuid
@@ -44,6 +45,15 @@ from app.workflow import (
 )
 
 load_project_environment()
+
+logger = logging.getLogger("invoice_processor")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    # Uvicorn does not configure the root logger, so without our own handler
+    # these INFO-level startup/mode messages would be silently dropped.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
+    logger.addHandler(_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +249,7 @@ def create_app(
         )
     )
     invoice_db_path = Path(os.environ.get("INVOICE_DB_PATH", "runtime_data/invoices.db"))
+    invoice_store_backend = os.environ.get("INVOICE_STORE_BACKEND", "sqlite").strip().lower()
     app.state.invoice_store = invoice_store or _build_invoice_store_from_environment(
         invoice_db_path
     )
@@ -270,22 +281,43 @@ def create_app(
         companies_store=app.state.companies_store,
         approval_matrix_store=app.state.approval_matrix_store,
     )
+    app.state.sharepoint_attach_attempted = app.state.sharepoint_client is not None
+
+    logger.info(
+        "Invoice Processor starting: invoice store backend=%s, SharePoint filing=%s",
+        invoice_store_backend,
+        "pre-configured" if app.state.sharepoint_client is not None else "not yet configured",
+    )
 
     def _lifecycle() -> InvoiceLifecycle:
         # Lazily attach a SharePoint client from the environment the first
         # time it is needed, so tests that never touch SharePoint never pay
         # for constructing one, but real deployments pick up .env values
-        # without an explicit override.
+        # without an explicit override. Only attempt this once per process
+        # -- if SharePoint isn't configured, retrying on every request would
+        # just repeat the same failure silently.
         current: InvoiceLifecycle = app.state.lifecycle
-        if current.sharepoint_client is None and app.state.sharepoint_client is None:
+        if (
+            current.sharepoint_client is None
+            and app.state.sharepoint_client is None
+            and not app.state.sharepoint_attach_attempted
+        ):
+            app.state.sharepoint_attach_attempted = True
             try:
                 from app.sharepoint import sharepoint_client_from_environment
 
                 client = sharepoint_client_from_environment()
                 app.state.sharepoint_client = client
                 current.sharepoint_client = client
-            except Exception:
-                pass
+                logger.info("SharePoint client configured; invoice PDFs will be filed centrally.")
+            except Exception as error:
+                logger.info(
+                    "SharePoint filing disabled (%s: %s). Running in local test mode -- "
+                    "invoices will complete their workflow locally without being filed "
+                    "in SharePoint.",
+                    type(error).__name__,
+                    error,
+                )
         return current
 
     @app.get("/", response_class=HTMLResponse)
