@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS approval_matrix (
     UNIQUE(company, supplier)
 );
 
+CREATE TABLE IF NOT EXISTS supplier_terms (
+    company TEXT NOT NULL,
+    supplier TEXT NOT NULL,
+    supplier_account_number TEXT,
+    default_payment_method TEXT,
+    payment_terms_notice TEXT,
+    bank_account TEXT,
+    PRIMARY KEY (company, supplier)
+);
+
 CREATE TABLE IF NOT EXISTS process_configuration (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

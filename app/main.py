@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import secrets
@@ -26,6 +27,7 @@ from app.auth import (
     get_current_user,
     require_role,
 )
+from app.bulk_import import import_supplier_workbook
 from app.companies import CompanyStore
 from app.config_db import config_database_path, set_setting
 from app.environment import load_project_environment
@@ -38,6 +40,7 @@ from app.outlook_notifications import (
 )
 from app.sharepoint import SharePointClient
 from app.suppliers import SupplierStore
+from app.supplier_terms import SupplierTermsStore
 from app.workflow import (
     ConfirmedInvoice,
     RoutingValidationError,
@@ -238,6 +241,7 @@ def create_app(
     companies_store: CompanyStore | None = None,
     suppliers_store: SupplierStore | None = None,
     approval_matrix_store: ApprovalMatrixStore | None = None,
+    supplier_terms_store: SupplierTermsStore | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Invoice Intake Prototype", version="0.1.0")
     app.state.notification_store = notification_store or OutlookNotificationStore(
@@ -285,6 +289,9 @@ def create_app(
         Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
     )
     app.state.approval_matrix_store = approval_matrix_store or ApprovalMatrixStore(
+        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
+    )
+    app.state.supplier_terms_store = supplier_terms_store or SupplierTermsStore(
         Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
     )
     app.state.lifecycle = InvoiceLifecycle(
@@ -2084,6 +2091,45 @@ def create_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         return {"status": "deleted"}
+
+    @app.get("/api/admin/supplier-terms")
+    def admin_list_supplier_terms(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> list[dict[str, object]]:
+        return [asdict(terms) for terms in app.state.supplier_terms_store.list()]
+
+    @app.post("/api/admin/import/supplier-master-data")
+    async def admin_import_supplier_master_data(
+        file: UploadFile = File(...),
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        """Bulk-import companies, suppliers, approval matrix entries, and
+        supplier payment terms from an uploaded .xlsx workbook, so an admin
+        doesn't have to manually re-key every row from an existing Excel
+        sheet. Expected columns (header names are flexible, see
+        app/bulk_import.py): Company, Supplier, Supplier Account Number,
+        Default Payment Method, Payment Terms, Bank Account, Approver(s)."""
+        if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
+            raise HTTPException(
+                status_code=422, detail="Please upload an Excel (.xlsx) file."
+            )
+        contents = await file.read()
+        try:
+            summary = import_supplier_workbook(
+                io.BytesIO(contents),
+                company_store=app.state.companies_store,
+                supplier_store=app.state.suppliers_store,
+                approval_matrix_store=app.state.approval_matrix_store,
+                supplier_terms_store=app.state.supplier_terms_store,
+                auth_store=app.state.auth_store,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {
+            "imported": summary.imported_count,
+            "skipped": summary.skipped_count,
+            "rows": [asdict(row) for row in summary.rows],
+        }
 
     @app.get("/api/admin/ai-threshold")
     def admin_get_ai_threshold(user: User = Depends(require_role(ROLE_ADMIN))) -> dict[str, float]:
