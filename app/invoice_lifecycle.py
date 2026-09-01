@@ -170,7 +170,8 @@ class InvoiceLifecycle:
                     review_reason=(
                         f"Possible duplicate of invoice #{duplicate.invoice_id} "
                         f"(IRJ {duplicate.irj_number or 'not yet assigned'}, "
-                        f"status {duplicate.status}). Purchase Ledger must "
+                        f"status {duplicate.status}), matched on "
+                        f"{duplicate.match_basis}. Purchase Ledger must "
                         "confirm this is a genuinely separate invoice before it "
                         "can be routed."
                     ),
@@ -180,7 +181,8 @@ class InvoiceLifecycle:
                     target_role=ROLE_PURCHASE_LEDGER,
                     message=(
                         f"Invoice {invoice.original_filename} looks like a possible "
-                        f"duplicate of invoice #{duplicate.invoice_id}."
+                        f"duplicate of invoice #{duplicate.invoice_id} "
+                        f"(matched on {duplicate.match_basis})."
                     ),
                     invoice_id=invoice_id,
                 )

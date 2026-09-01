@@ -294,3 +294,55 @@ def test_duplicate_invoice_is_flagged_for_review(tmp_path: Path) -> None:
     )
     assert override.status_code == 200
     assert override.json()["status"] == "Awaiting Approval 1"
+
+
+def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
+    tmp_path: Path,
+) -> None:
+    """If Purchase Ledger confirms an invoice without typing a supplier
+    invoice number (e.g. AI extraction hasn't run and nobody filled it in
+    manually), the primary company+supplier+number duplicate key has
+    nothing to compare -- but re-processing the exact same source PDF
+    should still be caught via the file-identity fallback rather than
+    silently routing a second time."""
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+
+    upload1 = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("same-invoice.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice1_id = upload1.json()["id"]
+    confirm1 = client.post(
+        f"/api/invoices/{invoice1_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": None,
+            "invoice_value": 500.0,
+        },
+    )
+    assert confirm1.status_code == 200, confirm1.text
+    assert confirm1.json()["status"] == "Awaiting Approval 1"
+
+    # The exact same PDF (same filename + size) is added again and
+    # confirmed the same way, again without a supplier invoice number.
+    upload2 = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("same-invoice.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice2_id = upload2.json()["id"]
+    confirm2 = client.post(
+        f"/api/invoices/{invoice2_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": None,
+            "invoice_value": 500.0,
+        },
+    )
+    assert confirm2.status_code == 200, confirm2.text
+    body = confirm2.json()
+    assert body["status"] == "Needs Review"
+    assert body["duplicate_of_invoice_id"] == invoice1_id
+    assert "matched on matching filename and file size" in body["review_reason"]
