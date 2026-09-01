@@ -785,6 +785,21 @@ def create_app(
               <section class="card">
                 <div class="content" id="admin-panel">
                   <div class="admin-block">
+                    <h3>Bulk import supplier master data</h3>
+                    <p style="margin: 0 0 8px; color: #555;">
+                      Upload an Excel (.xlsx) sheet with columns for Company, Supplier,
+                      Supplier Account Number, Default Payment Method, Payment Terms,
+                      Bank Account, and Approver(s) to create/update these records in bulk
+                      instead of entering every row by hand.
+                    </p>
+                    <form class="admin-form" id="admin-import-form">
+                      <input id="admin-import-file" type="file" accept=".xlsx,.xlsm" required>
+                      <button type="submit" class="primary">Import workbook</button>
+                    </form>
+                    <div id="admin-import-result"></div>
+                  </div>
+
+                  <div class="admin-block">
                     <h3>Companies</h3>
                     <form class="admin-form" id="admin-company-form">
                       <input id="admin-company-name" placeholder="Company name" required>
@@ -1473,6 +1488,44 @@ def create_app(
                 showToast(`Failed to load admin panel: ${error.message}`, true);
               }
             }
+
+            document.getElementById("admin-import-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              const fileInput = document.getElementById("admin-import-file");
+              const resultBox = document.getElementById("admin-import-result");
+              if (!fileInput.files.length) {
+                return;
+              }
+              const formData = new FormData();
+              formData.append("file", fileInput.files[0]);
+              resultBox.innerHTML = "<p>Importing…</p>";
+              try {
+                const response = await fetch("/api/admin/import/supplier-master-data", {
+                  method: "POST",
+                  body: formData,
+                });
+                const body = await response.json();
+                if (!response.ok) {
+                  throw new Error(body.detail || "Import failed.");
+                }
+                const skippedRows = body.rows.filter(r => r.status === "skipped");
+                const skippedList = skippedRows.length
+                  ? "<ul>" +
+                    skippedRows
+                      .map(r => `<li>Row ${r.row_number} (${r.company || "—"} / ${r.supplier || "—"}): ${r.reason}</li>`)
+                      .join("") +
+                    "</ul>"
+                  : "";
+                resultBox.innerHTML =
+                  `<p><strong>${body.imported}</strong> row(s) imported, ` +
+                  `<strong>${body.skipped}</strong> row(s) skipped.</p>${skippedList}`;
+                event.target.reset();
+                await loadAdminPanel();
+              } catch (error) {
+                resultBox.innerHTML = "";
+                showToast(error.message, true);
+              }
+            });
 
             document.getElementById("admin-company-form").addEventListener("submit", async event => {
               event.preventDefault();
