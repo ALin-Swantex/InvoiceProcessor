@@ -622,7 +622,7 @@ def create_app(
                       <label style="grid-column: 1 / -1">Email subject<input id="source-subject" disabled placeholder="Email subject"></label>
                     </div>
 
-                    <h3 class="section-title">Invoice identity</h3>
+                    <h3 class="section-title">Invoice identity (AI extraction preview — read-only)</h3>
                     <div class="grid">
                       <label>IRJ number
                         <input id="preview-irj" disabled placeholder="Assigned before final filing">
@@ -644,7 +644,7 @@ def create_app(
                       </label>
                     </div>
 
-                    <h3 class="section-title">Invoice value</h3>
+                    <h3 class="section-title">Invoice value (AI extraction preview — read-only)</h3>
                     <div class="grid three">
                       <label>Invoice value<input id="preview-value" disabled placeholder="0.00"></label>
                       <label>Currency<input id="preview-currency" disabled placeholder="Currency"></label>
@@ -666,7 +666,7 @@ def create_app(
                       </label>
                     </div>
 
-                    <h3 class="section-title">Purchase Ledger confirmation</h3>
+                    <h3 class="section-title">Purchase Ledger confirmation (editable — enter or correct any field below, then confirm)</h3>
                     <div class="grid">
                       <label>Company
                         <select id="confirm-company"><option value="">Select company…</option></select>
@@ -678,7 +678,7 @@ def create_app(
                         <input id="confirm-supplier-invoice" placeholder="Supplier's invoice number">
                       </label>
                       <label>Purchase Order number
-                        <input id="confirm-po" placeholder="Leave blank if none">
+                        <input id="confirm-po" placeholder="Enter PO number if one applies, even if not shown above">
                       </label>
                       <label>Invoice date
                         <input id="confirm-invoice-date" type="date">
@@ -914,14 +914,20 @@ def create_app(
                 duplicateWarning.style.display = "none";
                 overrideButton.style.display = "none";
               }
-              setValue("confirm-company", invoice.company || "");
-              setValue("confirm-supplier", invoice.supplier);
-              setValue("confirm-supplier-invoice", invoice.supplier_invoice_number);
-              setValue("confirm-po", invoice.po_number);
-              setValue("confirm-invoice-date", invoice.invoice_date);
-              setValue("confirm-invoice-value", invoice.invoice_value);
-              setValue("confirm-currency", invoice.currency || "GBP");
               if (displayedInvoiceId !== invoice.id) {
+                // Only (re)populate the editable confirm-* fields when the
+                // displayed invoice actually changes. showInvoice() is also
+                // called on every periodic refresh (loadInvoices runs every
+                // 5s); without this guard it would keep stomping on
+                // whatever the user is actively typing into these fields
+                // with the invoice's last-saved (often blank) values.
+                setValue("confirm-company", invoice.company || "");
+                setValue("confirm-supplier", invoice.supplier);
+                setValue("confirm-supplier-invoice", invoice.supplier_invoice_number);
+                setValue("confirm-po", invoice.po_number);
+                setValue("confirm-invoice-date", invoice.invoice_date);
+                setValue("confirm-invoice-value", invoice.invoice_value);
+                setValue("confirm-currency", invoice.currency || "GBP");
                 pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
                 displayedInvoiceId = invoice.id;
               }
