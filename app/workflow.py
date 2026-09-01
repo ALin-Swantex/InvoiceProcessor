@@ -52,7 +52,9 @@ def route_confirmed_invoice(invoice: ConfirmedInvoice) -> RoutingDecision:
             route="purchase_order",
             status="Awaiting PO Matching",
             destination_folder=str(invoice.po_matching_folder),
-            destination_filename=Path(invoice.original_filename).name,
+            destination_filename=_prefixed_filename(
+                invoice.irj_number, invoice.original_filename
+            ),
             notification_recipient=str(invoice.purchase_ledger_recipient),
             notification_reason=(
                 f"Invoice {invoice.invoice_id} requires matching against "

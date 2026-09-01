@@ -82,7 +82,30 @@ class InvoiceLifecycle:
 
     def run_extraction(self, invoice_id: int) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
-        result = run_ai_extraction(Path(invoice.stored_path))
+        # SOFTWARE_SPEC.md section 13 ("Exceptions and Errors") lists "the
+        # PDF cannot be read" as a scenario the system must handle sensibly
+        # rather than crash on. Once real AI extraction (Azure Document
+        # Intelligence) is wired into run_ai_extraction, a corrupt/unreadable
+        # PDF should flag the invoice for review, not raise an unhandled
+        # error and stall the pipeline.
+        try:
+            result = run_ai_extraction(Path(invoice.stored_path))
+        except Exception as error:
+            record = self.invoice_store.update_fields(
+                invoice_id,
+                status="Needs Review",
+                review_reason=f"The PDF could not be read automatically: {error}",
+            )
+            self.activity_feed.add_event(
+                event_type="needs_review",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Invoice {invoice.original_filename} could not be read "
+                    "and needs manual review."
+                ),
+                invoice_id=invoice_id,
+            )
+            return record
         if result.needs_review:
             record = self.invoice_store.update_fields(
                 invoice_id,
@@ -442,6 +465,21 @@ class InvoiceLifecycle:
             "status": "Approved",
         }
         record = self.invoice_store.update_fields(invoice_id, **fields)
+        # SOFTWARE_SPEC.md section 9: "Once fully approved... The Purchase
+        # Ledger team should receive an email notification where
+        # appropriate." Purchase Ledger isn't the one clicking approve here
+        # (an approver is), so -- unlike the PO-matched branch above, where
+        # Purchase Ledger performed the action themselves -- they need an
+        # actual email, not just an activity feed entry they'd have to go
+        # looking for.
+        send_email_notification(
+            recipient="purchase-ledger@example.test",
+            subject=f"Invoice {invoice.irj_number} fully approved",
+            body=(
+                f"Invoice {invoice.irj_number} ({invoice.supplier}) has completed "
+                "all required nominal approvals and is ready for payment."
+            ),
+        )
         self.activity_feed.add_event(
             event_type="approved",
             target_role=ROLE_PURCHASE_LEDGER,
@@ -510,18 +548,22 @@ class InvoiceLifecycle:
         payment_date: str,
         payment_reference: str | None,
         payment_method: str | None = None,
+        recorded_by: str | None = None,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
         if invoice.status != "Approved":
             raise InvoiceLifecycleError(
                 f"Only Approved invoices can be marked as paid (status: {invoice.status})."
             )
+        # SOFTWARE_SPEC.md section 10: "Doing this should automatically:
+        # Record who marked the invoice as paid".
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Paid / Awaiting Bank Reconciliation",
             payment_date=payment_date,
             payment_reference=payment_reference,
             payment_method=payment_method,
+            paid_by=recorded_by,
         )
         self.activity_feed.add_event(
             event_type="paid",
@@ -532,7 +574,12 @@ class InvoiceLifecycle:
         return record
 
     def mark_reconciled(
-        self, invoice_id: int, *, reconciliation_date: str, notes: str | None
+        self,
+        invoice_id: int,
+        *,
+        reconciliation_date: str,
+        notes: str | None,
+        recorded_by: str | None = None,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
         if invoice.status != "Paid / Awaiting Bank Reconciliation":
@@ -540,11 +587,14 @@ class InvoiceLifecycle:
                 f"Only invoices awaiting bank reconciliation can be reconciled "
                 f"(status: {invoice.status})."
             )
+        # SOFTWARE_SPEC.md section 11: "The system should record: ...Who
+        # completed the reconciliation, where practical".
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Reconciled / Complete",
             reconciliation_date=reconciliation_date,
             reconciliation_notes=notes,
+            reconciled_by=recorded_by,
         )
         self.activity_feed.add_event(
             event_type="reconciled",

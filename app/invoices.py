@@ -59,8 +59,10 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "payment_date": "TEXT",
     "payment_reference": "TEXT",
     "payment_method": "TEXT",
+    "paid_by": "TEXT",
     "reconciliation_date": "TEXT",
     "reconciliation_notes": "TEXT",
+    "reconciled_by": "TEXT",
     "rejection_reason": "TEXT",
     "review_reason": "TEXT",
     "duplicate_of_invoice_id": "INTEGER",
@@ -111,8 +113,10 @@ class InvoiceRecord:
     payment_date: str | None = None
     payment_reference: str | None = None
     payment_method: str | None = None
+    paid_by: str | None = None
     reconciliation_date: str | None = None
     reconciliation_notes: str | None = None
+    reconciled_by: str | None = None
     rejection_reason: str | None = None
     review_reason: str | None = None
     duplicate_of_invoice_id: int | None = None

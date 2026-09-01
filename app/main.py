@@ -1111,7 +1111,11 @@ def create_app(
               renderSectionTable(
                 "reconciliation-table",
                 SECTION_STATUSES["reconciliation"],
-                [...BASE_COLUMNS, { label: "Payment date", value: i => i.payment_date || "—" }],
+                [
+                  ...BASE_COLUMNS,
+                  { label: "Payment date", value: i => i.payment_date || "—" },
+                  { label: "Paid by", value: i => i.paid_by || "—" },
+                ],
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="reconcile" data-id="${invoice.id}">Mark reconciled</button>
@@ -1120,7 +1124,11 @@ def create_app(
               renderSectionTable(
                 "complete-table",
                 SECTION_STATUSES["complete"],
-                [...BASE_COLUMNS, { label: "Reconciled", value: i => i.reconciliation_date || "—" }],
+                [
+                  ...BASE_COLUMNS,
+                  { label: "Reconciled", value: i => i.reconciliation_date || "—" },
+                  { label: "Reconciled by", value: i => i.reconciled_by || "—" },
+                ],
                 invoice => pdfLinkButton(invoice)
               );
               renderSectionTable(
@@ -1897,6 +1905,7 @@ def create_app(
                 payment_date=request.payment_date,
                 payment_reference=request.payment_reference,
                 payment_method=request.payment_method,
+                recorded_by=user.display_name,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -1913,6 +1922,7 @@ def create_app(
                 invoice_id,
                 reconciliation_date=request.reconciliation_date,
                 notes=request.notes,
+                recorded_by=user.display_name,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
