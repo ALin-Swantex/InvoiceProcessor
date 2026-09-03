@@ -7,14 +7,19 @@ on read-only Microsoft Entra directory data. It does not currently provide an
 Outlook invoice-email trigger.
 
 This project therefore calls Microsoft Graph directly from `app/outlook_graph.py`.
-The `OutlookGraphClient` exposes four read-only operations:
+The `OutlookGraphClient` reads invoice mail and supports these attachment
+operations:
 
 - `list_invoice_emails`
 - `get_invoice_email`
+- `list_invoice_attachments`
+- `download_invoice_attachment`
 - `list_pdf_attachments`
 - `download_pdf_attachment`
 
-These operations cannot send, delete, move, or mark email as read.
+Excel conversion temporarily creates and deletes a workbook in the configured
+SharePoint/OneDrive drive. It does not alter or delete the original email
+attachment, send email, or mark email as read.
 
 Microsoft Graph webhooks push the new-email event; the worker then calls Graph
 directly (no separate MCP server, request/response tool layer, or additional
@@ -37,8 +42,9 @@ When Graph reports a newly created Inbox message, the notification endpoint:
 
 It deliberately does not download or process the invoice inside the webhook
 request. Microsoft expects a response within three seconds. The included worker
-claims the queued event, calls Microsoft Graph directly, downloads its PDFs,
-and creates the invoice records used by the web interface.
+claims the queued event, calls Microsoft Graph directly, downloads PDFs or
+converts supported Excel workbooks, and creates the invoice records used by the
+web interface.
 
 ## 1. Register an Entra application
 
@@ -50,8 +56,12 @@ integration and record:
 - `[APPLICATION CLIENT SECRET]`
 - `[INVOICE MAILBOX ADDRESS]`
 
-For this read-only stage, grant Microsoft Graph **Application** permission
-`Mail.Read` and provide admin consent.
+Grant Microsoft Graph **Application** permission `Mail.Read` and provide admin
+consent. Excel conversion also requires write access to the selected temporary
+conversion drive. Prefer `Sites.Selected` with an explicit write grant on only
+the invoice-processing SharePoint site. If the organisation does not use
+resource-specific site grants, the broader alternative is
+`Files.ReadWrite.All`; this should only be approved after IT security review.
 
 Application `Mail.Read` can otherwise access every mailbox in the tenant. The
 administrator must restrict the service principal to the invoice shared mailbox
@@ -69,6 +79,13 @@ cp .env.example .env
 Replace the placeholders in `.env`. Never commit this file.
 
 The project entry points load this `.env` file automatically.
+
+For Excel invoices, set `EXCEL_CONVERSION_DRIVE_ID` to the document-library
+drive ID and create the folder configured by
+`EXCEL_CONVERSION_TEMP_FOLDER` (default: `Invoice Conversion`). When the
+conversion drive is the same as `SHAREPOINT_DRIVE_ID`,
+`EXCEL_CONVERSION_DRIVE_ID` may be omitted because the worker falls back to
+that value.
 
 For production, use a certificate or managed identity instead of a long-lived
 client secret.

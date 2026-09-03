@@ -4,8 +4,8 @@ This project connects the first stage of the invoice workflow:
 
 1. Microsoft Graph sends a webhook when an email reaches the invoice Inbox.
 2. The web application queues the Outlook message ID.
-3. A worker calls Microsoft Graph directly to read the email and download
-   each PDF attachment.
+3. A worker calls Microsoft Graph directly to read the email and download each
+   PDF attachment, or convert an XLS/XLSX attachment to PDF.
 4. The worker creates an invoice record.
 5. The web interface lists the received invoices and displays the selected PDF.
 
@@ -96,6 +96,8 @@ The worker and subscription CLI call Microsoft Graph directly through
 
 - List invoice-relevant messages and read one message's metadata.
 - List and download non-inline PDF attachments.
+- Convert non-inline XLS/XLSX attachments through a temporary file in the
+  configured SharePoint/OneDrive drive, then delete the temporary workbook.
 - Create and renew the Inbox change-notification subscription.
 
 It does not send, delete, move, or mark email as read. See

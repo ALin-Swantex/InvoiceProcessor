@@ -36,7 +36,7 @@ class FakeOutlookRetriever:
             "receivedDateTime": "2026-04-06T10:00:00Z",
         }
 
-    async def list_pdf_attachments(
+    async def list_invoice_attachments(
         self, message_id: str
     ) -> list[dict[str, object]]:
         if not self.attachments:
@@ -49,10 +49,23 @@ class FakeOutlookRetriever:
             }
         ]
 
-    async def download_pdf_attachment(
+    async def download_invoice_attachment(
         self, message_id: str, attachment_id: str, filename: str
     ) -> str:
         return str(self.pdf_path)
+
+
+class FakeExcelRetriever(FakeOutlookRetriever):
+    async def list_invoice_attachments(
+        self, message_id: str
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "id": "excel-attachment-1",
+                "name": "invoice-1001.xlsx",
+                "size": 1234,
+            }
+        ]
 
 
 def queued_store(tmp_path: Path) -> OutlookNotificationStore:
@@ -112,6 +125,26 @@ def test_worker_persists_outlook_pdf_and_completes_notification(
     assert served_pdf.content.startswith(b"%PDF-")
 
 
+def test_worker_persists_converted_excel_as_a_pdf(tmp_path: Path) -> None:
+    converted_pdf = tmp_path / "invoice-1001.pdf"
+    converted_pdf.write_bytes(b"%PDF-1.7\nconverted\n%%EOF")
+    notifications = queued_store(tmp_path)
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    worker = OutlookInvoiceWorker(
+        notifications,
+        invoices,
+        FakeExcelRetriever(converted_pdf),
+    )
+
+    assert asyncio.run(worker.process_next()) is True
+
+    record = invoices.list()[0]
+    assert record.attachment_id == "excel-attachment-1"
+    assert record.original_filename == "invoice-1001.pdf"
+    assert record.stored_path == str(converted_pdf)
+    assert record.size_bytes == converted_pdf.stat().st_size
+
+
 def test_worker_places_no_pdf_email_in_failed_queue(tmp_path: Path) -> None:
     pdf_path = tmp_path / "unused.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n%%EOF")
@@ -122,13 +155,13 @@ def test_worker_places_no_pdf_email_in_failed_queue(tmp_path: Path) -> None:
         FakeOutlookRetriever(pdf_path, attachments=False),
     )
 
-    with pytest.raises(RuntimeError, match="no PDF attachments"):
+    with pytest.raises(RuntimeError, match="no supported invoice attachments"):
         asyncio.run(worker.process_next())
 
     failed = notifications.list(status="failed")
     assert len(failed) == 1
     assert failed[0].attempts == 1
-    assert "no PDF attachments" in str(failed[0].last_error)
+    assert "no supported invoice attachments" in str(failed[0].last_error)
 
 
 def test_worker_is_idempotent_for_duplicate_invoice_attachment(

@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from app.outlook_graph import (
+    OutlookConfigurationError,
     OutlookGraphClient,
     OutlookGraphError,
     OutlookSettings,
@@ -110,6 +111,136 @@ def test_filters_pdf_attachments(tmp_path: Path) -> None:
     attachments = client.list_pdf_attachments("message-1")
 
     assert [attachment["id"] for attachment in attachments] == ["pdf-1"]
+
+
+def test_lists_pdf_and_excel_invoice_attachments(tmp_path: Path) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "value": [
+                    {"id": "pdf", "name": "one.pdf", "isInline": False},
+                    {"id": "xls", "name": "two.xls", "isInline": False},
+                    {"id": "xlsx", "name": "three.xlsx", "isInline": False},
+                    {"id": "macro", "name": "four.xlsm", "isInline": False},
+                    {"id": "logo", "name": "logo.png", "isInline": False},
+                ]
+            },
+        )
+
+    client = graph_client(tmp_path, httpx.MockTransport(respond))
+
+    attachments = client.list_invoice_attachments("message-1")
+
+    assert [attachment["id"] for attachment in attachments] == [
+        "pdf",
+        "xls",
+        "xlsx",
+    ]
+
+
+def test_converts_excel_attachment_to_pdf_and_deletes_temporary_file(
+    tmp_path: Path,
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path.endswith("/attachments/excel-1/$value"):
+            return httpx.Response(200, content=b"excel workbook bytes")
+        if request.method == "PUT":
+            assert "/root:/Invoice%20Conversion/" in str(request.url)
+            return httpx.Response(201, json={"id": "temporary-item"})
+        if request.url.path.endswith("/items/temporary-item/content"):
+            assert request.url.params["format"] == "pdf"
+            return httpx.Response(200, content=b"%PDF-1.7\nconverted\n%%EOF")
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected Graph request: {request.method} {request.url}")
+
+    configured = settings(tmp_path)
+    configured = OutlookSettings(
+        tenant_id=configured.tenant_id,
+        client_id=configured.client_id,
+        client_secret=configured.client_secret,
+        mailbox=configured.mailbox,
+        download_directory=configured.download_directory,
+        excel_conversion_drive_id="conversion-drive",
+    )
+    client = OutlookGraphClient(
+        configured,
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    converted = client.download_invoice_attachment(
+        "message-1", "excel-1", "supplier invoice.xlsx"
+    )
+
+    assert converted.name == "supplier invoice.pdf"
+    assert converted.read_bytes().startswith(b"%PDF-")
+    assert requests[-1] == (
+        "DELETE",
+        "/v1.0/drives/conversion-drive/items/temporary-item",
+    )
+
+
+def test_excel_conversion_requires_a_drive(tmp_path: Path) -> None:
+    client = graph_client(
+        tmp_path,
+        httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"workbook")
+        ),
+    )
+
+    with pytest.raises(OutlookConfigurationError, match="EXCEL_CONVERSION_DRIVE_ID"):
+        client.download_invoice_attachment(
+            "message-1", "excel-1", "invoice.xlsx"
+        )
+
+
+def test_failed_excel_conversion_still_deletes_temporary_file(
+    tmp_path: Path,
+) -> None:
+    deleted = False
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal deleted
+        if request.url.path.endswith("/attachments/excel-1/$value"):
+            return httpx.Response(200, content=b"excel workbook bytes")
+        if request.method == "PUT":
+            return httpx.Response(201, json={"id": "temporary-item"})
+        if request.url.path.endswith("/items/temporary-item/content"):
+            return httpx.Response(
+                500,
+                headers={"request-id": "conversion-failed"},
+            )
+        if request.method == "DELETE":
+            deleted = True
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected Graph request: {request.method} {request.url}")
+
+    configured = settings(tmp_path)
+    configured = OutlookSettings(
+        tenant_id=configured.tenant_id,
+        client_id=configured.client_id,
+        client_secret=configured.client_secret,
+        mailbox=configured.mailbox,
+        download_directory=configured.download_directory,
+        excel_conversion_drive_id="conversion-drive",
+    )
+    client = OutlookGraphClient(
+        configured,
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    with pytest.raises(OutlookGraphError, match="conversion-failed"):
+        client.download_invoice_attachment(
+            "message-1", "excel-1", "invoice.xlsx"
+        )
+
+    assert deleted is True
 
 
 def test_downloads_valid_pdf_without_overwriting(tmp_path: Path) -> None:
