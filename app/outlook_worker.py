@@ -21,11 +21,11 @@ class OutlookRetriever(Protocol):
 
     async def get_invoice_email(self, message_id: str) -> dict[str, object]: ...
 
-    async def list_pdf_attachments(
+    async def list_invoice_attachments(
         self, message_id: str
     ) -> list[dict[str, object]]: ...
 
-    async def download_pdf_attachment(
+    async def download_invoice_attachment(
         self, message_id: str, attachment_id: str, filename: str
     ) -> str: ...
 
@@ -52,18 +52,18 @@ class OutlookGraphRetriever:
             self.graph_client.get_invoice_email, message_id
         )
 
-    async def list_pdf_attachments(
+    async def list_invoice_attachments(
         self, message_id: str
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self.graph_client.list_pdf_attachments, message_id
+            self.graph_client.list_invoice_attachments, message_id
         )
 
-    async def download_pdf_attachment(
+    async def download_invoice_attachment(
         self, message_id: str, attachment_id: str, filename: str
     ) -> str:
         stored_path = await asyncio.to_thread(
-            self.graph_client.download_pdf_attachment,
+            self.graph_client.download_invoice_attachment,
             message_id,
             attachment_id,
             filename,
@@ -109,17 +109,20 @@ class OutlookInvoiceWorker:
             message = await self.retriever.get_invoice_email(
                 notification.message_id
             )
-            attachments = await self.retriever.list_pdf_attachments(
+            attachments = await self.retriever.list_invoice_attachments(
                 notification.message_id
             )
             if not attachments:
-                raise RuntimeError("The Outlook message contains no PDF attachments.")
+                raise RuntimeError(
+                    "The Outlook message contains no supported invoice attachments "
+                    "(PDF, XLS, or XLSX)."
+                )
 
             for attachment in attachments:
                 attachment_id = self._required_string(attachment, "id")
                 filename = self._required_string(attachment, "name")
                 stored_path = Path(
-                    await self.retriever.download_pdf_attachment(
+                    await self.retriever.download_invoice_attachment(
                         notification.message_id,
                         attachment_id,
                         filename,
@@ -127,11 +130,15 @@ class OutlookInvoiceWorker:
                 )
                 if not stored_path.is_file():
                     raise RuntimeError(
-                        f"MCP reported a missing PDF path: {stored_path}"
+                        f"Microsoft Graph processing produced no PDF: {stored_path}"
                     )
+                processed_attachment = dict(attachment)
+                processed_attachment["name"] = stored_path.name
+                processed_attachment["contentType"] = "application/pdf"
+                processed_attachment["size"] = stored_path.stat().st_size
                 self.invoice_store.add_from_outlook(
                     message=message,
-                    attachment=attachment,
+                    attachment=processed_attachment,
                     stored_path=stored_path,
                 )
         except Exception as error:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,9 @@ import msal
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._ -]+")
+PDF_EXTENSIONS = {".pdf"}
+EXCEL_EXTENSIONS = {".xls", ".xlsx"}
+SUPPORTED_INVOICE_EXTENSIONS = PDF_EXTENSIONS | EXCEL_EXTENSIONS
 
 
 class OutlookConfigurationError(RuntimeError):
@@ -32,6 +36,8 @@ class OutlookSettings:
     mailbox: str
     download_directory: Path
     max_pdf_bytes: int = 20 * 1024 * 1024
+    excel_conversion_drive_id: str = ""
+    excel_conversion_folder: str = "Invoice Conversion"
 
     def validate(self) -> None:
         values = {
@@ -128,7 +134,7 @@ class OutlookGraphClient:
             raise OutlookGraphError("Graph returned an invalid message response.")
         return message
 
-    def list_pdf_attachments(self, message_id: str) -> list[dict[str, Any]]:
+    def list_invoice_attachments(self, message_id: str) -> list[dict[str, Any]]:
         response = self._get(
             (
                 f"/users/{quote(self.settings.mailbox, safe='')}/messages/"
@@ -145,12 +151,30 @@ class OutlookGraphClient:
             for attachment in attachments
             if isinstance(attachment, dict)
             and not attachment.get("isInline", False)
-            and (
-                str(attachment.get("contentType", "")).casefold()
-                == "application/pdf"
-                or str(attachment.get("name", "")).lower().endswith(".pdf")
-            )
+            and Path(str(attachment.get("name", ""))).suffix.casefold()
+            in SUPPORTED_INVOICE_EXTENSIONS
         ]
+
+    def list_pdf_attachments(self, message_id: str) -> list[dict[str, Any]]:
+        """Return the legacy PDF-only subset of supported attachments."""
+        return [
+            attachment
+            for attachment in self.list_invoice_attachments(message_id)
+            if Path(str(attachment.get("name", ""))).suffix.casefold()
+            in PDF_EXTENSIONS
+        ]
+
+    def download_invoice_attachment(
+        self, message_id: str, attachment_id: str, filename: str
+    ) -> Path:
+        suffix = Path(filename).suffix.casefold()
+        if suffix in PDF_EXTENSIONS:
+            return self.download_pdf_attachment(message_id, attachment_id, filename)
+        if suffix in EXCEL_EXTENSIONS:
+            return self._download_excel_as_pdf(message_id, attachment_id, filename)
+        raise OutlookGraphError(
+            "Only PDF, XLS, and XLSX invoice attachments are supported."
+        )
 
     def download_pdf_attachment(
         self, message_id: str, attachment_id: str, filename: str
@@ -171,6 +195,93 @@ class OutlookGraphClient:
 
         target = self._unique_target(safe_filename)
         target.write_bytes(content)
+        return target
+
+    def _download_excel_as_pdf(
+        self, message_id: str, attachment_id: str, filename: str
+    ) -> Path:
+        drive_id = self.settings.excel_conversion_drive_id.strip()
+        if not drive_id:
+            raise OutlookConfigurationError(
+                "EXCEL_CONVERSION_DRIVE_ID (or SHAREPOINT_DRIVE_ID) is required "
+                "to convert Excel invoice attachments to PDF."
+            )
+
+        safe_source_name = self._safe_excel_filename(filename)
+        source_response = self._get(
+            (
+                f"/users/{quote(self.settings.mailbox, safe='')}/messages/"
+                f"{quote(message_id, safe='')}/attachments/"
+                f"{quote(attachment_id, safe='')}/$value"
+            )
+        )
+        source_content = source_response.content
+        if len(source_content) > self.settings.max_pdf_bytes:
+            raise OutlookGraphError(
+                "The Excel attachment exceeds the configured size limit."
+            )
+        if not source_content:
+            raise OutlookGraphError("The Excel attachment is empty.")
+
+        temp_name = f"{uuid.uuid4().hex}-{safe_source_name}"
+        folder = self.settings.excel_conversion_folder.strip().strip("/")
+        remote_path = f"{folder}/{temp_name}" if folder else temp_name
+        uploaded = self._put_graph_content(
+            (
+                f"/drives/{quote(drive_id, safe='')}/root:/"
+                f"{quote(remote_path, safe='/')}:/content"
+            ),
+            source_content,
+        ).json()
+        item_id = uploaded.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            raise OutlookGraphError(
+                "Microsoft Graph did not return an item ID for the temporary workbook."
+            )
+
+        conversion_error: Exception | None = None
+        pdf_content: bytes | None = None
+        try:
+            response = self._get_graph_content(
+                (
+                    f"/drives/{quote(drive_id, safe='')}/items/"
+                    f"{quote(item_id, safe='')}/content"
+                ),
+                params={"format": "pdf"},
+            )
+            pdf_content = response.content
+            if len(pdf_content) > self.settings.max_pdf_bytes:
+                raise OutlookGraphError(
+                    "The converted PDF exceeds the configured size limit."
+                )
+            if not pdf_content.startswith(b"%PDF-"):
+                raise OutlookGraphError(
+                    "Microsoft Graph did not return a valid PDF conversion."
+                )
+        except Exception as error:
+            conversion_error = error
+
+        try:
+            self._delete_graph_item(
+                f"/drives/{quote(drive_id, safe='')}/items/"
+                f"{quote(item_id, safe='')}"
+            )
+        except Exception as cleanup_error:
+            if conversion_error is not None:
+                raise OutlookGraphError(
+                    f"{conversion_error} Temporary workbook cleanup also failed: "
+                    f"{cleanup_error}"
+                ) from conversion_error
+            raise
+
+        if conversion_error is not None:
+            raise conversion_error
+        assert pdf_content is not None
+
+        target = self._unique_target(
+            self._safe_pdf_filename(f"{Path(safe_source_name).stem}.pdf")
+        )
+        target.write_bytes(pdf_content)
         return target
 
     def create_inbox_subscription(
@@ -249,6 +360,50 @@ class OutlookGraphClient:
             ) from error
         return response
 
+    def _put_graph_content(
+        self, path: str, content: bytes
+    ) -> httpx.Response:
+        response = self.http_client.put(
+            f"{GRAPH_BASE_URL}{path}",
+            content=content,
+            headers={
+                "Authorization": f"Bearer {self.token_provider()}",
+                "Content-Type": "application/octet-stream",
+            },
+        )
+        self._raise_graph_error(response)
+        return response
+
+    def _get_graph_content(
+        self, path: str, *, params: dict[str, str]
+    ) -> httpx.Response:
+        response = self.http_client.get(
+            f"{GRAPH_BASE_URL}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {self.token_provider()}"},
+            follow_redirects=True,
+        )
+        self._raise_graph_error(response)
+        return response
+
+    def _delete_graph_item(self, path: str) -> None:
+        response = self.http_client.delete(
+            f"{GRAPH_BASE_URL}{path}",
+            headers={"Authorization": f"Bearer {self.token_provider()}"},
+        )
+        self._raise_graph_error(response)
+
+    @staticmethod
+    def _raise_graph_error(response: httpx.Response) -> None:
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            request_id = response.headers.get("request-id", "not provided")
+            raise OutlookGraphError(
+                f"Microsoft Graph request failed with HTTP {response.status_code}; "
+                f"request ID: {request_id}."
+            ) from error
+
     @staticmethod
     def _validate_subscription_values(
         notification_url: str, client_state: str
@@ -274,6 +429,14 @@ class OutlookGraphClient:
         cleaned = SAFE_FILENAME_PATTERN.sub("_", name)
         if not cleaned.lower().endswith(".pdf"):
             raise OutlookGraphError("Only PDF attachments can be downloaded.")
+        return cleaned[:180]
+
+    @staticmethod
+    def _safe_excel_filename(filename: str) -> str:
+        name = Path(filename).name.strip()
+        cleaned = SAFE_FILENAME_PATTERN.sub("_", name)
+        if Path(cleaned).suffix.casefold() not in EXCEL_EXTENSIONS:
+            raise OutlookGraphError("Only XLS and XLSX files can be converted.")
         return cleaned[:180]
 
     def _unique_target(self, filename: str) -> Path:
@@ -302,6 +465,13 @@ def settings_from_environment() -> OutlookSettings:
         ),
         max_pdf_bytes=int(
             os.environ.get("OUTLOOK_MCP_MAX_PDF_BYTES", str(20 * 1024 * 1024))
+        ),
+        excel_conversion_drive_id=os.environ.get(
+            "EXCEL_CONVERSION_DRIVE_ID",
+            os.environ.get("SHAREPOINT_DRIVE_ID", ""),
+        ),
+        excel_conversion_folder=os.environ.get(
+            "EXCEL_CONVERSION_TEMP_FOLDER", "Invoice Conversion"
         ),
     )
 
