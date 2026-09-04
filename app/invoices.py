@@ -68,6 +68,18 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "duplicate_of_invoice_id": "INTEGER",
     "hold_reason": "TEXT",
     "hold_level": "INTEGER",
+    "sage_registered_at": "TEXT",
+    "sage_reference": "TEXT",
+    "sage_registered_by": "TEXT",
+    "is_foreign_payment": "INTEGER",
+    "payment_route_decided_at": "TEXT",
+    "payment_route_decided_by": "TEXT",
+    "foreign_allocation_date": "TEXT",
+    "foreign_allocation_reference": "TEXT",
+    "foreign_allocated_by": "TEXT",
+    "cancelled_at": "TEXT",
+    "cancelled_by": "TEXT",
+    "cancellation_reason": "TEXT",
 }
 
 
@@ -122,6 +134,18 @@ class InvoiceRecord:
     duplicate_of_invoice_id: int | None = None
     hold_reason: str | None = None
     hold_level: int | None = None
+    sage_registered_at: str | None = None
+    sage_reference: str | None = None
+    sage_registered_by: str | None = None
+    is_foreign_payment: int | None = None
+    payment_route_decided_at: str | None = None
+    payment_route_decided_by: str | None = None
+    foreign_allocation_date: str | None = None
+    foreign_allocation_reference: str | None = None
+    foreign_allocated_by: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
+    cancellation_reason: str | None = None
 
 
 class InvoiceStore:

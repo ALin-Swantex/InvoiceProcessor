@@ -31,7 +31,9 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
 
     home = client.get("/")
     assert home.status_code == 200
-    assert "OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED" in home.text
+    assert "<h1>Swantex</h1>" in home.text
+    assert "OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED" not in home.text
+    assert '<aside class="sidebar">' in home.text
     assert "Invoice PDF" in home.text
     assert "IRJ number" in home.text
     assert "Company being invoiced" in home.text

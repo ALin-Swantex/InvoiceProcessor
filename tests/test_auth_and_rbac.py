@@ -160,8 +160,8 @@ def test_approver1_cannot_decide_level_2(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end nominal invoice flow: confirm -> approver1 hold -> resume ->
-# approver1 approve -> approver2 approve -> pay
+# End-to-end nominal invoice flow: confirm -> Sage registration -> approver1
+# hold -> resume -> approver1 approve -> approver2 approve -> pay
 # ---------------------------------------------------------------------------
 
 
@@ -185,7 +185,13 @@ def _upload_and_confirm(client: TestClient, *, supplier_invoice_number: str = "I
         },
     )
     assert confirm.status_code == 200, confirm.text
-    assert confirm.json()["status"] == "Awaiting Approval 1"
+    assert confirm.json()["status"] == "Awaiting Sage Registration"
+    register = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"sage_reference": f"SAGE-{supplier_invoice_number}"},
+    )
+    assert register.status_code == 200, register.text
+    assert register.json()["status"] == "Awaiting Approval 1"
     return invoice_id
 
 
@@ -235,6 +241,12 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
 
     # Purchase Ledger marks it paid.
     login(client, "purchase.ledger", "ChangeMe-PL1!")
+    client.app.state.invoice_store.update_fields(
+        invoice_id,
+        foreign_allocation_date="2026-01-14",
+        foreign_allocation_reference="STALE-FX",
+        foreign_allocated_by="Previous User",
+    )
     paid = client.post(
         f"/api/invoices/{invoice_id}/pay",
         json={
@@ -245,6 +257,82 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     )
     assert paid.status_code == 200
     assert paid.json()["status"] == "Paid / Awaiting Bank Reconciliation"
+    assert paid.json()["is_foreign_payment"] == 0
+    assert paid.json()["payment_route_decided_by"] == "Purchase Ledger"
+    assert paid.json()["foreign_allocation_date"] is None
+    assert paid.json()["foreign_allocation_reference"] is None
+    assert paid.json()["foreign_allocated_by"] is None
+
+    reconciled = client.post(
+        f"/api/invoices/{invoice_id}/reconcile",
+        json={
+            "reconciliation_date": "2026-01-17",
+            "notes": "Matched to bank statement.",
+        },
+    )
+    assert reconciled.status_code == 200
+    assert reconciled.json()["status"] == "Reconciled / Complete"
+
+
+def test_foreign_payment_is_allocated_directly_to_complete(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    invoice_id = _upload_and_confirm(
+        client, supplier_invoice_number="FOREIGN-1"
+    )
+
+    login(client, "jordan.blake", "ChangeMe-App1!")
+    assert client.post(
+        f"/api/invoices/{invoice_id}/approve",
+        json={"level": 1, "decision": "approved"},
+    ).status_code == 200
+    login(client, "sam.ellis", "ChangeMe-App2!")
+    approved = client.post(
+        f"/api/invoices/{invoice_id}/approve",
+        json={"level": 2, "decision": "approved"},
+    )
+    assert approved.json()["status"] == "Approved"
+
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    client.app.state.invoice_store.update_fields(
+        invoice_id,
+        payment_date="2026-01-19",
+        payment_reference="STALE-BACS",
+        payment_method="BACS",
+        paid_by="Previous User",
+        reconciliation_date="2026-01-20",
+        reconciliation_notes="Stale reconciliation",
+        reconciled_by="Previous User",
+    )
+    routed = client.post(f"/api/invoices/{invoice_id}/route-foreign-payment")
+    assert routed.status_code == 200
+    assert routed.json()["status"] == "Foreign Payment / Awaiting Allocation"
+    assert routed.json()["is_foreign_payment"] == 1
+    assert routed.json()["payment_route_decided_by"] == "Purchase Ledger"
+    assert routed.json()["payment_date"] is None
+    assert routed.json()["payment_reference"] is None
+    assert routed.json()["reconciliation_date"] is None
+
+    reverted = client.post(
+        f"/api/invoices/{invoice_id}/revert-foreign-payment"
+    )
+    assert reverted.status_code == 200
+    assert reverted.json()["status"] == "Approved"
+    assert reverted.json()["is_foreign_payment"] is None
+
+    routed = client.post(f"/api/invoices/{invoice_id}/route-foreign-payment")
+    assert routed.json()["status"] == "Foreign Payment / Awaiting Allocation"
+
+    allocated = client.post(
+        f"/api/invoices/{invoice_id}/allocate-foreign-payment",
+        json={
+            "allocation_date": "2026-01-20",
+            "allocation_reference": "FX-ALLOC-9",
+        },
+    )
+    assert allocated.status_code == 200
+    assert allocated.json()["status"] == "Reconciled / Complete"
+    assert allocated.json()["foreign_allocation_reference"] == "FX-ALLOC-9"
+    assert allocated.json()["reconciliation_date"] is None
 
 
 def test_on_hold_requires_a_comment(tmp_path: Path) -> None:
@@ -257,6 +345,132 @@ def test_on_hold_requires_a_comment(tmp_path: Path) -> None:
         json={"level": 1, "decision": "on_hold"},
     )
     assert response.status_code == 422
+
+
+def test_missing_approver_route_can_be_configured_and_retried(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("new-supplier.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    confirmed = client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "New Route Supplier",
+            "supplier_invoice_number": "NEW-ROUTE-1",
+        },
+    )
+    assert confirmed.json()["status"] == "Awaiting Sage Registration"
+
+    registered = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"sage_reference": "SAGE-NEW-1"},
+    )
+    assert registered.json()["status"] == "Needs Review"
+    assert "No approval matrix entry" in registered.json()["review_reason"]
+
+    login(client, "admin", "ChangeMe-Admin1!")
+    matrix = client.post(
+        "/api/admin/approval-matrix",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "New Route Supplier",
+            "approver1_name": "Approver One",
+            "approver1_email": "approver.one@example.test",
+        },
+    )
+    assert matrix.status_code == 200
+
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    retried = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"sage_reference": "SAGE-NEW-1"},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "Awaiting Approval 1"
+    assert retried.json()["sage_reference"] == "SAGE-NEW-1"
+
+
+def test_po_query_resolution_requires_sage_registration_before_approval(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("po-invoice.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    confirmed = client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "PO-INV-1",
+            "purchase_order_number": "PO-100",
+            "invoice_value": 750.0,
+        },
+    )
+    assert confirmed.json()["status"] == "Awaiting PO Matching"
+
+    query = client.post(
+        f"/api/invoices/{invoice_id}/po-match",
+        json={
+            "matched": False,
+            "notes": "Goods receipt is missing.",
+            "query_category": "missing goods receipt",
+            "purchasing_contact": "Purchasing Team",
+        },
+    )
+    assert query.json()["status"] == "PO Query / Matching Issue"
+
+    matched = client.post(
+        f"/api/invoices/{invoice_id}/po-match",
+        json={"matched": True, "notes": "Goods receipt recorded."},
+    )
+    assert matched.json()["status"] == "Awaiting Sage Registration"
+
+    registered = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"sage_reference": "SAGE-PO-100"},
+    )
+    assert registered.status_code == 200
+    assert registered.json()["status"] == "Approved"
+    assert registered.json()["sage_registered_by"] == "Purchase Ledger"
+
+
+def test_po_invoice_can_be_rejected_from_matching(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("po-reject.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "PO-REJECT",
+            "purchase_order_number": "PO-REJECT",
+        },
+    )
+
+    rejected = client.post(
+        f"/api/invoices/{invoice_id}/reject",
+        json={"reason": "Invoice is not valid for this company."},
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "Rejected"
+    assert rejected.json()["rejection_reason"] == (
+        "Invoice is not valid for this company."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +517,35 @@ def test_duplicate_invoice_is_flagged_for_review(tmp_path: Path) -> None:
         },
     )
     assert override.status_code == 200
-    assert override.json()["status"] == "Awaiting Approval 1"
+    assert override.json()["status"] == "Awaiting Sage Registration"
+    assert override.json()["duplicate_of_invoice_id"] is None
+
+
+def test_confirmed_duplicate_can_be_cancelled(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    _upload_and_confirm(client, supplier_invoice_number="DUP-CANCEL")
+
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("duplicate.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    duplicate = client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "DUP-CANCEL",
+            "invoice_value": 500.0,
+        },
+    )
+    assert duplicate.json()["status"] == "Needs Review"
+
+    cancelled = client.post(f"/api/invoices/{invoice_id}/cancel-duplicate")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "Cancelled - Duplicate"
+    assert cancelled.json()["cancelled_by"] == "Purchase Ledger"
 
 
 def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
@@ -333,7 +575,7 @@ def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
         },
     )
     assert confirm1.status_code == 200, confirm1.text
-    assert confirm1.json()["status"] == "Awaiting Approval 1"
+    assert confirm1.json()["status"] == "Awaiting Sage Registration"
 
     # The exact same PDF (same filename + size) is added again and
     # confirmed the same way, again without a supplier invoice number.

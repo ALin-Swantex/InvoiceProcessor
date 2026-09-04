@@ -199,6 +199,73 @@ def test_excel_conversion_requires_a_drive(tmp_path: Path) -> None:
         )
 
 
+def test_excel_source_and_converted_pdf_use_separate_size_limits(
+    tmp_path: Path,
+) -> None:
+    workbook = b"workbook is larger than the converted pdf limit"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/attachments/excel-1/$value"):
+            return httpx.Response(200, content=workbook)
+        if request.method == "PUT":
+            return httpx.Response(201, json={"id": "temporary-item"})
+        if request.url.path.endswith("/items/temporary-item/content"):
+            return httpx.Response(200, content=b"%PDF-")
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected Graph request: {request.method} {request.url}")
+
+    configured = settings(tmp_path)
+    configured = OutlookSettings(
+        tenant_id=configured.tenant_id,
+        client_id=configured.client_id,
+        client_secret=configured.client_secret,
+        mailbox=configured.mailbox,
+        download_directory=configured.download_directory,
+        max_pdf_bytes=10,
+        max_excel_bytes=len(workbook),
+        excel_conversion_drive_id="conversion-drive",
+    )
+    client = OutlookGraphClient(
+        configured,
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    converted = client.download_invoice_attachment(
+        "message-1", "excel-1", "invoice.xlsx"
+    )
+
+    assert converted.read_bytes() == b"%PDF-"
+
+
+def test_rejects_excel_source_over_its_own_size_limit(tmp_path: Path) -> None:
+    configured = settings(tmp_path)
+    configured = OutlookSettings(
+        tenant_id=configured.tenant_id,
+        client_id=configured.client_id,
+        client_secret=configured.client_secret,
+        mailbox=configured.mailbox,
+        download_directory=configured.download_directory,
+        max_excel_bytes=3,
+        excel_conversion_drive_id="conversion-drive",
+    )
+    client = OutlookGraphClient(
+        configured,
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=b"workbook")
+            )
+        ),
+    )
+
+    with pytest.raises(OutlookGraphError, match="Excel attachment exceeds"):
+        client.download_invoice_attachment(
+            "message-1", "excel-1", "invoice.xlsx"
+        )
+
+
 def test_failed_excel_conversion_still_deletes_temporary_file(
     tmp_path: Path,
 ) -> None:

@@ -125,8 +125,8 @@ class FlagReviewRequest(BaseModel):
 
 class PaymentRequest(BaseModel):
     payment_date: str
-    payment_reference: str | None = None
-    payment_method: str | None = None
+    payment_reference: str
+    payment_method: str
 
 
 class ReconciliationRequest(BaseModel):
@@ -136,6 +136,19 @@ class ReconciliationRequest(BaseModel):
 
 class ResumeApprovalRequest(BaseModel):
     resolution_notes: str | None = None
+
+
+class SageRegistrationRequest(BaseModel):
+    sage_reference: str
+
+
+class RejectInvoiceRequest(BaseModel):
+    reason: str
+
+
+class ForeignAllocationRequest(BaseModel):
+    allocation_date: str
+    allocation_reference: str
 
 
 class LoginRequest(BaseModel):
@@ -349,7 +362,7 @@ def create_app(
         <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Invoice Review Workspace</title>
+          <title>Swantex | Invoice Processing</title>
           <style>
             :root {
               color-scheme: light;
@@ -359,16 +372,29 @@ def create_app(
             }
             * { box-sizing: border-box; }
             body { margin: 0; min-width: 320px; }
-            header {
-              display: flex; align-items: center; justify-content: space-between;
-              gap: 1rem; padding: 1rem 1.5rem; color: white;
-              background: #102a43; border-bottom: 4px solid #2f80ed;
+            #app-root {
+              min-height: 100vh; display: grid;
+              grid-template-columns: 240px minmax(0, 1fr);
             }
-            header h1 { font-size: 1.15rem; margin: 0; }
-            .header-controls { display: flex; align-items: center; gap: .75rem; }
-            .prototype {
-              padding: .4rem .7rem; border: 1px solid #90cdf4; border-radius: 999px;
-              color: #bee3f8; font-size: .78rem; font-weight: 700;
+            .sidebar {
+              position: sticky; top: 0; height: 100vh; display: flex;
+              flex-direction: column; padding: 1.25rem .9rem; color: white;
+              background: #102a43; border-right: 4px solid #2f80ed;
+              overflow-y: auto;
+            }
+            .brand {
+              padding: .25rem .65rem 1.2rem; margin-bottom: .65rem;
+              border-bottom: 1px solid rgba(255,255,255,.14);
+            }
+            .brand h1 { margin: 0; font-size: 1.55rem; letter-spacing: -.02em; }
+            .brand p {
+              margin: .25rem 0 0; color: #9fb3c8; font-size: .76rem;
+              font-weight: 600; text-transform: uppercase; letter-spacing: .08em;
+            }
+            .header-controls {
+              display: flex; flex-direction: column; align-items: stretch;
+              gap: .65rem; margin-top: auto; padding: 1rem .4rem 0;
+              border-top: 1px solid rgba(255,255,255,.14);
             }
             .role-switcher-label {
               display: flex; align-items: center; gap: .4rem;
@@ -381,22 +407,24 @@ def create_app(
               background: #1c3a5e; color: white; font: inherit; font-size: .8rem;
               cursor: pointer;
             }
-            nav.section-nav {
-              display: flex; gap: .35rem; flex-wrap: wrap; padding: .6rem 1.5rem;
-              background: white; border-bottom: 1px solid #d9e2ec;
-            }
+            nav.section-nav { display: flex; flex-direction: column; gap: .3rem; }
             nav.section-nav button {
-              border: 1px solid #d9e2ec; background: #f8fafc; color: #486581;
-              border-radius: 999px; padding: .45rem .85rem; font-size: .8rem;
-              font-weight: 700; cursor: pointer;
+              display: flex; align-items: center; justify-content: space-between;
+              width: 100%; border: 1px solid transparent; background: transparent;
+              color: #bcccdc; border-radius: 8px; padding: .62rem .7rem;
+              font-size: .8rem; font-weight: 700; text-align: left; cursor: pointer;
             }
-            nav.section-nav button.active { background: #2f80ed; color: white; border-color: #2f80ed; }
+            nav.section-nav button:hover { background: rgba(255,255,255,.08); color: white; }
+            nav.section-nav button.active {
+              background: #2f80ed; color: white; border-color: #5da0f3;
+            }
             nav.section-nav button .count {
-              display: inline-block; margin-left: .35rem; padding: 0 .4rem;
-              border-radius: 999px; background: rgba(0,0,0,.12); font-size: .72rem;
+              display: inline-grid; place-items: center; min-width: 1.45rem;
+              margin-left: .35rem; padding: .08rem .38rem; border-radius: 999px;
+              background: rgba(255,255,255,.1); font-size: .7rem;
             }
             nav.section-nav button.active .count { background: rgba(255,255,255,.25); }
-            main { max-width: 1500px; margin: 0 auto; padding: 1.25rem; }
+            main { width: 100%; max-width: 1500px; margin: 0 auto; padding: 1.25rem; }
             .layout {
               display: grid; grid-template-columns: minmax(360px, .9fr) minmax(520px, 1.35fr);
               gap: 1rem; align-items: start;
@@ -504,12 +532,30 @@ def create_app(
             .toast.error { background: #9b1c1c; }
             @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
             @media (max-width: 950px) {
+              #app-root { grid-template-columns: 190px minmax(0, 1fr); }
               .layout { grid-template-columns: 1fr; }
               .pdf-empty { min-height: 360px; }
             }
-            @media (max-width: 620px) {
+            @media (max-width: 700px) {
+              #app-root { display: block; }
+              .sidebar {
+                position: static; width: 100%; height: auto; padding: .8rem;
+                border-right: 0; border-bottom: 4px solid #2f80ed;
+              }
+              .brand { padding: 0 .2rem .7rem; margin-bottom: .65rem; }
+              .brand h1 { font-size: 1.25rem; }
+              nav.section-nav {
+                flex-direction: row; overflow-x: auto; padding-bottom: .3rem;
+              }
+              nav.section-nav button {
+                width: auto; flex: 0 0 auto; gap: .5rem; white-space: nowrap;
+              }
+              .header-controls {
+                flex-direction: row; align-items: center; margin-top: .5rem;
+                padding: .7rem .2rem 0;
+              }
+              main { padding: .8rem; }
               .grid, .grid.three { grid-template-columns: 1fr; }
-              header { align-items: flex-start; flex-direction: column; }
             }
             #login-screen {
               position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center;
@@ -526,9 +572,9 @@ def create_app(
             #login-error { color: #c53030; font-size: .8rem; min-height: 1.1em; margin-bottom: .5rem; }
             #app-root.hidden { display: none; }
             .user-chip {
-              display: flex; align-items: center; gap: .5rem;
-              padding: .3rem .7rem; border-radius: 999px; border: 1px solid #325377;
-              background: #1c3a5e; color: #bee3f8; font-size: .78rem; font-weight: 600;
+              display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+              padding: .45rem .55rem; border-radius: 8px; border: 1px solid #325377;
+              background: #1c3a5e; color: #bee3f8; font-size: .75rem; font-weight: 600;
             }
             .user-chip button {
               background: transparent; border: 1px solid rgba(255,255,255,.4); color: white;
@@ -546,7 +592,7 @@ def create_app(
 
           <div id="login-screen">
             <form class="login-card" id="login-form">
-              <h1>Invoice Processing</h1>
+              <h1>Swantex</h1>
               <p>Sign in with your staff account to continue.</p>
               <div id="login-error"></div>
               <label>Username<input id="login-username" autocomplete="username" required></label>
@@ -556,28 +602,31 @@ def create_app(
           </div>
 
           <div id="app-root" class="hidden">
-          <header>
-            <h1>Invoice Processing</h1>
+          <aside class="sidebar">
+            <div class="brand">
+              <h1>Swantex</h1>
+              <p>Invoice Processing</p>
+            </div>
+            <nav class="section-nav" id="section-nav">
+              <button data-tab="incoming" class="active">Incoming<span class="count" id="count-incoming">0</span></button>
+              <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
+              <button data-tab="sage-registration">Sage Registration<span class="count" id="count-sage-registration">0</span></button>
+              <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
+              <button data-tab="approver2">Approver 2<span class="count" id="count-approver2">0</span></button>
+              <button data-tab="on-hold">On Hold / Query<span class="count" id="count-on-hold">0</span></button>
+              <button data-tab="approved">Approved<span class="count" id="count-approved">0</span></button>
+              <button data-tab="reconciliation">Bank Reconciliation<span class="count" id="count-reconciliation">0</span></button>
+              <button data-tab="complete">Complete / Filed<span class="count" id="count-complete">0</span></button>
+              <button data-tab="rejected">Rejected<span class="count" id="count-rejected">0</span></button>
+              <button data-tab="admin">Admin</button>
+            </nav>
             <div class="header-controls">
               <span class="user-chip" id="user-chip">
                 <span id="user-chip-label">Signed in</span>
                 <button type="button" id="logout-button">Sign out</button>
               </span>
-              <div class="prototype">OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED</div>
             </div>
-          </header>
-          <nav class="section-nav" id="section-nav">
-            <button data-tab="incoming" class="active">Incoming<span class="count" id="count-incoming">0</span></button>
-            <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
-            <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
-            <button data-tab="approver2">Approver 2<span class="count" id="count-approver2">0</span></button>
-            <button data-tab="on-hold">On Hold / Query<span class="count" id="count-on-hold">0</span></button>
-            <button data-tab="approved">Approved<span class="count" id="count-approved">0</span></button>
-            <button data-tab="reconciliation">Bank Reconciliation<span class="count" id="count-reconciliation">0</span></button>
-            <button data-tab="complete">Complete / Filed<span class="count" id="count-complete">0</span></button>
-            <button data-tab="rejected">Rejected<span class="count" id="count-rejected">0</span></button>
-            <button data-tab="admin">Admin</button>
-          </nav>
+          </aside>
           <main>
             <div class="tab-panel active" data-tab-panel="incoming">
               <div class="layout">
@@ -719,6 +768,8 @@ def create_app(
                   <div class="actions">
                     <button class="secondary" id="flag-review-button">Flag for review</button>
                     <button class="danger" id="override-duplicate-button" style="display: none">This is not a duplicate — route anyway</button>
+                    <button class="danger" id="cancel-duplicate-button" style="display: none">Confirmed duplicate — cancel</button>
+                    <button class="secondary" id="retry-approval-route-button" style="display: none">Retry configured approver route</button>
                     <button class="primary" id="confirm-invoice-button">Purchase Ledger: confirm invoice</button>
                   </div>
                 </section>
@@ -729,6 +780,13 @@ def create_app(
               <section class="card">
                 <div class="card-header"><h2>Purchase Order Invoice Matching</h2></div>
                 <div class="content" id="po-matching-table"></div>
+              </section>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="sage-registration">
+              <section class="card">
+                <div class="card-header"><h2>Awaiting Sage Registration</h2></div>
+                <div class="content" id="sage-registration-table"></div>
               </section>
             </div>
 
@@ -872,21 +930,22 @@ def create_app(
             const SECTION_STATUSES = {
               "incoming": ["Awaiting AI Extraction", "Needs Review"],
               "po-matching": ["Awaiting PO Matching", "PO Query / Matching Issue"],
+              "sage-registration": ["Awaiting Sage Registration"],
               "approver1": ["Awaiting Approval 1"],
               "approver2": ["Awaiting Approval 2"],
               "on-hold": ["Approval Query / On Hold"],
-              "approved": ["Approved"],
+              "approved": ["Approved", "Foreign Payment / Awaiting Allocation"],
               "reconciliation": ["Paid / Awaiting Bank Reconciliation"],
               "complete": ["Reconciled / Complete"],
-              "rejected": ["Rejected"],
+              "rejected": ["Rejected", "Cancelled - Duplicate"],
             };
             // Which nav tabs each signed-in role may view. "admin" is a
             // config panel, not an invoice-status tab, and is only ever
             // shown to the admin role. Every other tab maps 1:1 onto
             // MANUAL_VS_AUTOMATED.md's manual decision steps.
             const ROLE_TABS = {
-              "admin": ["incoming", "po-matching", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
-              "purchase_ledger": ["incoming", "po-matching", "on-hold", "approved", "reconciliation", "complete", "rejected"],
+              "admin": ["incoming", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
+              "purchase_ledger": ["incoming", "po-matching", "sage-registration", "on-hold", "approved", "reconciliation", "complete", "rejected"],
               "approver1": ["approver1"],
               "approver2": ["approver2"],
               "purchasing": ["po-matching"],
@@ -940,16 +999,26 @@ def create_app(
                 "This PDF and its email metadata were retrieved from Outlook. AI extraction has not run yet.";
               const duplicateWarning = document.getElementById("duplicate-warning");
               const overrideButton = document.getElementById("override-duplicate-button");
+              const cancelDuplicateButton = document.getElementById("cancel-duplicate-button");
+              const retryApprovalRouteButton = document.getElementById("retry-approval-route-button");
               if (invoice.duplicate_of_invoice_id) {
                 duplicateWarning.style.display = "grid";
                 document.getElementById("duplicate-warning-text").textContent =
                   invoice.review_reason ||
                   `Possible duplicate of invoice #${invoice.duplicate_of_invoice_id}.`;
                 overrideButton.style.display = "";
+                cancelDuplicateButton.style.display = "";
               } else {
                 duplicateWarning.style.display = "none";
                 overrideButton.style.display = "none";
+                cancelDuplicateButton.style.display = "none";
               }
+              retryApprovalRouteButton.style.display =
+                invoice.status === "Needs Review" &&
+                invoice.invoice_type === "nominal" &&
+                invoice.sage_registered_at
+                  ? ""
+                  : "none";
               if (displayedInvoiceId !== invoice.id) {
                 // Only (re)populate the editable confirm-* fields when the
                 // displayed invoice actually changes. showInvoice() is also
@@ -1086,8 +1155,20 @@ def create_app(
                 [...BASE_COLUMNS, { label: "PO number", value: i => i.po_number || "—" }],
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="po-match" data-id="${invoice.id}">Mark matched</button>
-                  <button data-action="po-query" data-id="${invoice.id}">Record query</button>
+                  ${currentUser && currentUser.role === "purchasing" ? "" : `
+                    <button data-action="po-match" data-id="${invoice.id}">Mark matched</button>
+                    <button data-action="po-query" data-id="${invoice.id}">Record query</button>
+                    <button data-action="po-reject" data-id="${invoice.id}" class="danger">Reject</button>
+                  `}
+                `
+              );
+              renderSectionTable(
+                "sage-registration-table",
+                SECTION_STATUSES["sage-registration"],
+                BASE_COLUMNS,
+                invoice => `
+                  ${pdfLinkButton(invoice)}
+                  <button data-action="register-sage" data-id="${invoice.id}">Confirm Sage registration</button>
                 `
               );
               renderSectionTable(
@@ -1125,10 +1206,17 @@ def create_app(
                 "approved-table",
                 SECTION_STATUSES["approved"],
                 BASE_COLUMNS,
-                invoice => `
-                  ${pdfLinkButton(invoice)}
-                  <button data-action="pay" data-id="${invoice.id}">Mark paid</button>
-                `
+                invoice => invoice.status === "Foreign Payment / Awaiting Allocation"
+                  ? `
+                    ${pdfLinkButton(invoice)}
+                    <button data-action="allocate-foreign" data-id="${invoice.id}">Mark allocated</button>
+                    <button data-action="revert-foreign" data-id="${invoice.id}" class="secondary">Not foreign — return</button>
+                  `
+                  : `
+                    ${pdfLinkButton(invoice)}
+                    <button data-action="pay" data-id="${invoice.id}">Record domestic payment</button>
+                    <button data-action="route-foreign" data-id="${invoice.id}" class="secondary">Foreign payment</button>
+                  `
               );
               renderSectionTable(
                 "reconciliation-table",
@@ -1148,15 +1236,15 @@ def create_app(
                 SECTION_STATUSES["complete"],
                 [
                   ...BASE_COLUMNS,
-                  { label: "Reconciled", value: i => i.reconciliation_date || "—" },
-                  { label: "Reconciled by", value: i => i.reconciled_by || "—" },
+                  { label: "Completed", value: i => i.reconciliation_date || i.foreign_allocation_date || "—" },
+                  { label: "Completed by", value: i => i.reconciled_by || i.foreign_allocated_by || "—" },
                 ],
                 invoice => pdfLinkButton(invoice)
               );
               renderSectionTable(
                 "rejected-table",
                 SECTION_STATUSES["rejected"],
-                [...BASE_COLUMNS, { label: "Reason", value: i => i.rejection_reason || "—" }],
+                [...BASE_COLUMNS, { label: "Reason", value: i => i.rejection_reason || i.cancellation_reason || "—" }],
                 invoice => pdfLinkButton(invoice)
               );
             }
@@ -1193,6 +1281,16 @@ def create_app(
                     query_category: queryCategory || null,
                     purchasing_contact: purchasingContact || null,
                   });
+                } else if (action === "po-reject") {
+                  const reason = window.prompt("Reason for rejecting this PO invoice:");
+                  if (!reason) return;
+                  await postJson(`/api/invoices/${id}/reject`, { reason });
+                } else if (action === "register-sage") {
+                  const sageReference = window.prompt("Sage registration reference:");
+                  if (!sageReference) return;
+                  await postJson(`/api/invoices/${id}/register-sage`, {
+                    sage_reference: sageReference,
+                  });
                 } else if (action === "approve" || action === "reject") {
                   const comments = window.prompt(
                     action === "reject" ? "Reason for rejection:" : "Approval comments (optional):"
@@ -1217,12 +1315,29 @@ def create_app(
                 } else if (action === "pay") {
                   const paymentDate = window.prompt("Payment date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
                   if (!paymentDate) return;
-                  const paymentReference = window.prompt("Payment reference (optional):");
-                  const paymentMethod = window.prompt("Payment method (e.g. BACS, CHAPS, card):");
+                  const paymentReference = window.prompt("Payment reference:");
+                  if (!paymentReference) return;
+                  const paymentMethod = window.prompt("Payment method (e.g. BACS, Bankline, CHAPS, card):");
+                  if (!paymentMethod) return;
                   await postJson(`/api/invoices/${id}/pay`, {
                     payment_date: paymentDate,
-                    payment_reference: paymentReference || null,
-                    payment_method: paymentMethod || null,
+                    payment_reference: paymentReference,
+                    payment_method: paymentMethod,
+                  });
+                } else if (action === "route-foreign") {
+                  if (!window.confirm("Confirm this is a foreign payment requiring allocation?")) return;
+                  await postJson(`/api/invoices/${id}/route-foreign-payment`, {});
+                } else if (action === "revert-foreign") {
+                  if (!window.confirm("Return this invoice to the domestic payment route?")) return;
+                  await postJson(`/api/invoices/${id}/revert-foreign-payment`, {});
+                } else if (action === "allocate-foreign") {
+                  const allocationDate = window.prompt("Allocation date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
+                  if (!allocationDate) return;
+                  const allocationReference = window.prompt("Foreign payment allocation reference:");
+                  if (!allocationReference) return;
+                  await postJson(`/api/invoices/${id}/allocate-foreign-payment`, {
+                    allocation_date: allocationDate,
+                    allocation_reference: allocationReference,
                   });
                 } else if (action === "reconcile") {
                   const reconciliationDate = window.prompt("Reconciliation date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
@@ -1258,6 +1373,32 @@ def create_app(
 
             document.getElementById("override-duplicate-button").addEventListener("click", async () => {
               await submitConfirm(true);
+            });
+
+            document.getElementById("cancel-duplicate-button").addEventListener("click", async () => {
+              const invoiceId = picker.value;
+              if (!invoiceId || !window.confirm("Confirm this invoice is a duplicate and cancel it?")) return;
+              try {
+                await postJson(`/api/invoices/${invoiceId}/cancel-duplicate`, {});
+                showToast("Duplicate invoice cancelled.");
+                await loadInvoices();
+              } catch (error) {
+                showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("retry-approval-route-button").addEventListener("click", async () => {
+              const invoice = invoices.find(item => String(item.id) === picker.value);
+              if (!invoice || !invoice.sage_reference) return;
+              try {
+                await postJson(`/api/invoices/${invoice.id}/register-sage`, {
+                  sage_reference: invoice.sage_reference,
+                });
+                showToast("Approver route checked again.");
+                await loadInvoices();
+              } catch (error) {
+                showToast(error.message, true);
+              }
             });
 
             async function submitConfirm(overrideDuplicate) {
@@ -1824,6 +1965,49 @@ def create_app(
         )
         return asdict(record)
 
+    @app.post("/api/invoices/{invoice_id}/register-sage")
+    def register_invoice_in_sage(
+        invoice_id: int,
+        request: SageRegistrationRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().register_in_sage(
+                invoice_id,
+                sage_reference=request.sage_reference,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/reject")
+    def reject_invoice(
+        invoice_id: int,
+        request: RejectInvoiceRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().reject_invoice(
+                invoice_id, reason=request.reason, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/cancel-duplicate")
+    def cancel_duplicate_invoice(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().cancel_confirmed_duplicate(
+                invoice_id, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
     @app.get("/api/invoices/{invoice_id}")
     def get_invoice(invoice_id: int, user: User = Depends(get_current_user)) -> dict[str, object]:
         invoice = app.state.invoice_store.get(invoice_id)
@@ -1856,6 +2040,49 @@ def create_app(
             record = _lifecycle().run_extraction(invoice_id)
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/route-foreign-payment")
+    def route_foreign_payment(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().route_as_foreign_payment(
+                invoice_id, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/allocate-foreign-payment")
+    def allocate_foreign_payment(
+        invoice_id: int,
+        request: ForeignAllocationRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().mark_foreign_allocated(
+                invoice_id,
+                allocation_date=request.allocation_date,
+                allocation_reference=request.allocation_reference,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/revert-foreign-payment")
+    def revert_foreign_payment(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().revert_foreign_payment_route(
+                invoice_id, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/confirm")

@@ -211,7 +211,7 @@ class InvoiceLifecycle:
                 )
                 return record
 
-        irj_number = self.irj_generator.generate()
+        irj_number = invoice.irj_number or self.irj_generator.generate()
         try:
             decision = route_confirmed_invoice(
                 ConfirmedInvoice(
@@ -239,6 +239,7 @@ class InvoiceLifecycle:
             "invoice_value": invoice_value,
             "currency": currency,
             "irj_number": irj_number,
+            "duplicate_of_invoice_id": None,
         }
 
         if decision.route == "purchase_order":
@@ -260,49 +261,17 @@ class InvoiceLifecycle:
             )
             return record
 
-        entry = self._find_approvers(company, supplier)
-        if entry is None:
-            record = self.invoice_store.update_fields(
-                invoice_id,
-                **base_fields,
-                invoice_type="nominal",
-                status="Needs Review",
-                review_reason=(
-                    f"No approval matrix entry found for supplier '{supplier}' "
-                    f"under '{company}'."
-                ),
-            )
-            self.activity_feed.add_event(
-                event_type="needs_review",
-                target_role=ROLE_PURCHASE_LEDGER,
-                message=(
-                    f"Invoice {irj_number}: no approver configured for "
-                    f"'{supplier}' under '{company}'."
-                ),
-                invoice_id=invoice_id,
-            )
-            return record
-
         record = self.invoice_store.update_fields(
             invoice_id,
             **base_fields,
             invoice_type="nominal",
-            status="Awaiting Approval 1",
-            approver1_name=entry.approver1.name,
-            approver1_email=entry.approver1.email,
-            approver2_name=entry.approver2.name if entry.approver2 else None,
-            approver2_email=entry.approver2.email if entry.approver2 else None,
+            status="Awaiting Sage Registration",
             review_reason=None,
         )
-        send_email_notification(
-            recipient=entry.approver1.email,
-            subject=f"Invoice {irj_number} awaiting your approval",
-            body=f"Invoice {irj_number} from {supplier} requires your approval.",
-        )
         self.activity_feed.add_event(
-            event_type="approval_pending",
-            target_role=ROLE_APPROVER_1,
-            message=f"Invoice {irj_number} ({supplier}) is awaiting Approver 1 approval.",
+            event_type="sage_registration_pending",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=f"Invoice {irj_number} ({supplier}) is awaiting Sage registration.",
             invoice_id=invoice_id,
         )
         return record
@@ -327,12 +296,19 @@ class InvoiceLifecycle:
             )
         if matched:
             record = self.invoice_store.update_fields(
-                invoice_id, status="Approved", po_query_notes=notes
+                invoice_id,
+                status="Awaiting Sage Registration",
+                po_query_notes=notes,
+                po_query_category=None,
+                po_query_contact=None,
             )
             self.activity_feed.add_event(
-                event_type="approved",
+                event_type="sage_registration_pending",
                 target_role=ROLE_PURCHASE_LEDGER,
-                message=f"Invoice {invoice.irj_number} matched against PO and approved.",
+                message=(
+                    f"Invoice {invoice.irj_number} matched against its PO and is "
+                    "awaiting Sage registration."
+                ),
                 invoice_id=invoice_id,
             )
             return record
@@ -356,6 +332,160 @@ class InvoiceLifecycle:
                 f"Invoice {invoice.irj_number}: PO matching issue"
                 f"{f' ({query_category})' if query_category else ''} — {notes or 'see notes'}."
             ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def register_in_sage(
+        self,
+        invoice_id: int,
+        *,
+        sage_reference: str,
+        recorded_by: str,
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        retrying_missing_route = (
+            invoice.status == "Needs Review"
+            and invoice.invoice_type == "nominal"
+            and invoice.sage_registered_at is not None
+            and invoice.approver1_email is None
+        )
+        if invoice.status != "Awaiting Sage Registration" and not retrying_missing_route:
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} is not awaiting Sage registration "
+                f"(status: {invoice.status})."
+            )
+        if not sage_reference.strip():
+            raise InvoiceLifecycleError("A Sage registration reference is required.")
+
+        now = datetime.now(timezone.utc).isoformat()
+        if not retrying_missing_route:
+            invoice = self.invoice_store.update_fields(
+                invoice_id,
+                sage_registered_at=now,
+                sage_reference=sage_reference.strip(),
+                sage_registered_by=recorded_by,
+            )
+
+        if invoice.invoice_type == "po":
+            record = self.invoice_store.update_fields(
+                invoice_id, status="Approved", review_reason=None
+            )
+            self.activity_feed.add_event(
+                event_type="approved",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Invoice {invoice.irj_number} registered in Sage and approved "
+                    "for payment."
+                ),
+                invoice_id=invoice_id,
+            )
+            return record
+
+        entry = self._find_approvers(str(invoice.company), str(invoice.supplier))
+        if entry is None:
+            record = self.invoice_store.update_fields(
+                invoice_id,
+                status="Needs Review",
+                review_reason=(
+                    f"No approval matrix entry found for supplier '{invoice.supplier}' "
+                    f"under '{invoice.company}'. Configure the route, then retry."
+                ),
+            )
+            self.activity_feed.add_event(
+                event_type="needs_review",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Invoice {invoice.irj_number}: no approver configured for "
+                    f"'{invoice.supplier}' under '{invoice.company}'."
+                ),
+                invoice_id=invoice_id,
+            )
+            return record
+
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Awaiting Approval 1",
+            approver1_name=entry.approver1.name,
+            approver1_email=entry.approver1.email,
+            approver2_name=entry.approver2.name if entry.approver2 else None,
+            approver2_email=entry.approver2.email if entry.approver2 else None,
+            review_reason=None,
+        )
+        send_email_notification(
+            recipient=entry.approver1.email,
+            subject=f"Invoice {invoice.irj_number} awaiting your approval",
+            body=(
+                f"Invoice {invoice.irj_number} from {invoice.supplier} requires "
+                "your approval."
+            ),
+        )
+        self.activity_feed.add_event(
+            event_type="approval_pending",
+            target_role=ROLE_APPROVER_1,
+            message=(
+                f"Invoice {invoice.irj_number} ({invoice.supplier}) is awaiting "
+                "Approver 1 approval."
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def reject_invoice(
+        self, invoice_id: int, *, reason: str, recorded_by: str
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status not in (
+            "Awaiting PO Matching",
+            "PO Query / Matching Issue",
+        ):
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} cannot be rejected from status {invoice.status}."
+            )
+        if not reason.strip():
+            raise InvoiceLifecycleError("A rejection reason is required.")
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Rejected",
+            rejection_reason=reason.strip(),
+        )
+        self.activity_feed.add_event(
+            event_type="rejected",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Invoice {invoice.irj_number} rejected by {recorded_by}: "
+                f"{reason.strip()}"
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def cancel_confirmed_duplicate(
+        self, invoice_id: int, *, recorded_by: str
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if (
+            invoice.status != "Needs Review"
+            or invoice.duplicate_of_invoice_id is None
+            or invoice.sage_registered_at is not None
+        ):
+            raise InvoiceLifecycleError(
+                "Only an invoice flagged as a possible duplicate can be cancelled "
+                "as a confirmed duplicate before Sage registration."
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        reason = f"Confirmed duplicate of invoice #{invoice.duplicate_of_invoice_id}."
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Cancelled - Duplicate",
+            cancelled_at=now,
+            cancelled_by=recorded_by,
+            cancellation_reason=reason,
+        )
+        self.activity_feed.add_event(
+            event_type="duplicate_cancelled",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=f"Invoice {invoice.id} cancelled: {reason}",
             invoice_id=invoice_id,
         )
         return record
@@ -555,6 +685,13 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError(
                 f"Only Approved invoices can be marked as paid (status: {invoice.status})."
             )
+        if not payment_method or not payment_method.strip():
+            raise InvoiceLifecycleError("A payment method is required.")
+        if not payment_reference or not payment_reference.strip():
+            raise InvoiceLifecycleError("A payment reference is required.")
+        if not payment_date.strip():
+            raise InvoiceLifecycleError("A payment date is required.")
+        now = datetime.now(timezone.utc).isoformat()
         # SOFTWARE_SPEC.md section 10: "Doing this should automatically:
         # Record who marked the invoice as paid".
         record = self.invoice_store.update_fields(
@@ -562,13 +699,119 @@ class InvoiceLifecycle:
             status="Paid / Awaiting Bank Reconciliation",
             payment_date=payment_date,
             payment_reference=payment_reference,
-            payment_method=payment_method,
+            payment_method=payment_method.strip(),
             paid_by=recorded_by,
+            is_foreign_payment=0,
+            payment_route_decided_at=now,
+            payment_route_decided_by=recorded_by,
+            foreign_allocation_date=None,
+            foreign_allocation_reference=None,
+            foreign_allocated_by=None,
         )
         self.activity_feed.add_event(
             event_type="paid",
             target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice {invoice.irj_number} paid; awaiting bank reconciliation.",
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def route_as_foreign_payment(
+        self, invoice_id: int, *, recorded_by: str
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Approved":
+            raise InvoiceLifecycleError(
+                f"Only Approved invoices can be marked as foreign payments "
+                f"(status: {invoice.status})."
+            )
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Foreign Payment / Awaiting Allocation",
+            is_foreign_payment=1,
+            payment_route_decided_at=datetime.now(timezone.utc).isoformat(),
+            payment_route_decided_by=recorded_by,
+            payment_date=None,
+            payment_reference=None,
+            payment_method=None,
+            paid_by=None,
+            reconciliation_date=None,
+            reconciliation_notes=None,
+            reconciled_by=None,
+        )
+        self.activity_feed.add_event(
+            event_type="foreign_payment_pending",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Invoice {invoice.irj_number} marked as a foreign payment by "
+                f"{recorded_by}; awaiting allocation."
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def mark_foreign_allocated(
+        self,
+        invoice_id: int,
+        *,
+        allocation_date: str,
+        allocation_reference: str,
+        recorded_by: str,
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Foreign Payment / Awaiting Allocation":
+            raise InvoiceLifecycleError(
+                f"Only foreign payments awaiting allocation can be allocated "
+                f"(status: {invoice.status})."
+            )
+        if not allocation_reference.strip():
+            raise InvoiceLifecycleError("An allocation reference is required.")
+        if not allocation_date.strip():
+            raise InvoiceLifecycleError("An allocation date is required.")
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Reconciled / Complete",
+            foreign_allocation_date=allocation_date,
+            foreign_allocation_reference=allocation_reference.strip(),
+            foreign_allocated_by=recorded_by,
+        )
+        self.activity_feed.add_event(
+            event_type="foreign_payment_allocated",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Foreign payment for invoice {invoice.irj_number} allocated and "
+                "completed."
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def revert_foreign_payment_route(
+        self, invoice_id: int, *, recorded_by: str
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Foreign Payment / Awaiting Allocation":
+            raise InvoiceLifecycleError(
+                f"Only a foreign payment awaiting allocation can be returned to "
+                f"domestic payment (status: {invoice.status})."
+            )
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Approved",
+            is_foreign_payment=None,
+            payment_route_decided_at=None,
+            payment_route_decided_by=None,
+            foreign_allocation_date=None,
+            foreign_allocation_reference=None,
+            foreign_allocated_by=None,
+        )
+        self.activity_feed.add_event(
+            event_type="foreign_payment_reverted",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Invoice {invoice.irj_number} returned to domestic payment by "
+                f"{recorded_by}."
+            ),
             invoice_id=invoice_id,
         )
         return record

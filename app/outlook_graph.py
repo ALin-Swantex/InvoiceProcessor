@@ -36,6 +36,7 @@ class OutlookSettings:
     mailbox: str
     download_directory: Path
     max_pdf_bytes: int = 20 * 1024 * 1024
+    max_excel_bytes: int = 50 * 1024 * 1024
     excel_conversion_drive_id: str = ""
     excel_conversion_folder: str = "Invoice Conversion"
 
@@ -54,6 +55,10 @@ class OutlookSettings:
         if self.max_pdf_bytes <= 0:
             raise OutlookConfigurationError(
                 "OUTLOOK_MCP_MAX_PDF_BYTES must be greater than zero."
+            )
+        if self.max_excel_bytes <= 0:
+            raise OutlookConfigurationError(
+                "OUTLOOK_MCP_MAX_EXCEL_BYTES must be greater than zero."
             )
 
 
@@ -216,7 +221,7 @@ class OutlookGraphClient:
             )
         )
         source_content = source_response.content
-        if len(source_content) > self.settings.max_pdf_bytes:
+        if len(source_content) > self.settings.max_excel_bytes:
             raise OutlookGraphError(
                 "The Excel attachment exceeds the configured size limit."
             )
@@ -465,6 +470,9 @@ def settings_from_environment() -> OutlookSettings:
         ),
         max_pdf_bytes=int(
             os.environ.get("OUTLOOK_MCP_MAX_PDF_BYTES", str(20 * 1024 * 1024))
+        ),
+        max_excel_bytes=int(
+            os.environ.get("OUTLOOK_MCP_MAX_EXCEL_BYTES", str(50 * 1024 * 1024))
         ),
         excel_conversion_drive_id=os.environ.get(
             "EXCEL_CONVERSION_DRIVE_ID",

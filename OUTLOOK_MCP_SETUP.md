@@ -85,7 +85,9 @@ drive ID and create the folder configured by
 `EXCEL_CONVERSION_TEMP_FOLDER` (default: `Invoice Conversion`). When the
 conversion drive is the same as `SHAREPOINT_DRIVE_ID`,
 `EXCEL_CONVERSION_DRIVE_ID` may be omitted because the worker falls back to
-that value.
+that value. `OUTLOOK_MCP_MAX_EXCEL_BYTES` limits the source workbook upload
+(default: 50 MiB), while `OUTLOOK_MCP_MAX_PDF_BYTES` independently limits the
+converted PDF.
 
 For production, use a certificate or managed identity instead of a long-lived
 client secret.

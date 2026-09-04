@@ -98,6 +98,7 @@ The worker and subscription CLI call Microsoft Graph directly through
 - List and download non-inline PDF attachments.
 - Convert non-inline XLS/XLSX attachments through a temporary file in the
   configured SharePoint/OneDrive drive, then delete the temporary workbook.
+  Source workbooks and converted PDFs have independent configurable size limits.
 - Create and renew the Inbox change-notification subscription.
 
 It does not send, delete, move, or mark email as read. See
