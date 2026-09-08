@@ -31,14 +31,44 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
 
     home = client.get("/")
     assert home.status_code == 200
-    assert "OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED" in home.text
+    assert "<h1>Swantex</h1>" in home.text
+    assert "OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED" not in home.text
+    assert '<aside class="sidebar">' in home.text
+    assert 'data-tab="needs-review"' in home.text
+    assert "Flagged Invoices — Purchase Ledger Review" in home.text
+    assert 'id="payment-method"' in home.text
+    assert '<select id="admin-import-company" required>' in home.text
+    assert "Supplier payment settings" in home.text
+    assert '<details class="admin-block admin-collapsible">' in home.text
+    assert "<summary>Companies</summary>" in home.text
+    assert 'id="admin-company-root-folder" required disabled' in home.text
+    assert '<select id="admin-supplier-default-company">' in home.text
+    assert '<select id="admin-matrix-company" required>' in home.text
+    assert '<select id="admin-matrix-supplier" required>' in home.text
+    assert "All invoice companies" in home.text
+    assert 'id="admin-edit-dialog"' in home.text
+    assert "function openAdminEditor" in home.text
+    assert 'data-edit-index="${index}"' in home.text
+    assert '${escapeHtml(c.value(row) ?? "—")}' in home.text
+    assert 'data-delete-index="${index}"' in home.text
+    assert "${escapeHtml(r.reason)}</li>" in home.text
+    assert "supplier companies already exist" in home.text
+    assert 'formData.set("replace_existing", "true")' in home.text
+    assert '.join("\\n")' in home.text
+    assert 'id="admin-company-folder-preview"' in home.text
     assert "Invoice PDF" in home.text
     assert "IRJ number" in home.text
     assert "Company being invoiced" in home.text
+    assert '<select id="confirm-supplier">' in home.text
     assert "Supplier invoice number" in home.text
     assert "Purchase Order number" in home.text
     assert "Invoice value" in home.text
     assert "Overall confidence" in home.text
+    assert "PDF and extracted fields" in home.text
+    assert "function invoiceAnalysisHtml" in home.text
+    assert 'data-expand-invoice="${invoice.id}"' in home.text
+    assert 'class="invoice-analysis-pdf"' in home.text
+    assert "Extracted invoice analysis" in home.text
     assert "Purchase Ledger: confirm invoice" in home.text
     assert "Manually add an invoice to Incoming Invoices" in home.text
     assert "Confirmation and automatic routing" not in home.text

@@ -188,6 +188,42 @@ class AuthStore:
             ).fetchall()
         return [User(**dict(row)) for row in rows]
 
+    def update_user(self, username: str, **fields: object) -> User:
+        allowed = {"display_name", "email", "role", "password"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise AuthError(f"Unknown user fields: {', '.join(sorted(unknown))}.")
+        role = fields.get("role")
+        if role is not None and role not in ALL_ROLES:
+            raise AuthError(f"Unknown role '{role}'.")
+        password = fields.pop("password", None)
+        if password is not None:
+            if not isinstance(password, str) or not password:
+                raise AuthError("A new password cannot be empty.")
+            salt = secrets.token_hex(16)
+            fields["password_hash"] = _hash_password(password, salt)
+            fields["password_salt"] = salt
+        if not fields:
+            users = {user.username: user for user in self.list_users()}
+            if username not in users:
+                raise AuthError(f"User '{username}' was not found.")
+            return users[username]
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        with self._connect() as connection:
+            try:
+                cursor = connection.execute(
+                    f"UPDATE users SET {assignments} WHERE username = ?",
+                    (*fields.values(), username),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                raise AuthError(
+                    "Another user already has that email address."
+                ) from error
+            if cursor.rowcount == 0:
+                raise AuthError(f"User '{username}' was not found.")
+        return next(user for user in self.list_users() if user.username == username)
+
     def delete_user(self, username: str) -> None:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM users WHERE username = ?", (username,))

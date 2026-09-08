@@ -91,6 +91,9 @@ FIELD_COLUMNS: dict[str, str] = {
     "invoice_date": "invoice_date",
     "invoice_value": "invoice_value",
     "currency": "currency",
+    "ai_confidence": "ai_confidence",
+    "ai_field_confidences": "ai_field_confidences",
+    "ai_review_warnings": "ai_review_warnings",
     "approver1_name": "approver1_name",
     "approver1_email": "approver1_email",
     "approver1_decision": "approver1_decision",
@@ -102,12 +105,34 @@ FIELD_COLUMNS: dict[str, str] = {
     "approver2_date": "approver2_date",
     "approver2_comments": "approver2_comments",
     "po_query_notes": "po_query_notes",
+    "po_query_category": "po_query_category",
+    "po_query_contact": "po_query_contact",
     "payment_date": "payment_date",
+    "supplier_account_number": "supplier_account_number",
     "payment_reference": "payment_reference",
+    "payment_method": "payment_method",
+    "paid_by": "paid_by",
     "reconciliation_date": "reconciliation_date",
     "reconciliation_notes": "reconciliation_notes",
+    "reconciled_by": "reconciled_by",
     "rejection_reason": "rejection_reason",
     "review_reason": "review_reason",
+    "review_return_status": "review_return_status",
+    "duplicate_of_invoice_id": "duplicate_of_invoice_id",
+    "hold_reason": "hold_reason",
+    "hold_level": "hold_level",
+    "sage_registered_at": "sage_registered_at",
+    "sage_reference": "sage_reference",
+    "sage_registered_by": "sage_registered_by",
+    "is_foreign_payment": "is_foreign_payment",
+    "payment_route_decided_at": "payment_route_decided_at",
+    "payment_route_decided_by": "payment_route_decided_by",
+    "foreign_allocation_date": "foreign_allocation_date",
+    "foreign_allocation_reference": "foreign_allocation_reference",
+    "foreign_allocated_by": "foreign_allocated_by",
+    "cancelled_at": "cancelled_at",
+    "cancelled_by": "cancelled_by",
+    "cancellation_reason": "cancellation_reason",
 }
 
 
@@ -186,6 +211,28 @@ class SharePointInvoiceStore:
 
         existing = self._find_by_message_and_attachment(message_id, attachment_id)
         if existing is not None:
+            if (
+                existing.sharepoint_item_id is None
+                and self._optional_string(attachment.get("sharepoint_item_id"))
+            ):
+                self._update_item_fields(
+                    existing.id,
+                    self._to_sharepoint_fields(
+                        {
+                            "stored_path": str(stored_path),
+                            "sharepoint_item_id": attachment["sharepoint_item_id"],
+                            "sharepoint_web_url": self._optional_string(
+                                attachment.get("sharepoint_web_url")
+                            ),
+                        }
+                    ),
+                )
+                refreshed = self.get(existing.id)
+                if refreshed is None:
+                    raise RuntimeError(
+                        f"Invoice {existing.id} could not be read after linking."
+                    )
+                return refreshed
             return existing
 
         from datetime import datetime, timezone
@@ -206,6 +253,12 @@ class SharePointInvoiceStore:
             "size_bytes": self._optional_int(attachment.get("size")),
             "status": "Awaiting AI Extraction",
             "created_at": created_at,
+            "sharepoint_item_id": self._optional_string(
+                attachment.get("sharepoint_item_id")
+            ),
+            "sharepoint_web_url": self._optional_string(
+                attachment.get("sharepoint_web_url")
+            ),
         }
         item = self._create_item(fields)
         return self._item_to_record(item)
@@ -231,6 +284,17 @@ class SharePointInvoiceStore:
     def get(self, invoice_id: int) -> InvoiceRecord | None:
         item = self._get_item(invoice_id)
         return self._item_to_record(item) if item is not None else None
+
+    def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
+        for record in self.list(limit=500):
+            if record.sharepoint_item_id == item_id:
+                return record
+        return None
+
+    def get_by_source_attachment(
+        self, message_id: str, attachment_id: str
+    ) -> InvoiceRecord | None:
+        return self._find_by_message_and_attachment(message_id, attachment_id)
 
     def update_status(self, invoice_id: int, status: str) -> None:
         self.update_fields(invoice_id, status=status)

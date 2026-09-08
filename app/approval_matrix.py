@@ -6,6 +6,8 @@ from pathlib import Path
 
 from app.config_db import connect
 
+ALL_COMPANIES = "*"
+
 
 # ---------------------------------------------------------------------------
 # Approval Matrix — admin-maintained routing rules mapping (company,
@@ -83,13 +85,28 @@ class ApprovalMatrixStore:
     def find(self, company: str, supplier: str) -> ApprovalMatrixEntry | None:
         company_key = company.strip().casefold()
         supplier_key = supplier.strip().casefold()
+        fallback: ApprovalMatrixEntry | None = None
         for entry in self.list():
-            if (
-                entry.company.strip().casefold() == company_key
-                and entry.supplier.strip().casefold() == supplier_key
-            ):
+            if entry.supplier.strip().casefold() != supplier_key:
+                continue
+            if entry.company.strip().casefold() == company_key:
                 return entry
-        return None
+            if entry.company == ALL_COMPANIES:
+                fallback = entry
+        return fallback
+
+    def find_exact(self, company: str, supplier: str) -> ApprovalMatrixEntry | None:
+        company_key = company.strip().casefold()
+        supplier_key = supplier.strip().casefold()
+        return next(
+            (
+                entry
+                for entry in self.list()
+                if entry.company.strip().casefold() == company_key
+                and entry.supplier.strip().casefold() == supplier_key
+            ),
+            None,
+        )
 
     def create(
         self,
@@ -103,8 +120,8 @@ class ApprovalMatrixStore:
     ) -> ApprovalMatrixEntry:
         approver1 = Approver(name=approver1_name, email=approver1_email)
         approver2 = (
-            Approver(name=approver2_name, email=approver2_email)
-            if approver2_name and approver2_email
+            Approver(name=approver2_name, email=approver2_email or "")
+            if approver2_name
             else None
         )
         with self._connect() as connection:
@@ -139,15 +156,24 @@ class ApprovalMatrixStore:
             return existing
         assignments = ", ".join(f"{key} = ?" for key in fields)
         with self._connect() as connection:
-            cursor = connection.execute(
-                f"UPDATE approval_matrix SET {assignments} WHERE id = ?",
-                (*fields.values(), entry_id),
-            )
-            connection.commit()
+            try:
+                cursor = connection.execute(
+                    f"UPDATE approval_matrix SET {assignments} WHERE id = ?",
+                    (*fields.values(), entry_id),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                raise ValueError(
+                    "An approval matrix entry for that company and supplier "
+                    "already exists."
+                ) from error
             if cursor.rowcount == 0:
                 raise KeyError(f"Approval matrix entry {entry_id} was not found.")
         result = self._get_by_id(entry_id)
-        assert result is not None
+        if result is None:
+            raise RuntimeError(
+                f"Approval matrix entry {entry_id} disappeared after it was updated."
+            )
         return result
 
     def delete(self, entry_id: int) -> None:
@@ -156,6 +182,22 @@ class ApprovalMatrixStore:
             connection.commit()
             if cursor.rowcount == 0:
                 raise KeyError(f"Approval matrix entry {entry_id} was not found.")
+
+    def delete_by_supplier(self, supplier: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM approval_matrix WHERE supplier = ?", (supplier,)
+            )
+            connection.commit()
+            return cursor.rowcount
+
+    def delete_by_company(self, company: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM approval_matrix WHERE company = ?", (company,)
+            )
+            connection.commit()
+            return cursor.rowcount
 
     def _get_by_id(self, entry_id: int) -> ApprovalMatrixEntry | None:
         with self._connect() as connection:
@@ -195,8 +237,8 @@ class ApprovalMatrixStore:
 
 def _row_to_entry(row: sqlite3.Row) -> ApprovalMatrixEntry:
     approver2 = (
-        Approver(name=row["approver2_name"], email=row["approver2_email"])
-        if row["approver2_name"] and row["approver2_email"]
+        Approver(name=row["approver2_name"], email=row["approver2_email"] or "")
+        if row["approver2_name"]
         else None
     )
     return ApprovalMatrixEntry(

@@ -103,7 +103,10 @@ class SupplierStore:
             connection.commit()
             if cursor.rowcount == 0:
                 raise KeyError(f"Supplier '{name}' was not found.")
-        return self.get(name)  # type: ignore[return-value]
+        updated = self.get(name)
+        if updated is None:
+            raise RuntimeError(f"Supplier '{name}' disappeared after it was updated.")
+        return updated
 
     def delete(self, name: str) -> None:
         with self._connect() as connection:

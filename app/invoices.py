@@ -43,6 +43,9 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "invoice_date": "TEXT",
     "invoice_value": "REAL",
     "currency": "TEXT",
+    "ai_confidence": "REAL",
+    "ai_field_confidences": "TEXT",
+    "ai_review_warnings": "TEXT",
     "approver1_name": "TEXT",
     "approver1_email": "TEXT",
     "approver1_decision": "TEXT",
@@ -57,6 +60,7 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "po_query_category": "TEXT",
     "po_query_contact": "TEXT",
     "payment_date": "TEXT",
+    "supplier_account_number": "TEXT",
     "payment_reference": "TEXT",
     "payment_method": "TEXT",
     "paid_by": "TEXT",
@@ -65,9 +69,22 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "reconciled_by": "TEXT",
     "rejection_reason": "TEXT",
     "review_reason": "TEXT",
+    "review_return_status": "TEXT",
     "duplicate_of_invoice_id": "INTEGER",
     "hold_reason": "TEXT",
     "hold_level": "INTEGER",
+    "sage_registered_at": "TEXT",
+    "sage_reference": "TEXT",
+    "sage_registered_by": "TEXT",
+    "is_foreign_payment": "INTEGER",
+    "payment_route_decided_at": "TEXT",
+    "payment_route_decided_by": "TEXT",
+    "foreign_allocation_date": "TEXT",
+    "foreign_allocation_reference": "TEXT",
+    "foreign_allocated_by": "TEXT",
+    "cancelled_at": "TEXT",
+    "cancelled_by": "TEXT",
+    "cancellation_reason": "TEXT",
 }
 
 
@@ -97,6 +114,9 @@ class InvoiceRecord:
     invoice_date: str | None = None
     invoice_value: float | None = None
     currency: str | None = None
+    ai_confidence: float | None = None
+    ai_field_confidences: str | None = None
+    ai_review_warnings: str | None = None
     approver1_name: str | None = None
     approver1_email: str | None = None
     approver1_decision: str | None = None
@@ -111,6 +131,7 @@ class InvoiceRecord:
     po_query_category: str | None = None
     po_query_contact: str | None = None
     payment_date: str | None = None
+    supplier_account_number: str | None = None
     payment_reference: str | None = None
     payment_method: str | None = None
     paid_by: str | None = None
@@ -119,9 +140,22 @@ class InvoiceRecord:
     reconciled_by: str | None = None
     rejection_reason: str | None = None
     review_reason: str | None = None
+    review_return_status: str | None = None
     duplicate_of_invoice_id: int | None = None
     hold_reason: str | None = None
     hold_level: int | None = None
+    sage_registered_at: str | None = None
+    sage_reference: str | None = None
+    sage_registered_by: str | None = None
+    is_foreign_payment: int | None = None
+    payment_route_decided_at: str | None = None
+    payment_route_decided_by: str | None = None
+    foreign_allocation_date: str | None = None
+    foreign_allocation_reference: str | None = None
+    foreign_allocated_by: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by: str | None = None
+    cancellation_reason: str | None = None
 
 
 class InvoiceStore:
@@ -145,15 +179,36 @@ class InvoiceStore:
         filename = self._required_string(attachment, "name")
         sender_name, sender_address = self._sender(message)
         created_at = datetime.now(timezone.utc).isoformat()
+        sharepoint_item_id = self._optional_string(
+            attachment.get("sharepoint_item_id")
+        )
+        sharepoint_web_url = self._optional_string(
+            attachment.get("sharepoint_web_url")
+        )
 
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO invoices (
+                INSERT INTO invoices (
                     message_id, attachment_id, internet_message_id,
                     sender_name, sender_address, subject, received_at,
-                    original_filename, stored_path, size_bytes, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    original_filename, stored_path, size_bytes, status, created_at,
+                    sharepoint_item_id, sharepoint_web_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id, attachment_id) DO UPDATE SET
+                    stored_path = CASE
+                        WHEN invoices.sharepoint_item_id IS NULL
+                        THEN excluded.stored_path
+                        ELSE invoices.stored_path
+                    END,
+                    sharepoint_item_id = COALESCE(
+                        invoices.sharepoint_item_id,
+                        excluded.sharepoint_item_id
+                    ),
+                    sharepoint_web_url = COALESCE(
+                        invoices.sharepoint_web_url,
+                        excluded.sharepoint_web_url
+                    )
                 """,
                 (
                     message_id,
@@ -168,6 +223,8 @@ class InvoiceStore:
                     self._optional_int(attachment.get("size")),
                     "Awaiting AI Extraction",
                     created_at,
+                    sharepoint_item_id,
+                    sharepoint_web_url,
                 ),
             )
             connection.commit()
@@ -212,6 +269,28 @@ class InvoiceStore:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM invoices WHERE id = ?", (invoice_id,)
+            ).fetchone()
+        return InvoiceRecord(**dict(row)) if row is not None else None
+
+    def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM invoices WHERE sharepoint_item_id = ? LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return InvoiceRecord(**dict(row)) if row is not None else None
+
+    def get_by_source_attachment(
+        self, message_id: str, attachment_id: str
+    ) -> InvoiceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM invoices
+                WHERE message_id = ? AND attachment_id = ?
+                LIMIT 1
+                """,
+                (message_id, attachment_id),
             ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
 

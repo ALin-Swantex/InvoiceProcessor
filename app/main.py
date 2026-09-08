@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Res
 from pydantic import BaseModel
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
+from app.ai_extraction import ai_extraction_configured
 from app.approval_matrix import ApprovalMatrixStore
 from app.auth import (
     AuthError,
@@ -27,18 +29,30 @@ from app.auth import (
     get_current_user,
     require_role,
 )
-from app.bulk_import import import_supplier_workbook
-from app.companies import CompanyStore
+from app.bulk_import import find_existing_supplier_imports, import_supplier_workbook
+from app.company_folders import (
+    INCOMING_INVOICES_FOLDER,
+    REJECTED_INVOICES_FOLDER,
+    CompanyFolderStructure,
+    discover_company_folder_structures,
+)
+from app.companies import CompanyProfile, CompanyStore
 from app.config_db import config_database_path, set_setting
 from app.environment import load_project_environment
-from app.invoice_lifecycle import InvoiceLifecycle, InvoiceLifecycleError
+from app.invoice_lifecycle import (
+    InvoiceExtractionUnavailableError,
+    InvoiceLifecycle,
+    InvoiceLifecycleError,
+)
+from app.pdf_validation import InvalidPdfError, validate_pdf
+from app.sharepoint_intake import SharePointIncomingMonitor
 from app.invoices import InvoiceStore
 from app.irj import IrjNumberGenerator
 from app.outlook_notifications import (
     OutlookNotificationStore,
     extract_message_id,
 )
-from app.sharepoint import SharePointClient
+from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
 from app.supplier_terms import SupplierTermsStore
 from app.workflow import (
@@ -123,10 +137,16 @@ class FlagReviewRequest(BaseModel):
     reason: str
 
 
+class ReviewDecisionRequest(BaseModel):
+    accepted: bool
+    reason: str | None = None
+
+
 class PaymentRequest(BaseModel):
     payment_date: str
-    payment_reference: str | None = None
-    payment_method: str | None = None
+    supplier_account_number: str | None = None
+    payment_reference: str
+    payment_method: str
 
 
 class ReconciliationRequest(BaseModel):
@@ -138,6 +158,19 @@ class ResumeApprovalRequest(BaseModel):
     resolution_notes: str | None = None
 
 
+class SageRegistrationRequest(BaseModel):
+    sage_reference: str
+
+
+class RejectInvoiceRequest(BaseModel):
+    reason: str
+
+
+class ForeignAllocationRequest(BaseModel):
+    allocation_date: str
+    allocation_reference: str
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -145,14 +178,16 @@ class LoginRequest(BaseModel):
 
 class CompanyRequest(BaseModel):
     name: str
-    company_folder: str
-    po_matching_folder: str
+    sharepoint_root_folder: str | None = None
+    company_folder: str | None = None
+    po_matching_folder: str | None = None
     aliases: list[str] | None = None
     vat_number: str | None = None
     address: str | None = None
 
 
 class CompanyUpdateRequest(BaseModel):
+    sharepoint_root_folder: str | None = None
     company_folder: str | None = None
     po_matching_folder: str | None = None
     aliases: list[str] | None = None
@@ -191,6 +226,15 @@ class ApprovalMatrixUpdateRequest(BaseModel):
     approver2_email: str | None = None
 
 
+class SupplierTermsUpdateRequest(BaseModel):
+    company: str
+    supplier: str
+    supplier_account_number: str | None = None
+    default_payment_method: str | None = None
+    payment_terms_notice: str | None = None
+    bank_account: str | None = None
+
+
 class ThresholdUpdateRequest(BaseModel):
     threshold: float
 
@@ -203,20 +247,29 @@ class UserCreateRequest(BaseModel):
     password: str
 
 
+class UserUpdateRequest(BaseModel):
+    display_name: str | None = None
+    email: str | None = None
+    role: str | None = None
+    password: str | None = None
+
+
 def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore:
     """Choose the invoice metadata store backend.
 
     Defaults to the local SQLite store (INVOICE_STORE_BACKEND unset or
     "sqlite") so tests and prototype usage keep working with zero
-    configuration. Set INVOICE_STORE_BACKEND=sharepoint_list to persist
-    invoice metadata centrally in a SharePoint List instead -- see
-    app/sharepoint_invoice_store.py for the required (currently
-    placeholder) SHAREPOINT_INVOICES_SITE_ID / SHAREPOINT_INVOICES_LIST_ID
-    environment variables.
+    configuration. Set INVOICE_STORE_BACKEND=postgres to persist invoice
+    metadata in Azure Database for PostgreSQL. The legacy sharepoint_list
+    adapter remains available for compatibility.
     """
     backend = os.environ.get("INVOICE_STORE_BACKEND", "sqlite").strip().lower()
     if backend == "sqlite":
         return InvoiceStore(invoice_db_path)
+    if backend == "postgres":
+        from app.postgres_invoices import create_postgres_invoice_store
+
+        return create_postgres_invoice_store()  # type: ignore[return-value]
     if backend == "sharepoint_list":
         from app.sharepoint_invoice_store import (
             sharepoint_invoice_store_from_environment,
@@ -224,9 +277,17 @@ def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore
 
         return sharepoint_invoice_store_from_environment()  # type: ignore[return-value]
     raise ValueError(
-        f"Unknown INVOICE_STORE_BACKEND '{backend}'. Expected 'sqlite' or "
-        "'sharepoint_list'."
+        f"Unknown INVOICE_STORE_BACKEND '{backend}'. Expected 'sqlite', "
+        "'postgres', or 'sharepoint_list'."
     )
+
+
+def _company_response(profile: CompanyProfile) -> dict[str, object]:
+    structure = CompanyFolderStructure.from_root(profile.sharepoint_root_folder)
+    return {
+        **asdict(profile),
+        "folder_structure": structure.as_dict(),
+    }
 
 
 def create_app(
@@ -242,6 +303,7 @@ def create_app(
     suppliers_store: SupplierStore | None = None,
     approval_matrix_store: ApprovalMatrixStore | None = None,
     supplier_terms_store: SupplierTermsStore | None = None,
+    auto_configure_sharepoint: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="Invoice Intake Prototype", version="0.1.0")
     app.state.notification_store = notification_store or OutlookNotificationStore(
@@ -277,10 +339,26 @@ def create_app(
     # watches in the app -- making genuinely still-pending invoices look like
     # they had skipped approvers and gone straight to Approved.
     irj_db_path = getattr(app.state.invoice_store, "database_path", invoice_db_path)
-    app.state.irj_generator = irj_generator or IrjNumberGenerator(irj_db_path)
-    app.state.activity_feed = activity_feed or ActivityFeedStore(
-        Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
-    )
+    if irj_generator is not None:
+        app.state.irj_generator = irj_generator
+    elif invoice_store is None and invoice_store_backend == "postgres":
+        from app.postgres_services import PostgresIrjNumberGenerator
+
+        app.state.irj_generator = PostgresIrjNumberGenerator()
+    else:
+        app.state.irj_generator = IrjNumberGenerator(irj_db_path)
+    if activity_feed is not None:
+        app.state.activity_feed = activity_feed
+    elif invoice_store is None and invoice_store_backend == "postgres":
+        from app.postgres_services import PostgresActivityFeedStore
+
+        app.state.activity_feed = PostgresActivityFeedStore()
+    else:
+        app.state.activity_feed = ActivityFeedStore(
+            Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
+        )
+    app.state.sharepoint_folder_paths = None
+    app.state.sharepoint_company_structures = None
     app.state.auth_store = auth_store or auth_store_from_environment()
     app.state.companies_store = companies_store or CompanyStore(
         Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
@@ -301,8 +379,11 @@ def create_app(
         app.state.sharepoint_client,
         companies_store=app.state.companies_store,
         approval_matrix_store=app.state.approval_matrix_store,
+        suppliers_store=app.state.suppliers_store,
     )
-    app.state.sharepoint_attach_attempted = app.state.sharepoint_client is not None
+    app.state.sharepoint_attach_attempted = (
+        app.state.sharepoint_client is not None or not auto_configure_sharepoint
+    )
 
     logger.info(
         "Invoice Processor starting: invoice store backend=%s, SharePoint filing=%s",
@@ -349,7 +430,7 @@ def create_app(
         <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Invoice Review Workspace</title>
+          <title>Swantex | Invoice Processing</title>
           <style>
             :root {
               color-scheme: light;
@@ -359,16 +440,29 @@ def create_app(
             }
             * { box-sizing: border-box; }
             body { margin: 0; min-width: 320px; }
-            header {
-              display: flex; align-items: center; justify-content: space-between;
-              gap: 1rem; padding: 1rem 1.5rem; color: white;
-              background: #102a43; border-bottom: 4px solid #2f80ed;
+            #app-root {
+              min-height: 100vh; display: grid;
+              grid-template-columns: 240px minmax(0, 1fr);
             }
-            header h1 { font-size: 1.15rem; margin: 0; }
-            .header-controls { display: flex; align-items: center; gap: .75rem; }
-            .prototype {
-              padding: .4rem .7rem; border: 1px solid #90cdf4; border-radius: 999px;
-              color: #bee3f8; font-size: .78rem; font-weight: 700;
+            .sidebar {
+              position: sticky; top: 0; height: 100vh; display: flex;
+              flex-direction: column; padding: 1.25rem .9rem; color: white;
+              background: #102a43; border-right: 4px solid #2f80ed;
+              overflow-y: auto;
+            }
+            .brand {
+              padding: .25rem .65rem 1.2rem; margin-bottom: .65rem;
+              border-bottom: 1px solid rgba(255,255,255,.14);
+            }
+            .brand h1 { margin: 0; font-size: 1.55rem; letter-spacing: -.02em; }
+            .brand p {
+              margin: .25rem 0 0; color: #9fb3c8; font-size: .76rem;
+              font-weight: 600; text-transform: uppercase; letter-spacing: .08em;
+            }
+            .header-controls {
+              display: flex; flex-direction: column; align-items: stretch;
+              gap: .65rem; margin-top: auto; padding: 1rem .4rem 0;
+              border-top: 1px solid rgba(255,255,255,.14);
             }
             .role-switcher-label {
               display: flex; align-items: center; gap: .4rem;
@@ -381,22 +475,24 @@ def create_app(
               background: #1c3a5e; color: white; font: inherit; font-size: .8rem;
               cursor: pointer;
             }
-            nav.section-nav {
-              display: flex; gap: .35rem; flex-wrap: wrap; padding: .6rem 1.5rem;
-              background: white; border-bottom: 1px solid #d9e2ec;
-            }
+            nav.section-nav { display: flex; flex-direction: column; gap: .3rem; }
             nav.section-nav button {
-              border: 1px solid #d9e2ec; background: #f8fafc; color: #486581;
-              border-radius: 999px; padding: .45rem .85rem; font-size: .8rem;
-              font-weight: 700; cursor: pointer;
+              display: flex; align-items: center; justify-content: space-between;
+              width: 100%; border: 1px solid transparent; background: transparent;
+              color: #bcccdc; border-radius: 8px; padding: .62rem .7rem;
+              font-size: .8rem; font-weight: 700; text-align: left; cursor: pointer;
             }
-            nav.section-nav button.active { background: #2f80ed; color: white; border-color: #2f80ed; }
+            nav.section-nav button:hover { background: rgba(255,255,255,.08); color: white; }
+            nav.section-nav button.active {
+              background: #2f80ed; color: white; border-color: #5da0f3;
+            }
             nav.section-nav button .count {
-              display: inline-block; margin-left: .35rem; padding: 0 .4rem;
-              border-radius: 999px; background: rgba(0,0,0,.12); font-size: .72rem;
+              display: inline-grid; place-items: center; min-width: 1.45rem;
+              margin-left: .35rem; padding: .08rem .38rem; border-radius: 999px;
+              background: rgba(255,255,255,.1); font-size: .7rem;
             }
             nav.section-nav button.active .count { background: rgba(255,255,255,.25); }
-            main { max-width: 1500px; margin: 0 auto; padding: 1.25rem; }
+            main { width: 100%; max-width: 1500px; margin: 0 auto; padding: 1.25rem; }
             .layout {
               display: grid; grid-template-columns: minmax(360px, .9fr) minmax(520px, 1.35fr);
               gap: 1rem; align-items: start;
@@ -487,6 +583,64 @@ def create_app(
             table.section-table th, table.section-table td {
               text-align: left; padding: .6rem .55rem; border-bottom: 1px solid #e4e7eb;
             }
+            table.section-table tr.invoice-summary-row {
+              cursor: pointer;
+            }
+            table.section-table tr.invoice-summary-row:hover,
+            table.section-table tr.invoice-summary-row:focus {
+              background: #f0f7ff;
+              outline: none;
+            }
+            table.section-table tr.invoice-summary-row[aria-expanded="true"] {
+              background: #e8f2ff;
+            }
+            .invoice-expand-hint {
+              display: block; margin-top: .25rem; color: #627d98;
+              font-size: .7rem; font-weight: 600;
+            }
+            .invoice-analysis-cell {
+              padding: 0 !important; background: #f8fbff;
+            }
+            .invoice-analysis {
+              display: grid; grid-template-columns: minmax(320px, 1.2fr) minmax(280px, .8fr);
+              gap: 1rem; padding: 1rem;
+            }
+            .invoice-analysis-pdf {
+              width: 100%; min-height: 620px; border: 1px solid #bcccdc;
+              border-radius: 8px; background: white;
+            }
+            .invoice-analysis-fields {
+              min-width: 0; padding: .9rem; border: 1px solid #d9e2ec;
+              border-radius: 8px; background: white;
+            }
+            .invoice-analysis-fields h3 {
+              margin: 0 0 .75rem; color: #243b53; font-size: .95rem;
+            }
+            .invoice-analysis-fields h4 {
+              margin: 1rem 0 .45rem; color: #486581; font-size: .75rem;
+              letter-spacing: .035em; text-transform: uppercase;
+            }
+            .invoice-analysis-list {
+              display: grid; grid-template-columns: minmax(120px, .7fr) minmax(0, 1.3fr);
+              gap: .45rem .75rem; margin: 0;
+            }
+            .invoice-analysis-list dt {
+              color: #627d98; font-size: .74rem; font-weight: 700;
+            }
+            .invoice-analysis-list dd {
+              min-width: 0; margin: 0; color: #243b53; font-size: .8rem;
+              overflow-wrap: anywhere;
+            }
+            .field-confidence {
+              display: inline-block; margin-left: .35rem; padding: .1rem .35rem;
+              border-radius: 999px; background: #e8f2ff; color: #1f5f99;
+              font-size: .66rem; font-weight: 700;
+            }
+            .analysis-warning {
+              margin-top: .75rem; padding: .65rem; border-left: 3px solid #d97706;
+              background: #fff8e7; color: #7c4a03; font-size: .78rem;
+              line-height: 1.45; white-space: pre-wrap;
+            }
             table.section-table th { color: #52606d; font-size: .72rem; text-transform: uppercase; }
             table.section-table tr:last-child td { border-bottom: 0; }
             .row-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
@@ -502,14 +656,51 @@ def create_app(
               animation: toast-in .15s ease-out;
             }
             .toast.error { background: #9b1c1c; }
+            dialog {
+              width: min(460px, calc(100vw - 2rem)); border: 0; border-radius: 12px;
+              padding: 0; box-shadow: 0 20px 60px rgba(16,42,67,.3);
+            }
+            dialog.admin-edit-dialog { width: min(640px, calc(100vw - 2rem)); }
+            dialog::backdrop { background: rgba(11,31,51,.55); }
+            .dialog-content { padding: 1rem; }
+            .dialog-content h2 { margin: 0 0 .35rem; font-size: 1.05rem; }
+            .dialog-content p { margin: 0 0 1rem; color: #52606d; font-size: .82rem; }
+            .dialog-content .actions { margin: 1rem -1rem -1rem; }
+            .admin-edit-fields {
+              display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+              gap: .75rem; margin-top: 1rem;
+            }
+            .admin-edit-fields label.full-width { grid-column: 1 / -1; }
+            @media (max-width: 600px) {
+              .admin-edit-fields { grid-template-columns: 1fr; }
+              .admin-edit-fields label.full-width { grid-column: auto; }
+            }
             @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
             @media (max-width: 950px) {
+              #app-root { grid-template-columns: 190px minmax(0, 1fr); }
               .layout { grid-template-columns: 1fr; }
               .pdf-empty { min-height: 360px; }
             }
-            @media (max-width: 620px) {
+            @media (max-width: 700px) {
+              #app-root { display: block; }
+              .sidebar {
+                position: static; width: 100%; height: auto; padding: .8rem;
+                border-right: 0; border-bottom: 4px solid #2f80ed;
+              }
+              .brand { padding: 0 .2rem .7rem; margin-bottom: .65rem; }
+              .brand h1 { font-size: 1.25rem; }
+              nav.section-nav {
+                flex-direction: row; overflow-x: auto; padding-bottom: .3rem;
+              }
+              nav.section-nav button {
+                width: auto; flex: 0 0 auto; gap: .5rem; white-space: nowrap;
+              }
+              .header-controls {
+                flex-direction: row; align-items: center; margin-top: .5rem;
+                padding: .7rem .2rem 0;
+              }
+              main { padding: .8rem; }
               .grid, .grid.three { grid-template-columns: 1fr; }
-              header { align-items: flex-start; flex-direction: column; }
             }
             #login-screen {
               position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center;
@@ -526,19 +717,120 @@ def create_app(
             #login-error { color: #c53030; font-size: .8rem; min-height: 1.1em; margin-bottom: .5rem; }
             #app-root.hidden { display: none; }
             .user-chip {
-              display: flex; align-items: center; gap: .5rem;
-              padding: .3rem .7rem; border-radius: 999px; border: 1px solid #325377;
-              background: #1c3a5e; color: #bee3f8; font-size: .78rem; font-weight: 600;
+              display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+              padding: .45rem .55rem; border-radius: 8px; border: 1px solid #325377;
+              background: #1c3a5e; color: #bee3f8; font-size: .75rem; font-weight: 600;
             }
             .user-chip button {
               background: transparent; border: 1px solid rgba(255,255,255,.4); color: white;
               padding: .25rem .55rem; font-size: .72rem; border-radius: 999px;
             }
-            .admin-block { margin-bottom: 1.5rem; }
-            .admin-block h3 { margin: 0 0 .6rem; font-size: .95rem; }
-            .admin-form { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .8rem; }
-            .admin-form input, .admin-form select { width: auto; flex: 1 1 140px; min-height: 36px; }
-            .admin-form button { white-space: nowrap; }
+            #admin-panel { display: grid; gap: 1rem; }
+            .admin-block {
+              min-width: 0; margin: 0; padding: 1rem;
+              border: 1px solid #d9e2ec; border-radius: 10px; background: #fbfdff;
+            }
+            .admin-block h3 {
+              margin: 0 0 .45rem; color: #243b53; font-size: .98rem;
+            }
+            details.admin-collapsible { padding: 0; }
+            details.admin-collapsible > summary {
+              display: flex; align-items: center; justify-content: space-between;
+              gap: 1rem; padding: 1rem; cursor: pointer; color: #243b53;
+              font-size: .98rem; font-weight: 700; list-style: none;
+              user-select: none;
+            }
+            details.admin-collapsible > summary::-webkit-details-marker {
+              display: none;
+            }
+            details.admin-collapsible > summary::after {
+              content: "⌄"; color: #52606d; font-size: 1.2rem;
+              line-height: 1; transition: transform .15s ease;
+            }
+            details.admin-collapsible[open] > summary {
+              border-bottom: 1px solid #d9e2ec;
+            }
+            details.admin-collapsible[open] > summary::after {
+              transform: rotate(180deg);
+            }
+            .admin-collapsible-content { padding: 1rem; }
+            .admin-help {
+              max-width: 82ch; margin: 0 0 .9rem; color: #52606d;
+              font-size: .82rem; line-height: 1.5;
+            }
+            .admin-form {
+              display: grid;
+              grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+              gap: .7rem; margin: .85rem 0 1rem; align-items: end;
+            }
+            .admin-form input, .admin-form select {
+              width: 100%; min-width: 0; min-height: 40px;
+            }
+            .admin-form button {
+              min-height: 40px; justify-self: start; white-space: nowrap;
+            }
+            #admin-company-root-folder { grid-column: span 2; }
+            .admin-table-wrap {
+              width: 100%; max-width: 100%; overflow-x: auto;
+              border: 1px solid #d9e2ec; border-radius: 8px; background: white;
+            }
+            table.admin-table {
+              width: 100%; border-collapse: collapse; font-size: .8rem;
+            }
+            table.admin-table th, table.admin-table td {
+              padding: .65rem .7rem; border-bottom: 1px solid #e4e7eb;
+              text-align: left; vertical-align: top; overflow-wrap: anywhere;
+            }
+            table.admin-table th {
+              background: #f0f4f8; color: #52606d; font-size: .68rem;
+              font-weight: 800; letter-spacing: .035em; text-transform: uppercase;
+              white-space: normal;
+            }
+            table.admin-table tr:last-child td { border-bottom: 0; }
+            table.admin-table td:last-child { width: 1%; white-space: nowrap; }
+            table.admin-table button { padding: .4rem .6rem; font-size: .75rem; }
+            .path-list {
+              display: grid; gap: .45rem; min-width: min(320px, 50vw);
+            }
+            .path-list div { display: grid; gap: .08rem; }
+            .path-list strong {
+              color: #52606d; font-size: .66rem; letter-spacing: .035em;
+              text-transform: uppercase;
+            }
+            .path-value {
+              color: #243b53; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size: .73rem; line-height: 1.35; overflow-wrap: anywhere;
+            }
+            #admin-company-folder-preview {
+              margin: .8rem 0 1rem; padding: .8rem; overflow-x: auto;
+              border: 1px solid #d9e2ec; border-radius: 8px; background: white;
+              color: #52606d; font-size: .8rem;
+            }
+            #admin-company-folder-preview table {
+              width: 100%; border-collapse: collapse;
+            }
+            #admin-company-folder-preview th,
+            #admin-company-folder-preview td {
+              padding: .4rem .5rem; border-bottom: 1px solid #e4e7eb;
+              text-align: left; vertical-align: top;
+            }
+            #admin-company-folder-preview th {
+              width: 150px; color: #52606d; font-size: .68rem;
+              text-transform: uppercase;
+            }
+            #admin-company-folder-preview td {
+              font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              overflow-wrap: anywhere;
+            }
+            @media (max-width: 700px) {
+              .admin-block { padding: .8rem; }
+              .admin-form { grid-template-columns: 1fr; }
+              #admin-company-root-folder { grid-column: auto; }
+              .admin-form button { width: 100%; }
+              .path-list { min-width: 230px; }
+              .invoice-analysis { grid-template-columns: 1fr; padding: .7rem; }
+              .invoice-analysis-pdf { min-height: 480px; }
+            }
           </style>
         </head>
         <body>
@@ -546,7 +838,7 @@ def create_app(
 
           <div id="login-screen">
             <form class="login-card" id="login-form">
-              <h1>Invoice Processing</h1>
+              <h1>Swantex</h1>
               <p>Sign in with your staff account to continue.</p>
               <div id="login-error"></div>
               <label>Username<input id="login-username" autocomplete="username" required></label>
@@ -555,29 +847,76 @@ def create_app(
             </form>
           </div>
 
+          <dialog id="payment-dialog">
+            <form id="payment-form" class="dialog-content">
+              <h2>Record domestic payment</h2>
+              <p id="payment-supplier-context"></p>
+              <div class="grid">
+                <label>Payment date
+                  <input id="payment-date" type="date" required>
+                </label>
+                <label>Payment method
+                  <select id="payment-method" required></select>
+                </label>
+                <label>Supplier account
+                  <select id="payment-supplier-account"></select>
+                </label>
+                <label style="grid-column: 1 / -1">Payment reference
+                  <input id="payment-reference" required>
+                </label>
+                <label>Normal payment terms
+                  <input id="payment-terms" disabled>
+                </label>
+                <label>Pay from bank account
+                  <input id="payment-bank-account" disabled>
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="secondary" id="payment-cancel">Cancel</button>
+                <button type="submit" class="primary">Record payment</button>
+              </div>
+            </form>
+          </dialog>
+
+          <dialog id="admin-edit-dialog" class="admin-edit-dialog">
+            <form id="admin-edit-form" class="dialog-content">
+              <h2 id="admin-edit-title">Edit record</h2>
+              <p>Update the fields below, then save your changes.</p>
+              <div id="admin-edit-fields" class="admin-edit-fields"></div>
+              <div class="actions">
+                <button type="button" class="secondary" id="admin-edit-cancel">Cancel</button>
+                <button type="submit" class="primary">Save changes</button>
+              </div>
+            </form>
+          </dialog>
+
           <div id="app-root" class="hidden">
-          <header>
-            <h1>Invoice Processing</h1>
+          <aside class="sidebar">
+            <div class="brand">
+              <h1>Swantex</h1>
+              <p>Invoice Processing</p>
+            </div>
+            <nav class="section-nav" id="section-nav">
+              <button data-tab="incoming" class="active">Incoming<span class="count" id="count-incoming">0</span></button>
+              <button data-tab="needs-review">Flagged Invoices<span class="count" id="count-needs-review">0</span></button>
+              <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
+              <button data-tab="sage-registration">Sage Registration<span class="count" id="count-sage-registration">0</span></button>
+              <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
+              <button data-tab="approver2">Approver 2<span class="count" id="count-approver2">0</span></button>
+              <button data-tab="on-hold">On Hold / Query<span class="count" id="count-on-hold">0</span></button>
+              <button data-tab="approved">Approved<span class="count" id="count-approved">0</span></button>
+              <button data-tab="reconciliation">Bank Reconciliation<span class="count" id="count-reconciliation">0</span></button>
+              <button data-tab="complete">Complete / Filed<span class="count" id="count-complete">0</span></button>
+              <button data-tab="rejected">Rejected<span class="count" id="count-rejected">0</span></button>
+              <button data-tab="admin">Admin</button>
+            </nav>
             <div class="header-controls">
               <span class="user-chip" id="user-chip">
                 <span id="user-chip-label">Signed in</span>
                 <button type="button" id="logout-button">Sign out</button>
               </span>
-              <div class="prototype">OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED</div>
             </div>
-          </header>
-          <nav class="section-nav" id="section-nav">
-            <button data-tab="incoming" class="active">Incoming<span class="count" id="count-incoming">0</span></button>
-            <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
-            <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
-            <button data-tab="approver2">Approver 2<span class="count" id="count-approver2">0</span></button>
-            <button data-tab="on-hold">On Hold / Query<span class="count" id="count-on-hold">0</span></button>
-            <button data-tab="approved">Approved<span class="count" id="count-approved">0</span></button>
-            <button data-tab="reconciliation">Bank Reconciliation<span class="count" id="count-reconciliation">0</span></button>
-            <button data-tab="complete">Complete / Filed<span class="count" id="count-complete">0</span></button>
-            <button data-tab="rejected">Rejected<span class="count" id="count-rejected">0</span></button>
-            <button data-tab="admin">Admin</button>
-          </nav>
+          </aside>
           <main>
             <div class="tab-panel active" data-tab-panel="incoming">
               <div class="layout">
@@ -678,8 +1017,8 @@ def create_app(
                       </label>
                       <label>Overall confidence
                         <div class="confidence">
-                          <input disabled placeholder="Not calculated">
-                          <small>—</small>
+                          <input id="ai-confidence" disabled placeholder="Not calculated">
+                          <small id="ai-confidence-percent">—</small>
                         </div>
                       </label>
                       <label style="grid-column: 1 / -1">Review warnings
@@ -693,7 +1032,9 @@ def create_app(
                         <select id="confirm-company"><option value="">Select company…</option></select>
                       </label>
                       <label>Supplier
-                        <input id="confirm-supplier" placeholder="Supplier name">
+                        <select id="confirm-supplier">
+                          <option value="">Select supplier…</option>
+                        </select>
                       </label>
                       <label>Supplier invoice number
                         <input id="confirm-supplier-invoice" placeholder="Supplier's invoice number">
@@ -719,16 +1060,32 @@ def create_app(
                   <div class="actions">
                     <button class="secondary" id="flag-review-button">Flag for review</button>
                     <button class="danger" id="override-duplicate-button" style="display: none">This is not a duplicate — route anyway</button>
+                    <button class="danger" id="cancel-duplicate-button" style="display: none">Confirmed duplicate — cancel</button>
+                    <button class="secondary" id="retry-approval-route-button" style="display: none">Retry configured approver route</button>
                     <button class="primary" id="confirm-invoice-button">Purchase Ledger: confirm invoice</button>
                   </div>
                 </section>
               </div>
             </div>
 
+            <div class="tab-panel" data-tab-panel="needs-review">
+              <section class="card">
+                <div class="card-header"><h2>Flagged Invoices — Purchase Ledger Review</h2></div>
+                <div class="content" id="needs-review-table"></div>
+              </section>
+            </div>
+
             <div class="tab-panel" data-tab-panel="po-matching">
               <section class="card">
                 <div class="card-header"><h2>Purchase Order Invoice Matching</h2></div>
                 <div class="content" id="po-matching-table"></div>
+              </section>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="sage-registration">
+              <section class="card">
+                <div class="card-header"><h2>Awaiting Sage Registration</h2></div>
+                <div class="content" id="sage-registration-table"></div>
               </section>
             </div>
 
@@ -786,37 +1143,53 @@ def create_app(
                 <div class="content" id="admin-panel">
                   <div class="admin-block">
                     <h3>Bulk import supplier master data</h3>
-                    <p style="margin: 0 0 8px; color: #555;">
-                      Upload an Excel (.xlsx) sheet with columns for Company, Supplier,
-                      Supplier Account Number, Default Payment Method, Payment Terms,
-                      Bank Account, and Approver(s) to create/update these records in bulk
-                      instead of entering every row by hand.
+                    <p class="admin-help">
+                      Choose the invoice company, then upload an Excel (.xlsx) sheet
+                      containing Trading Partner Name, Supplier Account Number,
+                      Default Payment Method, Payment Terms, Bank Account, and
+                      Approver(s). Optional Approver Email columns can also be
+                      included. Every supplier and approval route will be assigned
+                      to the selected company.
                     </p>
                     <form class="admin-form" id="admin-import-form">
+                      <select id="admin-import-company" required>
+                        <option value="">Select invoice company…</option>
+                      </select>
                       <input id="admin-import-file" type="file" accept=".xlsx,.xlsm" required>
                       <button type="submit" class="primary">Import workbook</button>
                     </form>
                     <div id="admin-import-result"></div>
                   </div>
 
-                  <div class="admin-block">
-                    <h3>Companies</h3>
-                    <form class="admin-form" id="admin-company-form">
-                      <input id="admin-company-name" placeholder="Company name" required>
-                      <input id="admin-company-folder" placeholder="Company folder path" required>
-                      <input id="admin-company-po-folder" placeholder="PO matching folder path" required>
-                      <input id="admin-company-aliases" placeholder="Aliases (comma separated)">
-                      <button type="submit" class="primary">Add company</button>
-                    </form>
-                    <div id="admin-companies-table"></div>
-                  </div>
+                  <details class="admin-block admin-collapsible">
+                    <summary>Companies</summary>
+                    <div class="admin-collapsible-content">
+                      <p id="admin-sharepoint-folder-status" class="admin-help">
+                        Loading SharePoint folders…
+                      </p>
+                      <form class="admin-form" id="admin-company-form">
+                        <input id="admin-company-name" placeholder="Company name" required>
+                        <select id="admin-company-root-folder" required disabled>
+                          <option value="">Select SharePoint company folder…</option>
+                        </select>
+                        <input id="admin-company-aliases" placeholder="Aliases (comma separated)">
+                        <button type="submit" class="primary" id="admin-company-submit" disabled>Add company</button>
+                      </form>
+                      <div id="admin-company-folder-preview" class="empty">
+                        Select a company folder to preview its workflow destinations.
+                      </div>
+                      <div id="admin-companies-table"></div>
+                    </div>
+                  </details>
 
                   <div class="admin-block">
                     <h3>Suppliers</h3>
                     <form class="admin-form" id="admin-supplier-form">
                       <input id="admin-supplier-name" placeholder="Supplier name" required>
                       <input id="admin-supplier-aliases" placeholder="Aliases (comma separated)">
-                      <input id="admin-supplier-default-company" placeholder="Default company (optional)">
+                      <select id="admin-supplier-default-company">
+                        <option value="">No default company</option>
+                      </select>
                       <input id="admin-supplier-contact" placeholder="Contact email (optional)">
                       <button type="submit" class="primary">Add supplier</button>
                     </form>
@@ -824,10 +1197,20 @@ def create_app(
                   </div>
 
                   <div class="admin-block">
+                    <h3>Supplier payment settings</h3>
+                    <div id="admin-supplier-terms-table"></div>
+                  </div>
+
+                  <div class="admin-block">
                     <h3>Approval matrix</h3>
                     <form class="admin-form" id="admin-matrix-form">
-                      <input id="admin-matrix-company" placeholder="Company" required>
-                      <input id="admin-matrix-supplier" placeholder="Supplier" required>
+                      <select id="admin-matrix-company" required>
+                        <option value="">Select invoice company…</option>
+                        <option value="*">All invoice companies</option>
+                      </select>
+                      <select id="admin-matrix-supplier" required>
+                        <option value="">Select supplier company…</option>
+                      </select>
                       <input id="admin-matrix-approver1-name" placeholder="Approver 1 name" required>
                       <input id="admin-matrix-approver1-email" placeholder="Approver 1 email" required>
                       <input id="admin-matrix-approver2-name" placeholder="Approver 2 name (optional)">
@@ -870,23 +1253,25 @@ def create_app(
           </div>
           <script>
             const SECTION_STATUSES = {
-              "incoming": ["Awaiting AI Extraction", "Needs Review"],
+              "incoming": ["Awaiting AI Extraction"],
+              "needs-review": ["Needs Review"],
               "po-matching": ["Awaiting PO Matching", "PO Query / Matching Issue"],
+              "sage-registration": ["Awaiting Sage Registration"],
               "approver1": ["Awaiting Approval 1"],
               "approver2": ["Awaiting Approval 2"],
               "on-hold": ["Approval Query / On Hold"],
-              "approved": ["Approved"],
+              "approved": ["Approved", "Foreign Payment / Awaiting Allocation"],
               "reconciliation": ["Paid / Awaiting Bank Reconciliation"],
               "complete": ["Reconciled / Complete"],
-              "rejected": ["Rejected"],
+              "rejected": ["Rejected", "Cancelled - Duplicate"],
             };
             // Which nav tabs each signed-in role may view. "admin" is a
             // config panel, not an invoice-status tab, and is only ever
             // shown to the admin role. Every other tab maps 1:1 onto
             // MANUAL_VS_AUTOMATED.md's manual decision steps.
             const ROLE_TABS = {
-              "admin": ["incoming", "po-matching", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
-              "purchase_ledger": ["incoming", "po-matching", "on-hold", "approved", "reconciliation", "complete", "rejected"],
+              "admin": ["incoming", "needs-review", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
+              "purchase_ledger": ["incoming", "needs-review", "po-matching", "sage-registration", "on-hold", "approved", "reconciliation", "complete", "rejected"],
               "approver1": ["approver1"],
               "approver2": ["approver2"],
               "purchasing": ["po-matching"],
@@ -905,6 +1290,10 @@ def create_app(
             let currentTab = "incoming";
             let lastActivityId = null;
             let currentUser = null;
+            let sharePointCompanyFolders = new Map();
+            let adminCompanies = [];
+            let adminSuppliers = [];
+            const expandedInvoiceIds = new Set();
 
             function setValue(id, value) {
               const el = document.getElementById(id);
@@ -926,6 +1315,13 @@ def create_app(
               setValue("source-received", invoice.received_at);
               setValue("source-subject", invoice.subject);
               setValue("processing-status", invoice.status);
+              const confidence = invoice.ai_confidence;
+              setValue(
+                "ai-confidence",
+                confidence == null ? "" : Number(confidence).toFixed(2)
+              );
+              document.getElementById("ai-confidence-percent").textContent =
+                confidence == null ? "—" : `${Math.round(Number(confidence) * 100)}%`;
               setValue("preview-irj", invoice.irj_number);
               setValue("preview-company", invoice.company);
               setValue("preview-supplier", invoice.supplier);
@@ -934,22 +1330,35 @@ def create_app(
               setValue("preview-invoice-date", invoice.invoice_date);
               setValue("preview-value", invoice.invoice_value);
               setValue("preview-currency", invoice.currency);
-              setValue("review-warnings", invoice.review_reason);
+              setValue(
+                "review-warnings",
+                invoice.ai_review_warnings || invoice.review_reason
+              );
               document.getElementById("intake-notice").textContent =
                 invoice.review_reason ||
                 "This PDF and its email metadata were retrieved from Outlook. AI extraction has not run yet.";
               const duplicateWarning = document.getElementById("duplicate-warning");
               const overrideButton = document.getElementById("override-duplicate-button");
+              const cancelDuplicateButton = document.getElementById("cancel-duplicate-button");
+              const retryApprovalRouteButton = document.getElementById("retry-approval-route-button");
               if (invoice.duplicate_of_invoice_id) {
                 duplicateWarning.style.display = "grid";
                 document.getElementById("duplicate-warning-text").textContent =
                   invoice.review_reason ||
                   `Possible duplicate of invoice #${invoice.duplicate_of_invoice_id}.`;
                 overrideButton.style.display = "";
+                cancelDuplicateButton.style.display = "";
               } else {
                 duplicateWarning.style.display = "none";
                 overrideButton.style.display = "none";
+                cancelDuplicateButton.style.display = "none";
               }
+              retryApprovalRouteButton.style.display =
+                invoice.status === "Needs Review" &&
+                invoice.invoice_type === "nominal" &&
+                invoice.sage_registered_at
+                  ? ""
+                  : "none";
               if (displayedInvoiceId !== invoice.id) {
                 // Only (re)populate the editable confirm-* fields when the
                 // displayed invoice actually changes. showInvoice() is also
@@ -972,7 +1381,10 @@ def create_app(
             }
 
             function incomingInvoices() {
-              return invoices.filter(i => SECTION_STATUSES["incoming"].includes(i.status));
+              return invoices.filter(i =>
+                SECTION_STATUSES["incoming"].includes(i.status) ||
+                SECTION_STATUSES["needs-review"].includes(i.status)
+              );
             }
 
             function refreshPicker() {
@@ -1027,6 +1439,28 @@ def create_app(
               }
             }
 
+            async function loadSuppliers() {
+              const response = await fetch("/api/suppliers");
+              if (!response.ok) return;
+              const suppliers = await response.json();
+              const select = document.getElementById("confirm-supplier");
+              const selected = select.value;
+              select.innerHTML = '<option value="">Select supplier…</option>';
+              for (const supplier of suppliers) {
+                const option = document.createElement("option");
+                option.value = supplier.name;
+                option.textContent = supplier.name;
+                select.appendChild(option);
+              }
+              if (selected && !suppliers.some(supplier => supplier.name === selected)) {
+                const option = document.createElement("option");
+                option.value = selected;
+                option.textContent = `${selected} (not in supplier register)`;
+                select.appendChild(option);
+              }
+              select.value = selected;
+            }
+
             function updateCounts() {
               for (const tab of Object.keys(SECTION_STATUSES)) {
                 const count = invoices.filter(i => SECTION_STATUSES[tab].includes(i.status)).length;
@@ -1041,6 +1475,85 @@ def create_app(
               return div.innerHTML;
             }
 
+            function fieldConfidences(invoice) {
+              if (!invoice.ai_field_confidences) return {};
+              try {
+                const parsed = JSON.parse(invoice.ai_field_confidences);
+                return parsed && typeof parsed === "object" ? parsed : {};
+              } catch (error) {
+                return {};
+              }
+            }
+
+            function analysisValue(value) {
+              return value === null || value === undefined || value === ""
+                ? "—"
+                : escapeHtml(value);
+            }
+
+            function analysisField(label, value, confidence = null) {
+              const confidenceBadge = confidence === null || confidence === undefined
+                ? ""
+                : `<span class="field-confidence">${Math.round(Number(confidence) * 100)}%</span>`;
+              return `<dt>${escapeHtml(label)}</dt><dd>${analysisValue(value)}${confidenceBadge}</dd>`;
+            }
+
+            function invoiceAnalysisHtml(invoice) {
+              const confidences = fieldConfidences(invoice);
+              const overallConfidence = invoice.ai_confidence === null ||
+                  invoice.ai_confidence === undefined
+                ? "—"
+                : `${Math.round(Number(invoice.ai_confidence) * 100)}%`;
+              const warnings = invoice.ai_review_warnings || invoice.review_reason;
+              return `
+                <div class="invoice-analysis">
+                  <iframe
+                    class="invoice-analysis-pdf"
+                    src="/api/invoices/${invoice.id}/pdf"
+                    title="Invoice ${escapeHtml(invoice.irj_number || invoice.original_filename)} PDF"
+                  ></iframe>
+                  <section class="invoice-analysis-fields" aria-label="Invoice analysis">
+                    <h3>Extracted invoice analysis</h3>
+                    <h4>Workflow</h4>
+                    <dl class="invoice-analysis-list">
+                      ${analysisField("Status", invoice.status)}
+                      ${analysisField("IRJ number", invoice.irj_number)}
+                      ${analysisField("Invoice type", invoice.invoice_type)}
+                      ${analysisField("Overall confidence", overallConfidence)}
+                    </dl>
+                    <h4>Extracted fields</h4>
+                    <dl class="invoice-analysis-list">
+                      ${analysisField("Company", invoice.company, confidences.company)}
+                      ${analysisField("Supplier", invoice.supplier, confidences.supplier)}
+                      ${analysisField("Supplier invoice no.", invoice.supplier_invoice_number, confidences.supplier_invoice_number)}
+                      ${analysisField("PO number", invoice.po_number, confidences.purchase_order_number)}
+                      ${analysisField("Invoice date", invoice.invoice_date, confidences.invoice_date)}
+                      ${analysisField("Invoice value", invoice.invoice_value, confidences.invoice_value)}
+                      ${analysisField("Currency", invoice.currency, confidences.currency)}
+                    </dl>
+                    <h4>Source</h4>
+                    <dl class="invoice-analysis-list">
+                      ${analysisField("Filename", invoice.original_filename)}
+                      ${analysisField("Sender", invoice.sender_address || invoice.sender_name)}
+                      ${analysisField("Received", invoice.received_at)}
+                      ${analysisField("Subject", invoice.subject)}
+                    </dl>
+                    ${invoice.sage_reference || invoice.approver1_name ? `
+                      <h4>Processing</h4>
+                      <dl class="invoice-analysis-list">
+                        ${analysisField("Sage reference", invoice.sage_reference)}
+                        ${analysisField("Approver 1", invoice.approver1_name)}
+                        ${analysisField("Approver 1 decision", invoice.approver1_decision)}
+                        ${analysisField("Approver 2", invoice.approver2_name)}
+                        ${analysisField("Approver 2 decision", invoice.approver2_decision)}
+                      </dl>
+                    ` : ""}
+                    ${warnings ? `<div class="analysis-warning">${escapeHtml(warnings)}</div>` : ""}
+                  </section>
+                </div>
+              `;
+            }
+
             function renderSectionTable(containerId, statuses, columns, actionsFn) {
               const container = document.getElementById(containerId);
               if (!container) return;
@@ -1053,17 +1566,40 @@ def create_app(
               for (const column of columns) html += `<th>${column.label}</th>`;
               html += "<th>Actions</th></tr></thead><tbody>";
               for (const invoice of rows) {
-                html += "<tr>";
+                const expanded = expandedInvoiceIds.has(String(invoice.id));
+                html += `<tr class="invoice-summary-row" data-expand-invoice="${invoice.id}" ` +
+                  `tabindex="0" aria-expanded="${expanded}" title="Click to view invoice analysis">`;
                 for (const column of columns) {
                   html += `<td>${escapeHtml(column.value(invoice))}</td>`;
                 }
-                html += `<td class="row-actions">${actionsFn(invoice)}</td>`;
+                html += `<td class="row-actions">${actionsFn(invoice)}` +
+                  `<span class="invoice-expand-hint">${expanded ? "Hide" : "View"} PDF and extracted fields</span></td>`;
                 html += "</tr>";
+                if (expanded) {
+                  html += `<tr class="invoice-analysis-row"><td colspan="${columns.length + 1}" ` +
+                    `class="invoice-analysis-cell">${invoiceAnalysisHtml(invoice)}</td></tr>`;
+                }
               }
               html += "</tbody></table>";
               container.innerHTML = html;
               container.querySelectorAll("[data-action]").forEach(button => {
                 button.addEventListener("click", () => handleRowAction(button));
+              });
+              container.querySelectorAll("[data-expand-invoice]").forEach(row => {
+                const toggle = event => {
+                  if (event.target.closest("button, a, input, select, textarea")) return;
+                  if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
+                  event.preventDefault();
+                  const id = String(row.dataset.expandInvoice);
+                  if (expandedInvoiceIds.has(id)) {
+                    expandedInvoiceIds.delete(id);
+                  } else {
+                    expandedInvoiceIds.add(id);
+                  }
+                  renderAllSections();
+                };
+                row.addEventListener("click", toggle);
+                row.addEventListener("keydown", toggle);
               });
             }
 
@@ -1081,13 +1617,42 @@ def create_app(
 
             function renderAllSections() {
               renderSectionTable(
+                "needs-review-table",
+                SECTION_STATUSES["needs-review"],
+                [
+                  ...BASE_COLUMNS,
+                  { label: "Reason", value: i => i.review_reason || "—" },
+                  { label: "Return stage", value: i => i.review_return_status || "Requires a dedicated resolution" },
+                ],
+                invoice => `
+                  ${pdfLinkButton(invoice)}
+                  <button data-action="open-review" data-id="${invoice.id}" class="secondary">Open review</button>
+                  ${invoice.review_return_status ? `
+                    <button data-action="accept-review" data-id="${invoice.id}">Accept</button>
+                    <button data-action="reject-review" data-id="${invoice.id}" class="danger">Reject</button>
+                  ` : ""}
+                `
+              );
+              renderSectionTable(
                 "po-matching-table",
                 SECTION_STATUSES["po-matching"],
                 [...BASE_COLUMNS, { label: "PO number", value: i => i.po_number || "—" }],
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="po-match" data-id="${invoice.id}">Mark matched</button>
-                  <button data-action="po-query" data-id="${invoice.id}">Record query</button>
+                  ${currentUser && currentUser.role === "purchasing" ? "" : `
+                    <button data-action="po-match" data-id="${invoice.id}">Mark matched</button>
+                    <button data-action="po-query" data-id="${invoice.id}">Record query</button>
+                    <button data-action="po-reject" data-id="${invoice.id}" class="danger">Reject</button>
+                  `}
+                `
+              );
+              renderSectionTable(
+                "sage-registration-table",
+                SECTION_STATUSES["sage-registration"],
+                BASE_COLUMNS,
+                invoice => `
+                  ${pdfLinkButton(invoice)}
+                  <button data-action="register-sage" data-id="${invoice.id}">Confirm Sage registration</button>
                 `
               );
               renderSectionTable(
@@ -1125,10 +1690,17 @@ def create_app(
                 "approved-table",
                 SECTION_STATUSES["approved"],
                 BASE_COLUMNS,
-                invoice => `
-                  ${pdfLinkButton(invoice)}
-                  <button data-action="pay" data-id="${invoice.id}">Mark paid</button>
-                `
+                invoice => invoice.status === "Foreign Payment / Awaiting Allocation"
+                  ? `
+                    ${pdfLinkButton(invoice)}
+                    <button data-action="allocate-foreign" data-id="${invoice.id}">Mark allocated</button>
+                    <button data-action="revert-foreign" data-id="${invoice.id}" class="secondary">Not foreign — return</button>
+                  `
+                  : `
+                    ${pdfLinkButton(invoice)}
+                    <button data-action="pay" data-id="${invoice.id}">Record domestic payment</button>
+                    <button data-action="route-foreign" data-id="${invoice.id}" class="secondary">Foreign payment</button>
+                  `
               );
               renderSectionTable(
                 "reconciliation-table",
@@ -1148,22 +1720,22 @@ def create_app(
                 SECTION_STATUSES["complete"],
                 [
                   ...BASE_COLUMNS,
-                  { label: "Reconciled", value: i => i.reconciliation_date || "—" },
-                  { label: "Reconciled by", value: i => i.reconciled_by || "—" },
+                  { label: "Completed", value: i => i.reconciliation_date || i.foreign_allocation_date || "—" },
+                  { label: "Completed by", value: i => i.reconciled_by || i.foreign_allocated_by || "—" },
                 ],
                 invoice => pdfLinkButton(invoice)
               );
               renderSectionTable(
                 "rejected-table",
                 SECTION_STATUSES["rejected"],
-                [...BASE_COLUMNS, { label: "Reason", value: i => i.rejection_reason || "—" }],
+                [...BASE_COLUMNS, { label: "Reason", value: i => i.rejection_reason || i.cancellation_reason || "—" }],
                 invoice => pdfLinkButton(invoice)
               );
             }
 
-            async function postJson(url, body) {
+            async function sendJson(url, method, body) {
               const response = await fetch(url, {
-                method: "POST",
+                method,
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body || {}),
               });
@@ -1174,12 +1746,103 @@ def create_app(
               return response.json();
             }
 
+            async function postJson(url, body) {
+              return sendJson(url, "POST", body);
+            }
+
+            async function putJson(url, body) {
+              return sendJson(url, "PUT", body);
+            }
+
+            async function collectDomesticPayment(invoice) {
+              const response = await fetch(
+                `/api/supplier-terms?company=${encodeURIComponent(invoice.company || "")}` +
+                `&supplier=${encodeURIComponent(invoice.supplier || "")}`
+              );
+              const terms = response.ok ? await response.json() : {};
+              const dialog = document.getElementById("payment-dialog");
+              const form = document.getElementById("payment-form");
+              const method = document.getElementById("payment-method");
+              const account = document.getElementById("payment-supplier-account");
+              const standardMethods = ["BACS", "Direct Debit", "CHAPS", "Card", "Cheque", "Other"];
+              const profiles = terms.profiles || [];
+              account.innerHTML = profiles.length
+                ? profiles.map(profile =>
+                    `<option value="${escapeHtml(profile.supplier_account_number || "")}">` +
+                    `${escapeHtml(profile.supplier_account_number || "No account number")} — ` +
+                    `${escapeHtml(profile.bank_account || "No bank specified")}` +
+                    `</option>`
+                  ).join("")
+                : '<option value="">No configured supplier account</option>';
+              account.disabled = !profiles.length;
+              const applyProfile = () => {
+                const profile = profiles.find(item => item.supplier_account_number === account.value) || profiles[0] || {};
+                const methods = [...standardMethods];
+                if (profile.default_payment_method && !methods.includes(profile.default_payment_method)) {
+                  methods.unshift(profile.default_payment_method);
+                }
+                method.innerHTML = methods
+                  .map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`)
+                  .join("");
+                method.value = profile.default_payment_method || "BACS";
+                document.getElementById("payment-terms").value = profile.payment_terms_notice || "";
+                document.getElementById("payment-bank-account").value = profile.bank_account || "";
+              };
+              account.onchange = applyProfile;
+              applyProfile();
+              document.getElementById("payment-date").value = new Date().toISOString().slice(0, 10);
+              document.getElementById("payment-reference").value = "";
+              document.getElementById("payment-supplier-context").textContent =
+                invoice.supplier || "Supplier";
+
+              return new Promise(resolve => {
+                let settled = false;
+                const finish = value => {
+                  if (settled) return;
+                  settled = true;
+                  resolve(value);
+                };
+                form.onsubmit = event => {
+                  event.preventDefault();
+                  const payment = {
+                    payment_date: document.getElementById("payment-date").value,
+                    supplier_account_number: account.value || null,
+                    payment_reference: document.getElementById("payment-reference").value,
+                    payment_method: method.value,
+                  };
+                  dialog.close();
+                  finish(payment);
+                };
+                document.getElementById("payment-cancel").onclick = () => dialog.close();
+                dialog.onclose = () => finish(null);
+                dialog.showModal();
+              });
+            }
+
             async function handleRowAction(button) {
               const action = button.dataset.action;
               const id = button.dataset.id;
               try {
                 if (action === "po-match") {
                   await postJson(`/api/invoices/${id}/po-match`, { matched: true, notes: null });
+                } else if (action === "open-review") {
+                  document.querySelector('#section-nav button[data-tab="incoming"]').click();
+                  picker.value = String(id);
+                  const invoice = invoices.find(item => String(item.id) === String(id));
+                  if (invoice) showInvoice(invoice);
+                  return;
+                } else if (action === "accept-review") {
+                  await postJson(`/api/invoices/${id}/review-decision`, {
+                    accepted: true,
+                    reason: null,
+                  });
+                } else if (action === "reject-review") {
+                  const reason = window.prompt("Reason for rejecting this invoice:");
+                  if (!reason) return;
+                  await postJson(`/api/invoices/${id}/review-decision`, {
+                    accepted: false,
+                    reason,
+                  });
                 } else if (action === "po-query") {
                   const notes = window.prompt("Describe the PO matching issue:");
                   if (notes === null) return;
@@ -1192,6 +1855,16 @@ def create_app(
                     notes,
                     query_category: queryCategory || null,
                     purchasing_contact: purchasingContact || null,
+                  });
+                } else if (action === "po-reject") {
+                  const reason = window.prompt("Reason for rejecting this PO invoice:");
+                  if (!reason) return;
+                  await postJson(`/api/invoices/${id}/reject`, { reason });
+                } else if (action === "register-sage") {
+                  const sageReference = window.prompt("Sage registration reference:");
+                  if (!sageReference) return;
+                  await postJson(`/api/invoices/${id}/register-sage`, {
+                    sage_reference: sageReference,
                   });
                 } else if (action === "approve" || action === "reject") {
                   const comments = window.prompt(
@@ -1215,14 +1888,25 @@ def create_app(
                   const notes = window.prompt("Resolution notes for resuming approval (optional):");
                   await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
                 } else if (action === "pay") {
-                  const paymentDate = window.prompt("Payment date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
-                  if (!paymentDate) return;
-                  const paymentReference = window.prompt("Payment reference (optional):");
-                  const paymentMethod = window.prompt("Payment method (e.g. BACS, CHAPS, card):");
-                  await postJson(`/api/invoices/${id}/pay`, {
-                    payment_date: paymentDate,
-                    payment_reference: paymentReference || null,
-                    payment_method: paymentMethod || null,
+                  const invoice = invoices.find(item => String(item.id) === String(id));
+                  if (!invoice) throw new Error("Invoice could not be found.");
+                  const payment = await collectDomesticPayment(invoice);
+                  if (!payment) return;
+                  await postJson(`/api/invoices/${id}/pay`, payment);
+                } else if (action === "route-foreign") {
+                  if (!window.confirm("Confirm this is a foreign payment requiring allocation?")) return;
+                  await postJson(`/api/invoices/${id}/route-foreign-payment`, {});
+                } else if (action === "revert-foreign") {
+                  if (!window.confirm("Return this invoice to the domestic payment route?")) return;
+                  await postJson(`/api/invoices/${id}/revert-foreign-payment`, {});
+                } else if (action === "allocate-foreign") {
+                  const allocationDate = window.prompt("Allocation date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
+                  if (!allocationDate) return;
+                  const allocationReference = window.prompt("Foreign payment allocation reference:");
+                  if (!allocationReference) return;
+                  await postJson(`/api/invoices/${id}/allocate-foreign-payment`, {
+                    allocation_date: allocationDate,
+                    allocation_reference: allocationReference,
                   });
                 } else if (action === "reconcile") {
                   const reconciliationDate = window.prompt("Reconciliation date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
@@ -1258,6 +1942,32 @@ def create_app(
 
             document.getElementById("override-duplicate-button").addEventListener("click", async () => {
               await submitConfirm(true);
+            });
+
+            document.getElementById("cancel-duplicate-button").addEventListener("click", async () => {
+              const invoiceId = picker.value;
+              if (!invoiceId || !window.confirm("Confirm this invoice is a duplicate and cancel it?")) return;
+              try {
+                await postJson(`/api/invoices/${invoiceId}/cancel-duplicate`, {});
+                showToast("Duplicate invoice cancelled.");
+                await loadInvoices();
+              } catch (error) {
+                showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("retry-approval-route-button").addEventListener("click", async () => {
+              const invoice = invoices.find(item => String(item.id) === picker.value);
+              if (!invoice || !invoice.sage_reference) return;
+              try {
+                await postJson(`/api/invoices/${invoice.id}/register-sage`, {
+                  sage_reference: invoice.sage_reference,
+                });
+                showToast("Approver route checked again.");
+                await loadInvoices();
+              } catch (error) {
+                showToast(error.message, true);
+              }
             });
 
             async function submitConfirm(overrideDuplicate) {
@@ -1393,52 +2103,311 @@ def create_app(
                 .filter(Boolean);
             }
 
-            function renderSimpleTable(container, columns, rows, onDelete, idKey = "id") {
+            function renderSimpleTable(
+              container,
+              columns,
+              rows,
+              onDelete,
+              idKey = "id",
+              onEdit = null
+            ) {
               if (!rows.length) {
                 container.innerHTML = '<p class="empty">Nothing here yet.</p>';
                 return;
               }
-              const head = columns.map(c => `<th>${c.label}</th>`).join("") + (onDelete ? "<th></th>" : "");
+              const hasActions = Boolean(onDelete || onEdit);
+              const head = columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("") +
+                (hasActions ? "<th>Actions</th>" : "");
               const body = rows
-                .map(row => {
-                  const cells = columns.map(c => `<td>${c.value(row) ?? "—"}</td>`).join("");
-                  const deleteCell = onDelete
-                    ? `<td><button class="danger" data-delete-id="${row[idKey]}">Delete</button></td>`
+                .map((row, index) => {
+                  const cells = columns
+                    .map(c => `<td>${escapeHtml(c.value(row) ?? "—")}</td>`)
+                    .join("");
+                  const actionCell = hasActions
+                    ? `<td><div class="row-actions">` +
+                      (onEdit
+                        ? `<button class="secondary" data-edit-index="${index}">Edit</button>`
+                        : "") +
+                      (onDelete
+                        ? `<button class="danger" data-delete-index="${index}">Delete</button>`
+                        : "") +
+                      `</div></td>`
                     : "";
-                  return `<tr>${cells}${deleteCell}</tr>`;
+                  return `<tr>${cells}${actionCell}</tr>`;
                 })
                 .join("");
-              container.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+              container.innerHTML =
+                `<div class="admin-table-wrap"><table class="admin-table">` +
+                `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>` +
+                `</table></div>`;
               if (onDelete) {
-                container.querySelectorAll("[data-delete-id]").forEach(button => {
-                  button.addEventListener("click", () => onDelete(button.dataset.deleteId));
+                container.querySelectorAll("[data-delete-index]").forEach(button => {
+                  button.addEventListener("click", () => {
+                    const row = rows[Number(button.dataset.deleteIndex)];
+                    onDelete(row[idKey]);
+                  });
                 });
+              }
+              if (onEdit) {
+                container.querySelectorAll("[data-edit-index]").forEach(button => {
+                  button.addEventListener(
+                    "click",
+                    () => onEdit(rows[Number(button.dataset.editIndex)])
+                  );
+                });
+              }
+            }
+
+            function openAdminEditor(title, fields, onSave) {
+              const dialog = document.getElementById("admin-edit-dialog");
+              const form = document.getElementById("admin-edit-form");
+              const container = document.getElementById("admin-edit-fields");
+              document.getElementById("admin-edit-title").textContent = title;
+              container.replaceChildren();
+              const controls = new Map();
+              for (const field of fields) {
+                const label = document.createElement("label");
+                label.textContent = field.label;
+                if (field.fullWidth) label.classList.add("full-width");
+                let control;
+                if (field.type === "select") {
+                  control = document.createElement("select");
+                  for (const [value, optionLabel] of field.options || []) {
+                    const option = document.createElement("option");
+                    option.value = value;
+                    option.textContent = optionLabel;
+                    control.appendChild(option);
+                  }
+                } else if (field.type === "textarea") {
+                  control = document.createElement("textarea");
+                } else {
+                  control = document.createElement("input");
+                  control.type = field.type || "text";
+                }
+                control.value = field.value ?? "";
+                control.required = Boolean(field.required);
+                control.autocomplete = field.type === "password" ? "new-password" : "off";
+                label.appendChild(control);
+                container.appendChild(label);
+                controls.set(field.key, { control, field });
+              }
+              document.getElementById("admin-edit-cancel").onclick = () => dialog.close();
+              form.onsubmit = async event => {
+                event.preventDefault();
+                const values = {};
+                for (const [key, { control, field }] of controls) {
+                  if (field.omitWhenBlank && !control.value) continue;
+                  values[key] = field.nullWhenBlank && !control.value
+                    ? null
+                    : control.value;
+                }
+                try {
+                  await onSave(values);
+                  dialog.close();
+                } catch (error) {
+                  showToast(error.message, true);
+                }
+              };
+              dialog.showModal();
+            }
+
+            function companyOptions(includeAll = false) {
+              return [
+                ["", "Select invoice company…"],
+                ...(includeAll ? [["*", "All invoice companies"]] : []),
+                ...adminCompanies.map(company => [company.name, company.name]),
+              ];
+            }
+
+            function supplierOptions() {
+              return [
+                ["", "Select supplier company…"],
+                ...adminSuppliers.map(supplier => [supplier.name, supplier.name]),
+              ];
+            }
+
+            function includeCurrentOption(options, value, label = value) {
+              if (!value || options.some(([optionValue]) => optionValue === value)) {
+                return options;
+              }
+              return [...options, [value, label]];
+            }
+
+            function replaceSelectOptions(select, options) {
+              const selected = select.value;
+              select.replaceChildren();
+              for (const [value, label] of options) {
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = label;
+                select.appendChild(option);
+              }
+              if (options.some(([value]) => value === selected)) {
+                select.value = selected;
+              }
+            }
+
+            function loadAdminReferenceOptions(companies, suppliers) {
+              const companyOptions = companies.map(company => [
+                company.name,
+                company.name,
+              ]);
+              replaceSelectOptions(
+                document.getElementById("admin-supplier-default-company"),
+                [["", "No default company"], ...companyOptions]
+              );
+              replaceSelectOptions(
+                document.getElementById("admin-import-company"),
+                [["", "Select invoice company…"], ...companyOptions]
+              );
+              replaceSelectOptions(
+                document.getElementById("admin-matrix-company"),
+                [
+                  ["", "Select invoice company…"],
+                  ["*", "All invoice companies"],
+                  ...companyOptions,
+                ]
+              );
+              replaceSelectOptions(
+                document.getElementById("admin-matrix-supplier"),
+                [
+                  ["", "Select supplier company…"],
+                  ...suppliers.map(supplier => [supplier.name, supplier.name]),
+                ]
+              );
+            }
+
+            async function loadSharePointFolderOptions() {
+              const status = document.getElementById("admin-sharepoint-folder-status");
+              const rootSelect = document.getElementById("admin-company-root-folder");
+              const preview = document.getElementById("admin-company-folder-preview");
+              const submit = document.getElementById("admin-company-submit");
+              try {
+                const response = await fetch("/api/admin/sharepoint/folders");
+                const body = await response.json();
+                if (!response.ok) {
+                  throw new Error(body.detail || "SharePoint folders could not be loaded.");
+                }
+                sharePointCompanyFolders = new Map(
+                  body.company_roots.map(structure => [structure.root, structure])
+                );
+                rootSelect.replaceChildren();
+                const emptyOption = document.createElement("option");
+                emptyOption.value = "";
+                emptyOption.textContent = "Select SharePoint company folder…";
+                rootSelect.appendChild(emptyOption);
+                for (const structure of body.company_roots) {
+                  const option = document.createElement("option");
+                  option.value = structure.root;
+                  option.textContent = structure.root.split("/").pop();
+                  rootSelect.appendChild(option);
+                }
+                rootSelect.disabled = false;
+                submit.disabled = false;
+                status.textContent =
+                  `${body.company_roots.length} complete company folder structure(s) found. ` +
+                  `Incoming and Rejected are shared across all companies.`;
+                preview.textContent =
+                  "Select a company folder to preview its workflow destinations.";
+              } catch (error) {
+                sharePointCompanyFolders = new Map();
+                rootSelect.disabled = true;
+                submit.disabled = true;
+                status.textContent = `SharePoint folders unavailable: ${error.message}`;
               }
             }
 
             async function loadAdminPanel() {
               try {
-                const [companies, suppliers, matrix, threshold, users] = await Promise.all([
+                const [companies, suppliers, matrix, supplierTerms, threshold, users] = await Promise.all([
                   fetch("/api/admin/companies").then(r => r.json()),
                   fetch("/api/admin/suppliers").then(r => r.json()),
                   fetch("/api/admin/approval-matrix").then(r => r.json()),
+                  fetch("/api/admin/supplier-terms").then(r => r.json()),
                   fetch("/api/admin/ai-threshold").then(r => r.json()),
                   fetch("/api/admin/users").then(r => r.json()),
                 ]);
+                adminCompanies = companies;
+                adminSuppliers = suppliers;
+                loadAdminReferenceOptions(companies, suppliers);
                 renderSimpleTable(
                   document.getElementById("admin-companies-table"),
                   [
                     { label: "Name", value: c => c.name },
-                    { label: "Invoice folder", value: c => c.company_folder },
-                    { label: "PO folder", value: c => c.po_matching_folder },
+                    { label: "SharePoint company folder", value: c => c.sharepoint_root_folder },
+                    {
+                      label: "Workflow destinations",
+                      value: c => `<div class="path-list">${[
+                          ["Nominal", c.folder_structure.nominal_invoices],
+                          ["PO Match", c.folder_structure.po_match],
+                          ["Approved", c.folder_structure.approved_for_payment],
+                          ["Paid", c.folder_structure.paid],
+                          ["Reconciled", c.folder_structure.reconciled],
+                        ].map(([label, path]) =>
+                          `<div><strong>${escapeHtml(label)}</strong>` +
+                          `<span class="path-value">${escapeHtml(path)}</span></div>`
+                        ).join("")}</div>`
+                    },
                     { label: "Aliases", value: c => (c.aliases || []).join(", ") },
                   ],
                   companies,
                   async name => {
                     await fetch(`/api/admin/companies/${encodeURIComponent(name)}`, { method: "DELETE" });
                     await loadAdminPanel();
+                    await loadCompanies();
                   },
-                  "name"
+                  "name",
+                  company => {
+                    const rootOptions = includeCurrentOption(
+                      [
+                        ["", "Select SharePoint company folder…"],
+                        ...[...sharePointCompanyFolders.values()].map(structure => [
+                          structure.root,
+                          structure.root.split("/").pop(),
+                        ]),
+                      ],
+                      company.sharepoint_root_folder
+                    );
+                    openAdminEditor(`Edit ${company.name}`, [
+                      {
+                        key: "sharepoint_root_folder",
+                        label: "SharePoint company folder",
+                        type: "select",
+                        options: rootOptions,
+                        value: company.sharepoint_root_folder,
+                        required: true,
+                        fullWidth: true,
+                      },
+                      {
+                        key: "aliases",
+                        label: "Aliases (comma separated)",
+                        value: (company.aliases || []).join(", "),
+                        fullWidth: true,
+                      },
+                      {
+                        key: "vat_number",
+                        label: "VAT number",
+                        value: company.vat_number,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "address",
+                        label: "Address",
+                        type: "textarea",
+                        value: company.address,
+                        nullWhenBlank: true,
+                        fullWidth: true,
+                      },
+                    ], async values => {
+                      values.aliases = splitCommaList(values.aliases);
+                      await putJson(
+                        `/api/admin/companies/${encodeURIComponent(company.name)}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                      await loadCompanies();
+                    });
+                  }
                 );
                 renderSimpleTable(
                   document.getElementById("admin-suppliers-table"),
@@ -1452,21 +2421,198 @@ def create_app(
                   async name => {
                     await fetch(`/api/admin/suppliers/${encodeURIComponent(name)}`, { method: "DELETE" });
                     await loadAdminPanel();
+                    await loadSuppliers();
                   },
-                  "name"
+                  "name",
+                  supplier => {
+                    openAdminEditor(`Edit ${supplier.name}`, [
+                      {
+                        key: "aliases",
+                        label: "Aliases (comma separated)",
+                        value: (supplier.aliases || []).join(", "),
+                        fullWidth: true,
+                      },
+                      {
+                        key: "default_company",
+                        label: "Default company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          [["", "No default company"], ...companyOptions().slice(1)],
+                          supplier.default_company
+                        ),
+                        value: supplier.default_company,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "contact_email",
+                        label: "Contact email",
+                        type: "email",
+                        value: supplier.contact_email,
+                        nullWhenBlank: true,
+                      },
+                    ], async values => {
+                      values.aliases = splitCommaList(values.aliases);
+                      await putJson(
+                        `/api/admin/suppliers/${encodeURIComponent(supplier.name)}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                      await loadSuppliers();
+                    });
+                  }
+                );
+                renderSimpleTable(
+                  document.getElementById("admin-supplier-terms-table"),
+                  [
+                    { label: "Applies to", value: t => t.company === "*" ? "All invoice companies" : t.company },
+                    { label: "Supplier company", value: t => t.supplier },
+                    { label: "Account no.", value: t => t.supplier_account_number },
+                    { label: "Payment method", value: t => t.default_payment_method },
+                    { label: "Terms", value: t => t.payment_terms_notice },
+                    { label: "Bank account", value: t => t.bank_account },
+                  ],
+                  supplierTerms,
+                  null,
+                  "id",
+                  terms => {
+                    openAdminEditor("Edit supplier payment settings", [
+                      {
+                        key: "company",
+                        label: "Invoice company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          companyOptions(true),
+                          terms.company,
+                          terms.company === "*" ? "All invoice companies" : terms.company
+                        ),
+                        value: terms.company,
+                        required: true,
+                      },
+                      {
+                        key: "supplier",
+                        label: "Supplier company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          supplierOptions(),
+                          terms.supplier
+                        ),
+                        value: terms.supplier,
+                        required: true,
+                      },
+                      {
+                        key: "supplier_account_number",
+                        label: "Supplier account number",
+                        value: terms.supplier_account_number,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "default_payment_method",
+                        label: "Default payment method",
+                        value: terms.default_payment_method,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "payment_terms_notice",
+                        label: "Payment terms",
+                        value: terms.payment_terms_notice,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "bank_account",
+                        label: "Bank account",
+                        value: terms.bank_account,
+                        nullWhenBlank: true,
+                      },
+                    ], async values => {
+                      await putJson(`/api/admin/supplier-terms/${terms.id}`, values);
+                      await loadAdminPanel();
+                    });
+                  }
                 );
                 renderSimpleTable(
                   document.getElementById("admin-matrix-table"),
                   [
-                    { label: "Company", value: m => m.company },
-                    { label: "Supplier", value: m => m.supplier },
-                    { label: "Approver 1", value: m => `${m.approver1_name} <${m.approver1_email}>` },
-                    { label: "Approver 2", value: m => (m.approver2_name ? `${m.approver2_name} <${m.approver2_email}>` : "—") },
+                    { label: "Applies to", value: m => m.company === "*" ? "All invoice companies" : m.company },
+                    { label: "Supplier company", value: m => m.supplier },
+                    {
+                      label: "Approver 1",
+                      value: m => m.approver1_email
+                        ? `${m.approver1_name} <${m.approver1_email}>`
+                        : m.approver1_name,
+                    },
+                    {
+                      label: "Approver 2",
+                      value: m => m.approver2_name
+                        ? (m.approver2_email
+                          ? `${m.approver2_name} <${m.approver2_email}>`
+                          : m.approver2_name)
+                        : "—",
+                    },
                   ],
                   matrix,
                   async id => {
                     await fetch(`/api/admin/approval-matrix/${id}`, { method: "DELETE" });
                     await loadAdminPanel();
+                  },
+                  "id",
+                  entry => {
+                    openAdminEditor("Edit approval route", [
+                      {
+                        key: "company",
+                        label: "Invoice company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          companyOptions(true),
+                          entry.company,
+                          entry.company === "*" ? "All invoice companies" : entry.company
+                        ),
+                        value: entry.company,
+                        required: true,
+                      },
+                      {
+                        key: "supplier",
+                        label: "Supplier company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          supplierOptions(),
+                          entry.supplier
+                        ),
+                        value: entry.supplier,
+                        required: true,
+                      },
+                      {
+                        key: "approver1_name",
+                        label: "Approver 1 name",
+                        value: entry.approver1_name,
+                        required: true,
+                      },
+                      {
+                        key: "approver1_email",
+                        label: "Approver 1 email",
+                        type: "email",
+                        value: entry.approver1_email,
+                        required: true,
+                      },
+                      {
+                        key: "approver2_name",
+                        label: "Approver 2 name",
+                        value: entry.approver2_name,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "approver2_email",
+                        label: "Approver 2 email",
+                        type: "email",
+                        value: entry.approver2_email,
+                        nullWhenBlank: true,
+                      },
+                    ], async values => {
+                      await putJson(
+                        `/api/admin/approval-matrix/${entry.id}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                    });
                   }
                 );
                 document.getElementById("admin-threshold-value").value = threshold.threshold ?? 0.8;
@@ -1482,7 +2628,51 @@ def create_app(
                     await fetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: "DELETE" });
                     await loadAdminPanel();
                   },
-                  "username"
+                  "username",
+                  account => {
+                    openAdminEditor(`Edit ${account.username}`, [
+                      {
+                        key: "display_name",
+                        label: "Display name",
+                        value: account.display_name,
+                        required: true,
+                      },
+                      {
+                        key: "email",
+                        label: "Email",
+                        type: "email",
+                        value: account.email,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "role",
+                        label: "Role",
+                        type: "select",
+                        options: [
+                          ["admin", "Admin"],
+                          ["purchase_ledger", "Purchase Ledger"],
+                          ["approver1", "Approver 1"],
+                          ["approver2", "Approver 2"],
+                          ["purchasing", "Purchasing"],
+                        ],
+                        value: account.role,
+                        required: true,
+                      },
+                      {
+                        key: "password",
+                        label: "New password (leave blank to keep current)",
+                        type: "password",
+                        omitWhenBlank: true,
+                        fullWidth: true,
+                      },
+                    ], async values => {
+                      await putJson(
+                        `/api/admin/users/${encodeURIComponent(account.username)}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                    });
+                  }
                 );
               } catch (error) {
                 showToast(`Failed to load admin panel: ${error.message}`, true);
@@ -1492,35 +2682,68 @@ def create_app(
             document.getElementById("admin-import-form").addEventListener("submit", async event => {
               event.preventDefault();
               const fileInput = document.getElementById("admin-import-file");
+              const companySelect = document.getElementById("admin-import-company");
               const resultBox = document.getElementById("admin-import-result");
-              if (!fileInput.files.length) {
+              if (!companySelect.value || !fileInput.files.length) {
                 return;
               }
               const formData = new FormData();
               formData.append("file", fileInput.files[0]);
+              formData.append("company", companySelect.value);
               resultBox.innerHTML = "<p>Importing…</p>";
               try {
-                const response = await fetch("/api/admin/import/supplier-master-data", {
+                let response = await fetch("/api/admin/import/supplier-master-data", {
                   method: "POST",
                   body: formData,
                 });
-                const body = await response.json();
-                if (!response.ok) {
-                  throw new Error(body.detail || "Import failed.");
+                let body = await response.json();
+                if (response.status === 409 && body.detail?.duplicates) {
+                  const duplicates = body.detail.duplicates
+                    .map(item =>
+                      `${item.existing_name} (spreadsheet row${item.row_numbers.length === 1 ? "" : "s"} ` +
+                      `${item.row_numbers.join(", ")})`
+                    )
+                    .join("\\n");
+                  const replace = window.confirm(
+                    `The following supplier companies already exist:\n\n${duplicates}\n\n` +
+                    `Replace their configured values with the spreadsheet rows?`
+                  );
+                  if (!replace) {
+                    resultBox.innerHTML = "<p>Import cancelled; no records were changed.</p>";
+                    return;
+                  }
+                  formData.set("replace_existing", "true");
+                  response = await fetch("/api/admin/import/supplier-master-data", {
+                    method: "POST",
+                    body: formData,
+                  });
+                  body = await response.json();
                 }
-                const skippedRows = body.rows.filter(r => r.status === "skipped");
-                const skippedList = skippedRows.length
+                if (!response.ok) {
+                  const detail = typeof body.detail === "string"
+                    ? body.detail
+                    : body.detail?.message;
+                  throw new Error(detail || "Import failed.");
+                }
+                const issueRows = body.rows.filter(r => r.status !== "imported");
+                const issueList = issueRows.length
                   ? "<ul>" +
-                    skippedRows
-                      .map(r => `<li>Row ${r.row_number} (${r.company || "—"} / ${r.supplier || "—"}): ${r.reason}</li>`)
+                    issueRows
+                      .map(r =>
+                        `<li>Row ${escapeHtml(r.row_number)} (` +
+                        `${escapeHtml(r.company === "*" ? "All invoice companies" : (r.company || "—"))} / ` +
+                        `${escapeHtml(r.supplier || "—")}): ${escapeHtml(r.reason)}</li>`
+                      )
                       .join("") +
                     "</ul>"
                   : "";
                 resultBox.innerHTML =
-                  `<p><strong>${body.imported}</strong> row(s) imported, ` +
-                  `<strong>${body.skipped}</strong> row(s) skipped.</p>${skippedList}`;
+                  `<p><strong>${escapeHtml(body.imported)}</strong> row(s) imported, ` +
+                  `<strong>${escapeHtml(body.warnings)}</strong> warning(s), ` +
+                  `<strong>${escapeHtml(body.skipped)}</strong> row(s) skipped.</p>${issueList}`;
                 event.target.reset();
                 await loadAdminPanel();
+                await loadSuppliers();
               } catch (error) {
                 resultBox.innerHTML = "";
                 showToast(error.message, true);
@@ -1532,14 +2755,46 @@ def create_app(
               try {
                 await postJson("/api/admin/companies", {
                   name: document.getElementById("admin-company-name").value,
-                  company_folder: document.getElementById("admin-company-folder").value,
-                  po_matching_folder: document.getElementById("admin-company-po-folder").value,
+                  sharepoint_root_folder: document.getElementById("admin-company-root-folder").value,
                   aliases: splitCommaList(document.getElementById("admin-company-aliases").value),
                 });
                 event.target.reset();
                 await loadAdminPanel();
               } catch (error) {
                 showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("admin-company-root-folder").addEventListener("change", event => {
+              const structure = sharePointCompanyFolders.get(event.target.value);
+              const preview = document.getElementById("admin-company-folder-preview");
+              if (!structure) {
+                preview.textContent =
+                  "Select a company folder to preview its workflow destinations.";
+                return;
+              }
+              const rows = [
+                ["Nominal invoices", structure.nominal_invoices],
+                ["Approver 1", structure.nominal_approver_1],
+                ["Approver 2", structure.nominal_approver_2],
+                ["Nominal on hold", structure.nominal_on_hold],
+                ["PO match", structure.po_match],
+                ["PO on hold", structure.po_on_hold],
+                ["Approved — BACS", structure.approved_bacs],
+                ["Approved — BANKLINE", structure.approved_bankline],
+                ["Approved — FOREIGN POA", structure.approved_foreign_poa],
+                ["Paid", structure.paid],
+                ["Reconciled", structure.reconciled],
+              ];
+              preview.innerHTML =
+                "<table><tbody>" +
+                rows.map(([label, path]) =>
+                  `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(path)}</td></tr>`
+                ).join("") +
+                "</tbody></table>";
+              const nameInput = document.getElementById("admin-company-name");
+              if (!nameInput.value) {
+                nameInput.value = structure.root.split("/").pop();
               }
             });
 
@@ -1554,6 +2809,7 @@ def create_app(
                 });
                 event.target.reset();
                 await loadAdminPanel();
+                await loadSuppliers();
               } catch (error) {
                 showToast(error.message, true);
               }
@@ -1652,9 +2908,12 @@ def create_app(
               document.getElementById("user-chip-label").textContent =
                 `${currentUser.display_name} (${currentUser.role})`;
               applyRoleVisibility(currentUser.role);
-              await loadInvoices();
               await loadCompanies();
-              if (currentUser.role === "admin") await loadAdminPanel();
+              await loadSuppliers();
+              await loadInvoices();
+              if (currentUser.role === "admin") {
+                await Promise.all([loadAdminPanel(), loadSharePointFolderOptions()]);
+              }
               await initActivityCursor();
               setInterval(pollActivity, 3000);
               setInterval(loadInvoices, 5000);
@@ -1723,6 +2982,10 @@ def create_app(
             for profile in app.state.companies_store.list()
         ]
 
+    @app.get("/api/suppliers")
+    def suppliers(user: User = Depends(get_current_user)) -> list[dict[str, object]]:
+        return [asdict(profile) for profile in app.state.suppliers_store.list()]
+
     @app.get("/api/approval-matrix")
     def approval_matrix(user: User = Depends(get_current_user)) -> list[dict[str, object]]:
         return [
@@ -1738,6 +3001,15 @@ def create_app(
             }
             for entry in app.state.approval_matrix_store.list()
         ]
+
+    @app.get("/api/supplier-terms")
+    def supplier_terms(
+        company: str,
+        supplier: str,
+        user: User = Depends(get_current_user),
+    ) -> dict[str, object]:
+        profiles = app.state.supplier_terms_store.list_for_supplier(company, supplier)
+        return {"profiles": [asdict(terms) for terms in profiles]}
 
     @app.get("/api/activity")
     def activity(
@@ -1767,13 +3039,9 @@ def create_app(
         outside of the normal email process can still enter the same
         workflow."
 
-        The uploaded PDF is stored locally (mirroring how the Outlook
-        worker stores downloaded attachments) and a synthetic
-        message/attachment pair is created so the same
-        InvoiceStore.add_from_outlook() call used by the Outlook worker can
-        be reused unchanged -- the invoice then proceeds through AI
-        extraction, confirmation, routing, approval, payment, and
-        reconciliation exactly like an email-sourced invoice.
+        In the connected deployment, the PDF is uploaded to SharePoint
+        Incoming first and registered from its DriveItem identity. A local
+        cache is retained only for Document Intelligence and PDF preview.
         """
         if file.content_type not in {"application/pdf", "application/octet-stream"} and not (
             file.filename or ""
@@ -1783,16 +3051,15 @@ def create_app(
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="The uploaded file was empty.")
+        try:
+            validate_pdf(content)
+        except InvalidPdfError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
-        upload_dir = Path(os.environ.get("MANUAL_UPLOAD_DIR", "manual_uploads"))
-        upload_dir.mkdir(parents=True, exist_ok=True)
         unique_id = uuid.uuid4().hex
         original_filename = file.filename or f"manual-invoice-{unique_id}.pdf"
-        stored_path = upload_dir / f"{unique_id}-{original_filename}"
-        stored_path.write_bytes(content)
 
         message = {
-            "id": f"manual-{unique_id}",
             "internetMessageId": None,
             "subject": subject or "(Manually added invoice)",
             "receivedDateTime": received_at
@@ -1804,24 +3071,120 @@ def create_app(
                 }
             },
         }
-        attachment = {
-            "id": f"manual-attachment-{unique_id}",
-            "name": original_filename,
-            "size": len(content),
-        }
 
-        record = app.state.invoice_store.add_from_outlook(
-            message=message, attachment=attachment, stored_path=stored_path
-        )
-        app.state.activity_feed.add_event(
-            event_type="manual_intake",
-            target_role=ROLE_PURCHASE_LEDGER,
-            message=(
-                f"'{original_filename}' was manually added to Incoming Invoices "
-                "and is awaiting AI extraction."
-            ),
-            invoice_id=record.id,
-        )
+        lifecycle = _lifecycle()
+        if lifecycle.sharepoint_client is not None:
+            monitor = SharePointIncomingMonitor(
+                lifecycle.sharepoint_client,
+                app.state.invoice_store,
+                cache_directory=Path(
+                    os.environ.get(
+                        "SHAREPOINT_INVOICE_CACHE_DIR",
+                        "runtime_data/sharepoint_invoice_cache",
+                    )
+                ),
+                extraction_runner=(
+                    lifecycle.run_extraction if ai_extraction_configured() else None
+                ),
+                activity_feed=app.state.activity_feed,
+            )
+            try:
+                item = await asyncio.to_thread(
+                    lifecycle.sharepoint_client.upload_to_incoming,
+                    original_filename,
+                    content,
+                )
+                record = await asyncio.to_thread(
+                    monitor.ingest_item,
+                    item,
+                    source_message=message,
+                    content=content,
+                    event_type="manual_intake",
+                )
+            except InvoiceExtractionUnavailableError:
+                item_id = str(item.get("id", ""))
+                record = app.state.invoice_store.get_by_sharepoint_item_id(item_id)
+            except SharePointError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"SharePoint Incoming upload failed: {error}",
+                ) from error
+            if record is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The SharePoint invoice is already registered.",
+                )
+        else:
+            upload_dir = Path(os.environ.get("MANUAL_UPLOAD_DIR", "manual_uploads"))
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            stored_path = upload_dir / f"{unique_id}-{original_filename}"
+            stored_path.write_bytes(content)
+            message["id"] = f"manual-{unique_id}"
+            attachment = {
+                "id": f"manual-attachment-{unique_id}",
+                "name": original_filename,
+                "size": len(content),
+            }
+            record = app.state.invoice_store.add_from_outlook(
+                message=message, attachment=attachment, stored_path=stored_path
+            )
+            app.state.activity_feed.add_event(
+                event_type="manual_intake",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"'{original_filename}' was manually added in offline mode "
+                    "and is awaiting AI extraction."
+                ),
+                invoice_id=record.id,
+            )
+            if ai_extraction_configured():
+                try:
+                    record = lifecycle.run_extraction(record.id)
+                except InvoiceExtractionUnavailableError:
+                    record = app.state.invoice_store.get(record.id) or record
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/register-sage")
+    def register_invoice_in_sage(
+        invoice_id: int,
+        request: SageRegistrationRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().register_in_sage(
+                invoice_id,
+                sage_reference=request.sage_reference,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/reject")
+    def reject_invoice(
+        invoice_id: int,
+        request: RejectInvoiceRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().reject_invoice(
+                invoice_id, reason=request.reason, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/cancel-duplicate")
+    def cancel_duplicate_invoice(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().cancel_confirmed_duplicate(
+                invoice_id, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.get("/api/invoices/{invoice_id}")
@@ -1854,8 +3217,53 @@ def create_app(
     ) -> dict[str, object]:
         try:
             record = _lifecycle().run_extraction(invoice_id)
+        except InvoiceExtractionUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except InvoiceLifecycleError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/route-foreign-payment")
+    def route_foreign_payment(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().route_as_foreign_payment(
+                invoice_id, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/allocate-foreign-payment")
+    def allocate_foreign_payment(
+        invoice_id: int,
+        request: ForeignAllocationRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().mark_foreign_allocated(
+                invoice_id,
+                allocation_date=request.allocation_date,
+                allocation_reference=request.allocation_reference,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/revert-foreign-payment")
+    def revert_foreign_payment(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().revert_foreign_payment_route(
+                invoice_id, recorded_by=user.display_name
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/confirm")
@@ -1950,7 +3358,24 @@ def create_app(
         try:
             record = _lifecycle().flag_for_review(invoice_id, reason=request.reason)
         except InvoiceLifecycleError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/review-decision")
+    def decide_flagged_invoice(
+        invoice_id: int,
+        request: ReviewDecisionRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().resolve_flagged_review(
+                invoice_id,
+                accepted=request.accepted,
+                reason=request.reason,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/pay")
@@ -1963,6 +3388,7 @@ def create_app(
             record = _lifecycle().mark_paid(
                 invoice_id,
                 payment_date=request.payment_date,
+                supplier_account_number=request.supplier_account_number,
                 payment_reference=request.payment_reference,
                 payment_method=request.payment_method,
                 recorded_by=user.display_name,
@@ -1999,17 +3425,64 @@ def create_app(
     def admin_list_companies(
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> list[dict[str, object]]:
-        return [asdict(profile) for profile in app.state.companies_store.list()]
+        return [_company_response(profile) for profile in app.state.companies_store.list()]
+
+    @app.get("/api/admin/sharepoint/folders")
+    def admin_list_sharepoint_folders(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        client = _lifecycle().sharepoint_client
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="SharePoint is not configured or accessible.",
+            )
+        try:
+            folders = client.list_folder_paths()
+        except SharePointError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        app.state.sharepoint_folder_paths = frozenset(folders)
+        structures = discover_company_folder_structures(folders)
+        app.state.sharepoint_company_structures = {
+            structure.root: structure for structure in structures
+        }
+        return {
+            "folders": folders,
+            "company_roots": [structure.as_dict() for structure in structures],
+            "shared_folders": {
+                "incoming": INCOMING_INVOICES_FOLDER,
+                "rejected": REJECTED_INVOICES_FOLDER,
+            },
+        }
 
     @app.post("/api/admin/companies")
     def admin_create_company(
         request: CompanyRequest, user: User = Depends(require_role(ROLE_ADMIN))
     ) -> dict[str, object]:
+        request_fields = request.model_dump()
+        root = request_fields.pop("sharepoint_root_folder")
+        structure: CompanyFolderStructure | None = None
+        if root:
+            structures = app.state.sharepoint_company_structures
+            structure = structures.get(root) if structures is not None else None
+            if structure is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select a complete company folder structure from SharePoint.",
+                )
+            request_fields["sharepoint_root_folder"] = structure.root
+            request_fields["company_folder"] = structure.nominal_invoices
+            request_fields["po_matching_folder"] = structure.po_match
+        elif not request.company_folder or not request.po_matching_folder:
+            raise HTTPException(
+                status_code=400,
+                detail="Select a SharePoint company folder.",
+            )
         try:
-            profile = app.state.companies_store.create(**request.model_dump())
+            profile = app.state.companies_store.create(**request_fields)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return asdict(profile)
+        return _company_response(profile)
 
     @app.put("/api/admin/companies/{name}")
     def admin_update_company(
@@ -2017,14 +3490,28 @@ def create_app(
         request: CompanyUpdateRequest,
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        fields = request.model_dump(exclude_unset=True)
+        root = fields.get("sharepoint_root_folder")
+        if isinstance(root, str):
+            structures = app.state.sharepoint_company_structures
+            structure = structures.get(root) if structures is not None else None
+            if structure is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select a complete company folder structure from SharePoint.",
+                )
+            fields.update(
+                sharepoint_root_folder=structure.root,
+                company_folder=structure.nominal_invoices,
+                po_matching_folder=structure.po_match,
+            )
         try:
             profile = app.state.companies_store.update(name, **fields)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return asdict(profile)
+        return _company_response(profile)
 
     @app.delete("/api/admin/companies/{name}")
     def admin_delete_company(
@@ -2034,6 +3521,8 @@ def create_app(
             app.state.companies_store.delete(name)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        app.state.approval_matrix_store.delete_by_company(name)
+        app.state.supplier_terms_store.delete_by_company(name)
         return {"status": "deleted"}
 
     @app.get("/api/admin/suppliers")
@@ -2058,7 +3547,7 @@ def create_app(
         request: SupplierUpdateRequest,
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        fields = request.model_dump(exclude_unset=True)
         try:
             profile = app.state.suppliers_store.update(name, **fields)
         except KeyError as error:
@@ -2075,6 +3564,8 @@ def create_app(
             app.state.suppliers_store.delete(name)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        app.state.approval_matrix_store.delete_by_supplier(name)
+        app.state.supplier_terms_store.delete_by_supplier(name)
         return {"status": "deleted"}
 
     @app.get("/api/admin/approval-matrix")
@@ -2118,7 +3609,7 @@ def create_app(
         request: ApprovalMatrixUpdateRequest,
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        fields = request.model_dump(exclude_unset=True)
         try:
             entry = app.state.approval_matrix_store.update(entry_id, **fields)
         except KeyError as error:
@@ -2151,16 +3642,35 @@ def create_app(
     ) -> list[dict[str, object]]:
         return [asdict(terms) for terms in app.state.supplier_terms_store.list()]
 
+    @app.put("/api/admin/supplier-terms/{terms_id}")
+    def admin_update_supplier_terms(
+        terms_id: int,
+        request: SupplierTermsUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            terms = app.state.supplier_terms_store.update(
+                terms_id, **request.model_dump()
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(terms)
+
     @app.post("/api/admin/import/supplier-master-data")
     async def admin_import_supplier_master_data(
         file: UploadFile = File(...),
+        company: str = Form(...),
+        replace_existing: bool = Form(False),
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        """Bulk-import companies, suppliers, approval matrix entries, and
-        supplier payment terms from an uploaded .xlsx workbook, so an admin
-        doesn't have to manually re-key every row from an existing Excel
-        sheet. Expected columns (header names are flexible, see
-        app/bulk_import.py): Company, Supplier, Supplier Account Number,
+        """Bulk-import supplier companies, approval matrix entries, and
+        supplier payment terms from an uploaded .xlsx workbook, scoped to
+        the company selected by the admin. A Company column in the workbook
+        is ignored when this selection is provided. Expected columns (header
+        names are flexible, see
+        app/bulk_import.py): Trading Partner Name, Supplier Account Number,
         Default Payment Method, Payment Terms, Bank Account, Approver(s)."""
         if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
             raise HTTPException(
@@ -2168,6 +3678,21 @@ def create_app(
             )
         contents = await file.read()
         try:
+            duplicates = find_existing_supplier_imports(
+                io.BytesIO(contents),
+                supplier_store=app.state.suppliers_store,
+            )
+            if duplicates and not replace_existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "One or more supplier companies already exist. "
+                            "Confirm before replacing their configured values."
+                        ),
+                        "duplicates": [asdict(duplicate) for duplicate in duplicates],
+                    },
+                )
             summary = import_supplier_workbook(
                 io.BytesIO(contents),
                 company_store=app.state.companies_store,
@@ -2175,11 +3700,15 @@ def create_app(
                 approval_matrix_store=app.state.approval_matrix_store,
                 supplier_terms_store=app.state.supplier_terms_store,
                 auth_store=app.state.auth_store,
+                default_company=company,
             )
+        except HTTPException:
+            raise
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return {
             "imported": summary.imported_count,
+            "warnings": summary.warning_count,
             "skipped": summary.skipped_count,
             "rows": [asdict(row) for row in summary.rows],
         }
@@ -2216,6 +3745,20 @@ def create_app(
         except AuthError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(created)
+
+    @app.put("/api/admin/users/{username}")
+    def admin_update_user(
+        username: str,
+        request: UserUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            updated = app.state.auth_store.update_user(
+                username, **request.model_dump(exclude_unset=True)
+            )
+        except AuthError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(updated)
 
     @app.delete("/api/admin/users/{username}")
     def admin_delete_user(

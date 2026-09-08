@@ -62,12 +62,88 @@ class SharePointClient:
         self.token_provider = token_provider or MsalTokenProvider(outlook_settings)
         self.http_client = http_client or httpx.Client(timeout=60.0)
 
-    def upload_to_incoming(self, filename: str, content: bytes) -> dict[str, Any]:
+    def upload_to_incoming(
+        self,
+        filename: str,
+        content: bytes,
+        *,
+        conflict_behavior: str = "rename",
+    ) -> dict[str, Any]:
         """Upload a PDF to the configured incoming invoices folder.
 
         Returns the Graph DriveItem for the uploaded file.
         """
-        return self._upload(self.settings.incoming_folder, filename, content)
+        return self._upload(
+            self.settings.incoming_folder,
+            filename,
+            content,
+            conflict_behavior=conflict_behavior,
+        )
+
+    def list_incoming_pdfs(self) -> list[dict[str, Any]]:
+        """Return PDFs currently waiting in the configured Incoming folder."""
+        drive_id = quote(self.settings.drive_id, safe="")
+        folder = quote(str(PurePosixPath(self.settings.incoming_folder)), safe="/")
+        url: str | None = (
+            f"{GRAPH_BASE_URL}/drives/{drive_id}/root:/{folder}:/children"
+        )
+        params: dict[str, str] | None = {
+            "$select": "id,name,size,file,webUrl,createdDateTime",
+            "$top": "200",
+        }
+        items: list[dict[str, Any]] = []
+        while url:
+            response = self.http_client.get(
+                url,
+                params=params,
+                headers={"Authorization": "Bearer " + self.token_provider()},
+            )
+            params = None
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                request_id = response.headers.get("request-id", "not provided")
+                raise SharePointError(
+                    f"SharePoint Incoming listing failed with HTTP "
+                    f"{response.status_code}; request ID: {request_id}."
+                ) from error
+            payload = response.json()
+            page = payload.get("value", [])
+            if not isinstance(page, list):
+                raise SharePointError(
+                    "SharePoint returned an invalid Incoming folder response."
+                )
+            items.extend(
+                item
+                for item in page
+                if isinstance(item, dict)
+                and isinstance(item.get("file"), dict)
+                and str(item.get("name", "")).lower().endswith(".pdf")
+            )
+            next_link = payload.get("@odata.nextLink")
+            url = next_link if isinstance(next_link, str) else None
+        return items
+
+    def download_item(self, item_id: str) -> bytes:
+        """Download a DriveItem by ID for processing or preview caching."""
+        url = (
+            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
+            f"items/{quote(item_id, safe='')}/content"
+        )
+        response = self.http_client.get(
+            url,
+            headers={"Authorization": "Bearer " + self.token_provider()},
+            follow_redirects=True,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            request_id = response.headers.get("request-id", "not provided")
+            raise SharePointError(
+                f"SharePoint invoice download failed with HTTP "
+                f"{response.status_code}; request ID: {request_id}."
+            ) from error
+        return response.content
 
     def move_to_folder(
         self,
@@ -119,11 +195,81 @@ class SharePointClient:
     def get_item_web_url(self, item: dict[str, Any]) -> str | None:
         return item.get("webUrl") if isinstance(item.get("webUrl"), str) else None
 
+    def list_folder_paths(self, *, max_folders: int = 2000) -> list[str]:
+        """Return every existing folder path in the configured drive.
+
+        Paths are relative to the document-library root and are suitable for
+        storing in company routing configuration.
+        """
+        if max_folders < 1:
+            raise ValueError("max_folders must be greater than zero.")
+
+        drive_prefix = (
+            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
+        )
+        paths: set[str] = set()
+        url: str | None = f"{drive_prefix}/root/delta"
+        params: dict[str, str] | None = {"$top": "200"}
+        while url:
+            response = self.http_client.get(
+                url,
+                params=params,
+                headers={"Authorization": "Bearer " + self.token_provider()},
+            )
+            params = None
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                request_id = response.headers.get("request-id", "not provided")
+                raise SharePointError(
+                    f"SharePoint folder inventory failed with HTTP "
+                    f"{response.status_code}; request ID: {request_id}."
+                ) from error
+            payload = response.json()
+            page = payload.get("value", [])
+            if not isinstance(page, list):
+                raise SharePointError(
+                    "SharePoint returned an invalid folder inventory response."
+                )
+            for item in page:
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("folder"), dict)
+                    or "deleted" in item
+                ):
+                    continue
+                name = item.get("name")
+                parent = item.get("parentReference")
+                if not isinstance(name, str) or not isinstance(parent, dict):
+                    continue
+                parent_path = parent.get("path")
+                if not isinstance(parent_path, str) or "/root:" not in parent_path:
+                    continue
+                relative_parent = parent_path.partition("/root:")[2].strip("/")
+                path = str(PurePosixPath(relative_parent) / name)
+                paths.add(path)
+                if len(paths) > max_folders:
+                    raise SharePointError(
+                        f"SharePoint folder scan exceeded {max_folders} folders."
+                    )
+            next_link = payload.get("@odata.nextLink")
+            url = next_link if isinstance(next_link, str) else None
+        return sorted(paths, key=str.casefold)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _upload(self, folder_path: str, filename: str, content: bytes) -> dict[str, Any]:
+    def _upload(
+        self,
+        folder_path: str,
+        filename: str,
+        content: bytes,
+        *,
+        conflict_behavior: str = "rename",
+    ) -> dict[str, Any]:
+        if conflict_behavior not in {"fail", "replace", "rename"}:
+            raise ValueError("Unsupported SharePoint upload conflict behavior.")
         safe_folder = str(PurePosixPath(folder_path))
         safe_filename = quote(filename, safe="")
         url = (
@@ -133,6 +279,7 @@ class SharePointClient:
         )
         response = self.http_client.put(
             url,
+            params={"@microsoft.graph.conflictBehavior": conflict_behavior},
             content=content,
             headers={
                 "Authorization": f"Bearer {self.token_provider()}",
@@ -173,23 +320,41 @@ class SharePointClient:
         else:
             url = f"{drive_prefix}/items/{quote(parent_id, safe='')}/children"
 
-        response = self.http_client.get(
-            url,
-            params={"$filter": f"name eq '{name}' and folder ne null", "$select": "id,name"},
-            headers={"Authorization": f"Bearer {self.token_provider()}"},
-        )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise SharePointError(
-                f"SharePoint folder lookup failed with HTTP {response.status_code}; "
-                f"request ID: {request_id}."
-            ) from error
+        params: dict[str, str] | None = {
+            "$select": "id,name,folder",
+            "$top": "200",
+        }
+        while url:
+            response = self.http_client.get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {self.token_provider()}"},
+            )
+            params = None
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                request_id = response.headers.get("request-id", "not provided")
+                raise SharePointError(
+                    f"SharePoint folder lookup failed with HTTP {response.status_code}; "
+                    f"request ID: {request_id}."
+                ) from error
 
-        items = response.json().get("value", [])
-        if items:
-            return str(items[0]["id"])
+            payload = response.json()
+            items = payload.get("value", [])
+            if not isinstance(items, list):
+                raise SharePointError(
+                    "SharePoint returned an invalid folder lookup response."
+                )
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("folder"), dict)
+                    and str(item.get("name", "")).casefold() == name.casefold()
+                ):
+                    return str(item["id"])
+            next_link = payload.get("@odata.nextLink")
+            url = next_link if isinstance(next_link, str) else None
 
         # Folder does not exist — create it
         if parent_id is None:
@@ -226,7 +391,6 @@ class SharePointClient:
                 f"request ID: {request_id}."
             ) from error
         return response
-
 
 def sharepoint_settings_from_environment() -> SharePointSettings:
     return SharePointSettings(

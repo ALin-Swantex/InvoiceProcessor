@@ -25,6 +25,7 @@ from pathlib import Path
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS companies (
     name TEXT PRIMARY KEY,
+    sharepoint_root_folder TEXT,
     company_folder TEXT NOT NULL,
     po_matching_folder TEXT NOT NULL,
     aliases TEXT NOT NULL DEFAULT '',
@@ -51,13 +52,14 @@ CREATE TABLE IF NOT EXISTS approval_matrix (
 );
 
 CREATE TABLE IF NOT EXISTS supplier_terms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     company TEXT NOT NULL,
     supplier TEXT NOT NULL,
     supplier_account_number TEXT,
     default_payment_method TEXT,
     payment_terms_notice TEXT,
     bank_account TEXT,
-    PRIMARY KEY (company, supplier)
+    UNIQUE(company, supplier_account_number)
 );
 
 CREATE TABLE IF NOT EXISTS process_configuration (
@@ -77,6 +79,34 @@ def connect(database_path: Path | None = None) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    company_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(companies)").fetchall()
+    }
+    if "sharepoint_root_folder" not in company_columns:
+        connection.execute(
+            "ALTER TABLE companies ADD COLUMN sharepoint_root_folder TEXT"
+        )
+    connection.execute(
+        """
+        UPDATE companies
+        SET sharepoint_root_folder = CASE
+            WHEN company_folder LIKE '%/Nominal Invoices'
+            THEN substr(company_folder, 1, length(company_folder) - length('/Nominal Invoices'))
+            ELSE company_folder
+        END
+        WHERE sharepoint_root_folder IS NULL OR sharepoint_root_folder = ''
+        """
+    )
+    connection.execute(
+        """
+        UPDATE companies
+        SET company_folder = sharepoint_root_folder || '/Nominal Invoices',
+            po_matching_folder = sharepoint_root_folder || '/PO Invoices/PO Match'
+        WHERE sharepoint_root_folder IS NOT NULL
+          AND sharepoint_root_folder != ''
+        """
+    )
     connection.commit()
     return connection
 
@@ -101,4 +131,3 @@ def set_setting(key: str, value: str, *, database_path: Path | None = None) -> N
             (key, value),
         )
         connection.commit()
-
