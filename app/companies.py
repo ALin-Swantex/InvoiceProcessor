@@ -4,6 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.company_folders import CompanyFolderStructure
 from app.config_db import connect
 
 
@@ -21,6 +22,7 @@ from app.config_db import connect
 @dataclass(frozen=True)
 class CompanyProfile:
     name: str
+    sharepoint_root_folder: str
     company_folder: str
     po_matching_folder: str
     aliases: tuple[str, ...] = ()
@@ -31,18 +33,21 @@ class CompanyProfile:
 _DEFAULT_COMPANIES: list[CompanyProfile] = [
     CompanyProfile(
         name="Acme Trading Ltd",
+        sharepoint_root_folder="Invoices/Acme Trading Ltd",
         company_folder="Invoices/Acme Trading Ltd",
         po_matching_folder="Invoices/Acme Trading Ltd/PO Matching",
         aliases=("Acme Trading", "Acme"),
     ),
     CompanyProfile(
         name="Northfield Manufacturing",
+        sharepoint_root_folder="Invoices/Northfield Manufacturing",
         company_folder="Invoices/Northfield Manufacturing",
         po_matching_folder="Invoices/Northfield Manufacturing/PO Matching",
         aliases=("Northfield Mfg",),
     ),
     CompanyProfile(
         name="Riverside Logistics",
+        sharepoint_root_folder="Invoices/Riverside Logistics",
         company_folder="Invoices/Riverside Logistics",
         po_matching_folder="Invoices/Riverside Logistics/PO Matching",
         aliases=(),
@@ -81,16 +86,22 @@ class CompanyStore:
         self,
         *,
         name: str,
-        company_folder: str,
-        po_matching_folder: str,
+        company_folder: str | None = None,
+        po_matching_folder: str | None = None,
+        sharepoint_root_folder: str | None = None,
         aliases: list[str] | None = None,
         vat_number: str | None = None,
         address: str | None = None,
     ) -> CompanyProfile:
+        root = sharepoint_root_folder or company_folder
+        if not root:
+            raise ValueError("A SharePoint company root folder is required.")
+        structure = CompanyFolderStructure.from_root(root)
         profile = CompanyProfile(
             name=name,
-            company_folder=company_folder,
-            po_matching_folder=po_matching_folder,
+            sharepoint_root_folder=structure.root,
+            company_folder=company_folder or structure.nominal_invoices,
+            po_matching_folder=po_matching_folder or structure.po_match,
             aliases=tuple(aliases or []),
             vat_number=vat_number,
             address=address,
@@ -104,7 +115,14 @@ class CompanyStore:
         return profile
 
     def update(self, name: str, **fields: object) -> CompanyProfile:
-        allowed = {"company_folder", "po_matching_folder", "aliases", "vat_number", "address"}
+        allowed = {
+            "sharepoint_root_folder",
+            "company_folder",
+            "po_matching_folder",
+            "aliases",
+            "vat_number",
+            "address",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unknown company fields: {', '.join(sorted(unknown))}.")
@@ -124,7 +142,10 @@ class CompanyStore:
             connection.commit()
             if cursor.rowcount == 0:
                 raise KeyError(f"Company '{name}' was not found.")
-        return self.get(name)  # type: ignore[return-value]
+        updated = self.get(name)
+        if updated is None:
+            raise RuntimeError(f"Company '{name}' disappeared after it was updated.")
+        return updated
 
     def delete(self, name: str) -> None:
         with self._connect() as connection:
@@ -136,11 +157,14 @@ class CompanyStore:
     def _insert(self, connection: sqlite3.Connection, profile: CompanyProfile) -> None:
         connection.execute(
             """
-            INSERT INTO companies (name, company_folder, po_matching_folder, aliases, vat_number, address)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO companies (
+                name, sharepoint_root_folder, company_folder,
+                po_matching_folder, aliases, vat_number, address
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 profile.name,
+                profile.sharepoint_root_folder,
                 profile.company_folder,
                 profile.po_matching_folder,
                 ",".join(profile.aliases),
@@ -157,6 +181,7 @@ def _row_to_profile(row: sqlite3.Row) -> CompanyProfile:
     aliases = tuple(a for a in (row["aliases"] or "").split(",") if a)
     return CompanyProfile(
         name=row["name"],
+        sharepoint_root_folder=row["sharepoint_root_folder"],
         company_folder=row["company_folder"],
         po_matching_folder=row["po_matching_folder"],
         aliases=aliases,

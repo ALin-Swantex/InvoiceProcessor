@@ -186,7 +186,7 @@ def test_authoritative_schema_contains_current_and_company_scoped_tables() -> No
     assert "ENABLE ROW LEVEL SECURITY" not in schema
 
 
-def test_insecure_postgres_sslmode_is_rejected() -> None:
+def test_insecure_remote_postgres_sslmode_is_rejected() -> None:
     with pytest.raises(ValueError, match="sslmode"):
         PostgresSettings(
             "db.example",
@@ -194,3 +194,18 @@ def test_insecure_postgres_sslmode_is_rejected() -> None:
             "user",
             sslmode="disable",
         )
+
+
+def test_local_postgres_can_disable_transport_encryption() -> None:
+    settings = PostgresSettings.from_env(
+        {
+            "DATABASE_URL": (
+                "postgresql://invoice_processor:local-password"
+                "@127.0.0.1:5432/invoice_processing?sslmode=disable"
+            )
+        }
+    )
+
+    assert settings.host == "127.0.0.1"
+    assert settings.sslmode == "disable"
+    assert settings.connection_kwargs()["password"] == "local-password"

@@ -257,6 +257,12 @@ class SharePointInvoiceStore:
         item = self._get_item(invoice_id)
         return self._item_to_record(item) if item is not None else None
 
+    def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
+        for record in self.list(limit=500):
+            if record.sharepoint_item_id == item_id:
+                return record
+        return None
+
     def update_status(self, invoice_id: int, status: str) -> None:
         self.update_fields(invoice_id, status=status)
 

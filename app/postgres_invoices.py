@@ -4,13 +4,16 @@ import hashlib
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Mapping
 
 from app.invoices import InvoiceRecord
-from app.postgres_settings import PostgresSettings, connect_postgres
+from app.postgres_settings import (
+    ConnectionFactory,
+    PostgresSettings,
+    postgres_connection_factory,
+)
 
 
-ConnectionFactory = Callable[[], object]
 MIGRATIONS_DIRECTORY = Path(__file__).with_name("postgres_migrations")
 _RECORD_COLUMNS = tuple(InvoiceRecord.__dataclass_fields__)
 _UPDATABLE_COLUMNS = frozenset(_RECORD_COLUMNS) - {"id"}
@@ -29,8 +32,7 @@ class PostgresInvoiceStore:
         migrations_directory: Path = MIGRATIONS_DIRECTORY,
     ) -> None:
         if connection_factory is None:
-            resolved = settings or PostgresSettings.from_env()
-            connection_factory = lambda: connect_postgres(resolved)
+            connection_factory = postgres_connection_factory(settings)
         self._connection_factory = connection_factory
         self._migrations_directory = migrations_directory
         if initialize_schema:
@@ -144,6 +146,17 @@ class PostgresInvoiceStore:
                 cursor.execute(
                     f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE id = %s",
                     (invoice_id,),
+                )
+                row = cursor.fetchone()
+        return self._record(row) if row is not None else None
+
+    def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT {_SELECT_COLUMNS} FROM invoices "
+                    "WHERE sharepoint_item_id = %s LIMIT 1",
+                    (item_id,),
                 )
                 row = cursor.fetchone()
         return self._record(row) if row is not None else None

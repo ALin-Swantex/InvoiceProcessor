@@ -140,6 +140,47 @@ class SupplierTermsStore:
             connection.commit()
         return terms
 
+    def update(self, terms_id: int, **fields: object) -> SupplierTerms:
+        allowed = {
+            "company",
+            "supplier",
+            "supplier_account_number",
+            "default_payment_method",
+            "payment_terms_notice",
+            "bank_account",
+        }
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown supplier terms fields: {', '.join(sorted(unknown))}."
+            )
+        if not fields:
+            existing = self._get_by_id(terms_id)
+            if existing is None:
+                raise KeyError(f"Supplier terms entry {terms_id} was not found.")
+            return existing
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        with self._connect() as connection:
+            try:
+                cursor = connection.execute(
+                    f"UPDATE supplier_terms SET {assignments} WHERE id = ?",
+                    (*fields.values(), terms_id),
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as error:
+                raise ValueError(
+                    "A payment profile with that company and account number "
+                    "already exists."
+                ) from error
+            if cursor.rowcount == 0:
+                raise KeyError(f"Supplier terms entry {terms_id} was not found.")
+        result = self._get_by_id(terms_id)
+        if result is None:
+            raise RuntimeError(
+                f"Supplier terms entry {terms_id} disappeared after it was updated."
+            )
+        return result
+
     def delete(self, company: str, supplier: str) -> None:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -168,6 +209,13 @@ class SupplierTermsStore:
 
     def _connect(self) -> sqlite3.Connection:
         return connect(self.database_path)
+
+    def _get_by_id(self, terms_id: int) -> SupplierTerms | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM supplier_terms WHERE id = ?", (terms_id,)
+            ).fetchone()
+        return _row_to_terms(row) if row is not None else None
 
     def _migrate_legacy_schema(self) -> None:
         with self._connect() as connection:

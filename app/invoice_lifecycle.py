@@ -21,6 +21,10 @@ from app.approval_matrix import ApprovalMatrixStore
 from app.approval_matrix import find_approvers as _default_find_approvers
 from app.companies import CompanyStore
 from app.companies import get_company as _default_get_company
+from app.company_folders import (
+    REJECTED_INVOICES_FOLDER,
+    CompanyFolderStructure,
+)
 from app.duplicates import find_possible_duplicate
 from app.email_notifications import send_email_notification
 from app.invoices import InvoiceRecord, InvoiceStore
@@ -370,6 +374,12 @@ class InvoiceLifecycle:
                 f"Invoice {invoice_id} is not awaiting PO matching (status: {invoice.status})."
             )
         if matched:
+            if invoice.status == "PO Query / Matching Issue":
+                self._move_pdf_in_sharepoint(
+                    invoice,
+                    self._company_folders(invoice).po_match,
+                    self._filed_filename(invoice),
+                )
             record = self.invoice_store.update_fields(
                 invoice_id,
                 status="Awaiting Sage Registration",
@@ -393,6 +403,11 @@ class InvoiceLifecycle:
         # investigate. The invoice stays outstanding -- it must not be
         # registered in Sage or moved to Approved -- until the query is
         # resolved and record_po_match is called again with matched=True.
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).po_on_hold,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="PO Query / Matching Issue",
@@ -443,6 +458,11 @@ class InvoiceLifecycle:
             )
 
         if invoice.invoice_type == "po":
+            self._move_pdf_in_sharepoint(
+                invoice,
+                self._company_folders(invoice).approved_for_payment,
+                self._filed_filename(invoice),
+            )
             record = self.invoice_store.update_fields(
                 invoice_id, status="Approved", review_reason=None
             )
@@ -479,6 +499,11 @@ class InvoiceLifecycle:
             )
             return record
 
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).nominal_approver_1,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Awaiting Approval 1",
@@ -520,6 +545,11 @@ class InvoiceLifecycle:
             )
         if not reason.strip():
             raise InvoiceLifecycleError("A rejection reason is required.")
+        self._move_pdf_in_sharepoint(
+            invoice,
+            REJECTED_INVOICES_FOLDER,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Rejected",
@@ -551,6 +581,11 @@ class InvoiceLifecycle:
             )
         now = datetime.now(timezone.utc).isoformat()
         reason = f"Confirmed duplicate of invoice #{invoice.duplicate_of_invoice_id}."
+        self._move_pdf_in_sharepoint(
+            invoice,
+            REJECTED_INVOICES_FOLDER,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Cancelled - Duplicate",
@@ -611,6 +646,11 @@ class InvoiceLifecycle:
                 "hold_reason": comments,
                 f"approver{level}_comments": comments,
             }
+            self._move_pdf_in_sharepoint(
+                invoice,
+                self._company_folders(invoice).nominal_on_hold,
+                self._filed_filename(invoice),
+            )
             record = self.invoice_store.update_fields(invoice_id, **fields)
             self.activity_feed.add_event(
                 event_type="approval_on_hold",
@@ -631,6 +671,11 @@ class InvoiceLifecycle:
                 "status": "Rejected",
                 "rejection_reason": comments,
             }
+            self._move_pdf_in_sharepoint(
+                invoice,
+                REJECTED_INVOICES_FOLDER,
+                self._filed_filename(invoice),
+            )
             record = self.invoice_store.update_fields(invoice_id, **fields)
             self.activity_feed.add_event(
                 event_type="rejected",
@@ -640,13 +685,18 @@ class InvoiceLifecycle:
             )
             return record
 
-        if level == 1 and invoice.approver2_email:
+        if level == 1 and invoice.approver2_name:
             fields = {
                 "approver1_decision": "approved",
                 "approver1_date": now,
                 "approver1_comments": comments,
                 "status": "Awaiting Approval 2",
             }
+            self._move_pdf_in_sharepoint(
+                invoice,
+                self._company_folders(invoice).nominal_approver_2,
+                self._filed_filename(invoice),
+            )
             record = self.invoice_store.update_fields(invoice_id, **fields)
             send_email_notification(
                 recipient=str(invoice.approver2_email),
@@ -670,6 +720,11 @@ class InvoiceLifecycle:
             f"approver{level}_comments": comments,
             "status": "Approved",
         }
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).approved_for_payment,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(invoice_id, **fields)
         # SOFTWARE_SPEC.md section 9: "Once fully approved... The Purchase
         # Ledger team should receive an email notification where
@@ -705,6 +760,16 @@ class InvoiceLifecycle:
                 f"Invoice {invoice_id} is not on hold (status: {invoice.status})."
             )
         level = invoice.hold_level or 1
+        structure = self._company_folders(invoice)
+        self._move_pdf_in_sharepoint(
+            invoice,
+            (
+                structure.nominal_approver_1
+                if level == 1
+                else structure.nominal_approver_2
+            ),
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status=f"Awaiting Approval {level}",
@@ -787,6 +852,11 @@ class InvoiceLifecycle:
 
         if not reason or not reason.strip():
             raise InvoiceLifecycleError("A rejection reason is required.")
+        self._move_pdf_in_sharepoint(
+            invoice,
+            REJECTED_INVOICES_FOLDER,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Rejected",
@@ -831,6 +901,11 @@ class InvoiceLifecycle:
         if not payment_date.strip():
             raise InvoiceLifecycleError("A payment date is required.")
         now = datetime.now(timezone.utc).isoformat()
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).paid,
+            self._filed_filename(invoice),
+        )
         # SOFTWARE_SPEC.md section 10: "Doing this should automatically:
         # Record who marked the invoice as paid".
         record = self.invoice_store.update_fields(
@@ -865,6 +940,11 @@ class InvoiceLifecycle:
                 f"Only Approved invoices can be marked as foreign payments "
                 f"(status: {invoice.status})."
             )
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).approved_foreign_poa,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Foreign Payment / Awaiting Allocation",
@@ -908,6 +988,11 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError("An allocation reference is required.")
         if not allocation_date.strip():
             raise InvoiceLifecycleError("An allocation date is required.")
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).reconciled,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Reconciled / Complete",
@@ -935,6 +1020,11 @@ class InvoiceLifecycle:
                 f"Only a foreign payment awaiting allocation can be returned to "
                 f"domestic payment (status: {invoice.status})."
             )
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).approved_for_payment,
+            self._filed_filename(invoice),
+        )
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Approved",
@@ -970,6 +1060,11 @@ class InvoiceLifecycle:
                 f"Only invoices awaiting bank reconciliation can be reconciled "
                 f"(status: {invoice.status})."
             )
+        self._move_pdf_in_sharepoint(
+            invoice,
+            self._company_folders(invoice).reconciled,
+            self._filed_filename(invoice),
+        )
         # SOFTWARE_SPEC.md section 11: "The system should record: ...Who
         # completed the reconciliation, where practical".
         record = self.invoice_store.update_fields(
@@ -1016,16 +1111,28 @@ class InvoiceLifecycle:
             )
             return
         try:
-            pdf_bytes = Path(invoice.stored_path).read_bytes()
-            item = self.sharepoint_client.upload_and_move(
-                filename=invoice.original_filename,
-                content=pdf_bytes,
-                destination_folder=destination_folder,
-                destination_filename=destination_filename,
-            )
+            if invoice.sharepoint_item_id:
+                item = self.sharepoint_client.move_to_folder(
+                    invoice.sharepoint_item_id,
+                    destination_folder,
+                    destination_filename,
+                )
+            else:
+                pdf_bytes = Path(invoice.stored_path).read_bytes()
+                item = self.sharepoint_client.upload_and_move(
+                    filename=invoice.original_filename,
+                    content=pdf_bytes,
+                    destination_folder=destination_folder,
+                    destination_filename=destination_filename,
+                )
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                raise SharePointError(
+                    "SharePoint did not return an item ID after moving the invoice."
+                )
             self.invoice_store.update_fields(
                 invoice.id,
-                sharepoint_item_id=str(item.get("id", "")),
+                sharepoint_item_id=item_id,
                 sharepoint_web_url=self.sharepoint_client.get_item_web_url(item),
             )
         except SharePointError as error:
@@ -1035,3 +1142,29 @@ class InvoiceLifecycle:
                 message=f"SharePoint move failed for invoice {invoice.id}: {error}",
                 invoice_id=invoice.id,
             )
+            raise InvoiceLifecycleError(
+                f"SharePoint filing failed; invoice status was not advanced: {error}"
+            ) from error
+
+    def _company_folders(self, invoice: InvoiceRecord) -> CompanyFolderStructure:
+        if not invoice.company:
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice.id} has no company folder configuration."
+            )
+        company = self._get_company(invoice.company)
+        if company is None:
+            raise InvoiceLifecycleError(
+                f"Company '{invoice.company}' is not configured."
+            )
+        return CompanyFolderStructure.from_root(company.sharepoint_root_folder)
+
+    @staticmethod
+    def _filed_filename(invoice: InvoiceRecord) -> str:
+        if not invoice.irj_number:
+            return invoice.original_filename
+        prefix = f"{invoice.irj_number}_"
+        return (
+            invoice.original_filename
+            if invoice.original_filename.startswith(prefix)
+            else f"{prefix}{invoice.original_filename}"
+        )

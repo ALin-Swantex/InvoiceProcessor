@@ -25,6 +25,7 @@ from pathlib import Path
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS companies (
     name TEXT PRIMARY KEY,
+    sharepoint_root_folder TEXT,
     company_folder TEXT NOT NULL,
     po_matching_folder TEXT NOT NULL,
     aliases TEXT NOT NULL DEFAULT '',
@@ -78,6 +79,25 @@ def connect(database_path: Path | None = None) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    company_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(companies)").fetchall()
+    }
+    if "sharepoint_root_folder" not in company_columns:
+        connection.execute(
+            "ALTER TABLE companies ADD COLUMN sharepoint_root_folder TEXT"
+        )
+    connection.execute(
+        """
+        UPDATE companies
+        SET sharepoint_root_folder = CASE
+            WHEN company_folder LIKE '%/Nominal Invoices'
+            THEN substr(company_folder, 1, length(company_folder) - length('/Nominal Invoices'))
+            ELSE company_folder
+        END
+        WHERE sharepoint_root_folder IS NULL OR sharepoint_root_folder = ''
+        """
+    )
     connection.commit()
     return connection
 

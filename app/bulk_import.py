@@ -23,9 +23,9 @@ from app.supplier_terms import SupplierTermsStore
 # -insensitive, a few common synonyms) since real-world spreadsheets rarely
 # match an exact schema.
 #
-# Row-level failures (e.g. an approver name that doesn't match any existing
-# user) do not abort the whole import -- each row succeeds or is reported as
-# a skipped row with a reason, and the caller/admin can fix just that row.
+# Rows may refer to approvers who do not have a local login yet. Their names
+# are still imported into the matrix; a warning identifies routes that need
+# an email address before outbound approval notifications are enabled.
 # ---------------------------------------------------------------------------
 
 _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
@@ -70,6 +70,18 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
         "second approver",
         "final signature",
     ),
+    "approver1_email": (
+        "approver email",
+        "approver 1 email",
+        "approver1 email",
+        "1st approval email",
+    ),
+    "approver2_email": (
+        "approver 2 email",
+        "approver2 email",
+        "second approver email",
+        "final signature email",
+    ),
 }
 
 
@@ -97,6 +109,13 @@ class ImportSummary:
     @property
     def warning_count(self) -> int:
         return sum(1 for row in self.rows if row.status == "warning")
+
+
+@dataclass(frozen=True)
+class ExistingSupplierImport:
+    existing_name: str
+    spreadsheet_names: tuple[str, ...]
+    row_numbers: tuple[int, ...]
 
 
 def _normalise_header(value: object) -> str:
@@ -131,6 +150,65 @@ def _split_names(raw: str) -> list[str]:
     comma, semicolon, or the word "and"."""
     text = raw.replace(" and ", ",").replace(";", ",")
     return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def find_existing_supplier_imports(
+    source: Path | BinaryIO,
+    *,
+    supplier_store: SupplierStore,
+) -> list[ExistingSupplierImport]:
+    """Return existing supplier companies referenced by a workbook.
+
+    This is intentionally read-only so the API can request confirmation
+    before any imported configuration is changed.
+    """
+    workbook = load_workbook(source, data_only=True, read_only=True)
+    sheet = workbook.active
+    rows_iter = sheet.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        return []
+    mapping = _map_headers(header_row)
+    if "supplier" not in mapping:
+        raise ValueError(
+            "The spreadsheet must have a supplier column (for example "
+            "'Supplier' or 'Trading Partner Name')."
+        )
+
+    duplicates: dict[str, dict[str, object]] = {}
+    for row_number, row in enumerate(rows_iter, start=2):
+        supplier = _cell(row, mapping, "supplier")
+        if not supplier:
+            continue
+        existing = supplier_store.get(supplier)
+        if existing is None:
+            continue
+        key = existing.name.strip().casefold()
+        duplicate = duplicates.setdefault(
+            key,
+            {
+                "existing_name": existing.name,
+                "spreadsheet_names": [],
+                "row_numbers": [],
+            },
+        )
+        spreadsheet_names = duplicate["spreadsheet_names"]
+        row_numbers = duplicate["row_numbers"]
+        assert isinstance(spreadsheet_names, list)
+        assert isinstance(row_numbers, list)
+        if supplier not in spreadsheet_names:
+            spreadsheet_names.append(supplier)
+        row_numbers.append(row_number)
+
+    return [
+        ExistingSupplierImport(
+            existing_name=str(duplicate["existing_name"]),
+            spreadsheet_names=tuple(duplicate["spreadsheet_names"]),
+            row_numbers=tuple(duplicate["row_numbers"]),
+        )
+        for duplicate in duplicates.values()
+    ]
 
 
 def import_supplier_workbook(
@@ -171,11 +249,9 @@ def import_supplier_workbook(
         if row is None or all(cell is None for cell in row):
             continue
 
-        company = (
-            _cell(row, mapping, "company")
-            or selected_company
-            or ALL_COMPANIES
-        )
+        # An admin-selected company scopes the entire workbook and takes
+        # precedence over any Company column accidentally left in the file.
+        company = selected_company or _cell(row, mapping, "company") or ALL_COMPANIES
         supplier = _cell(row, mapping, "supplier")
         if not company or not supplier:
             summary.rows.append(
@@ -188,6 +264,9 @@ def import_supplier_workbook(
                 )
             )
             continue
+        supplier_profile = supplier_store.get(supplier)
+        if supplier_profile is not None:
+            supplier = supplier_profile.name
 
         approver1_raw = _cell(row, mapping, "approver1")
         approver2_raw = _cell(row, mapping, "approver2")
@@ -195,21 +274,43 @@ def import_supplier_workbook(
         if approver2_raw:
             approver_names.append(approver2_raw)
 
+        supplied_emails = [
+            _cell(row, mapping, "approver1_email"),
+            _cell(row, mapping, "approver2_email"),
+        ]
+        existing_entry = approval_matrix_store.find_exact(company, supplier)
+        existing_emails = (
+            {
+                approver.name.strip().casefold(): approver.email
+                for approver in (
+                    existing_entry.approver1,
+                    existing_entry.approver2,
+                )
+                if approver is not None and approver.email
+            }
+            if existing_entry is not None
+            else {}
+        )
         resolved: list[tuple[str, str]] = []
-        unresolved: list[str] = []
-        for name in approver_names[:2]:
+        missing_emails: list[str] = []
+        for index, name in enumerate(approver_names[:2]):
             user = users_by_name.get(name.strip().casefold())
-            if user is None or not user.email:
-                unresolved.append(name)
-            else:
-                resolved.append((user.display_name, user.email))
+            display_name = user.display_name if user is not None else name
+            email = (
+                supplied_emails[index]
+                or (user.email if user is not None else None)
+                or existing_emails.get(display_name.strip().casefold())
+            )
+            resolved.append((display_name, email or ""))
+            if not email:
+                missing_emails.append(display_name)
         route_warning: str | None = None
         if not approver1_raw:
             route_warning = "No first approver was supplied."
-        elif unresolved:
+        elif missing_emails:
             route_warning = (
-                "Approval route was not updated. Create local users for: "
-                f"{', '.join(unresolved)}."
+                "Approval route imported. Add email addresses for: "
+                f"{', '.join(missing_emails)}."
             )
 
         # Ensure the company and supplier master records exist so the
@@ -222,11 +323,19 @@ def import_supplier_workbook(
                 company_folder=f"Invoices/{company}",
                 po_matching_folder=f"Invoices/{company}/PO Matching",
             )
-        if supplier_store.get(supplier) is None:
-            supplier_store.create(name=supplier)
+        supplier_default_company = company if company != ALL_COMPANIES else None
+        if supplier_profile is None:
+            supplier_store.create(
+                name=supplier,
+                default_company=supplier_default_company,
+            )
+        elif supplier_default_company:
+            supplier_store.update(
+                supplier_profile.name,
+                default_company=supplier_default_company,
+            )
 
-        if resolved and route_warning is None:
-            existing_entry = approval_matrix_store.find(company, supplier)
+        if resolved:
             approver1_name, approver1_email = resolved[0]
             approver2_name, approver2_email = resolved[1] if len(resolved) > 1 else (None, None)
             if existing_entry is None:

@@ -4,11 +4,13 @@ import importlib
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Mapping
+from typing import Callable, Mapping
 from urllib.parse import parse_qsl, unquote, urlparse
 
 
 AAD_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
+LOCAL_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+ConnectionFactory = Callable[[], object]
 
 
 @dataclass(frozen=True)
@@ -22,9 +24,13 @@ class PostgresSettings:
     sslrootcert: str | None = None
 
     def __post_init__(self) -> None:
-        if self.sslmode not in {"require", "verify-ca", "verify-full"}:
+        allowed_ssl_modes = {"require", "verify-ca", "verify-full"}
+        if self.sslmode == "disable" and self.host in LOCAL_POSTGRES_HOSTS:
+            return
+        if self.sslmode not in allowed_ssl_modes:
             raise ValueError(
-                "PostgreSQL sslmode must be require, verify-ca, or verify-full."
+                "PostgreSQL sslmode must be require, verify-ca, or verify-full. "
+                "The disable mode is allowed only for a local loopback host."
             )
 
     @classmethod
@@ -136,3 +142,10 @@ def connect_postgres(
         **settings.connection_kwargs(credential),
         row_factory=rows.dict_row,
     )
+
+
+def postgres_connection_factory(
+    settings: PostgresSettings | None = None,
+) -> ConnectionFactory:
+    resolved = settings or PostgresSettings.from_env()
+    return lambda: connect_postgres(resolved)

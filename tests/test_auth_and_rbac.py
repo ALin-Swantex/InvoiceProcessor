@@ -16,6 +16,7 @@ from app.invoices import InvoiceStore
 from app.main import create_app
 from app.outlook_notifications import OutlookNotificationStore
 from app.suppliers import SupplierStore
+from tests.pdf_helpers import VALID_PDF_BYTES
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -34,6 +35,7 @@ def make_client(tmp_path: Path) -> TestClient:
             notification_store=OutlookNotificationStore(
                 tmp_path / "outlook_notifications.db"
             ),
+            auto_configure_sharepoint=False,
         )
     )
 
@@ -74,7 +76,7 @@ def test_manual_upload_runs_extraction_when_azure_is_configured(
 
     response = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("auto.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("auto.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
 
     assert response.status_code == 200
@@ -134,6 +136,72 @@ def test_non_admin_cannot_access_admin_endpoints(tmp_path: Path) -> None:
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     assert client.get("/api/admin/companies").status_code == 403
     assert client.get("/api/admin/users").status_code == 403
+    assert (
+        client.put(
+            "/api/admin/users/admin", json={"display_name": "Unauthorised"}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.put(
+            "/api/admin/supplier-terms/1",
+            json={"company": "*", "supplier": "Supplier Ltd"},
+        ).status_code
+        == 403
+    )
+
+
+def test_admin_can_edit_user_profile_role_and_password(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client, "admin", "ChangeMe-Admin1!")
+
+    updated = client.put(
+        "/api/admin/users/purchase.ledger",
+        json={
+            "display_name": "Ledger Manager",
+            "email": "ledger.manager@example.test",
+            "role": "purchasing",
+            "password": "Replacement-PL1!",
+        },
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json() == {
+        "username": "purchase.ledger",
+        "display_name": "Ledger Manager",
+        "email": "ledger.manager@example.test",
+        "role": "purchasing",
+    }
+    client.post("/api/auth/logout")
+    assert (
+        client.post(
+            "/api/auth/login",
+            json={
+                "username": "purchase.ledger",
+                "password": "ChangeMe-PL1!",
+            },
+        ).status_code
+        == 401
+    )
+    login(client, "purchase.ledger", "Replacement-PL1!")
+    assert client.get("/api/auth/me").json()["role"] == "purchasing"
+
+
+def test_admin_can_clear_user_optional_email(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client, "admin", "ChangeMe-Admin1!")
+    client.put(
+        "/api/admin/users/purchase.ledger",
+        json={"email": "ledger@example.test"},
+    )
+
+    updated = client.put(
+        "/api/admin/users/purchase.ledger",
+        json={"email": None},
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["email"] is None
 
 
 def test_admin_can_manage_companies_suppliers_and_matrix(tmp_path: Path) -> None:
@@ -151,12 +219,35 @@ def test_admin_can_manage_companies_suppliers_and_matrix(tmp_path: Path) -> None
     )
     assert created.status_code == 200, created.text
     assert any(c["name"] == "New Co Ltd" for c in client.get("/api/admin/companies").json())
+    company_updated = client.put(
+        "/api/admin/companies/New%20Co%20Ltd",
+        json={
+            "aliases": ["New Company"],
+            "vat_number": "GB123456789",
+            "address": None,
+        },
+    )
+    assert company_updated.status_code == 200, company_updated.text
+    assert company_updated.json()["aliases"] == ["New Company"]
+    assert company_updated.json()["vat_number"] == "GB123456789"
+    assert company_updated.json()["address"] is None
 
     supplier = client.post(
         "/api/admin/suppliers",
         json={"name": "New Supplier", "contact_email": "ns@example.test"},
     )
     assert supplier.status_code == 200
+    supplier_updated = client.put(
+        "/api/admin/suppliers/New%20Supplier",
+        json={
+            "aliases": ["Supplier Alias"],
+            "default_company": "New Co Ltd",
+            "contact_email": None,
+        },
+    )
+    assert supplier_updated.status_code == 200, supplier_updated.text
+    assert supplier_updated.json()["default_company"] == "New Co Ltd"
+    assert supplier_updated.json()["contact_email"] is None
 
     matrix_entry = client.post(
         "/api/admin/approval-matrix",
@@ -176,6 +267,13 @@ def test_admin_can_manage_companies_suppliers_and_matrix(tmp_path: Path) -> None
     )
     assert updated.status_code == 200
     assert updated.json()["approver2_email"] == "approver.two@example.test"
+    cleared = client.put(
+        f"/api/admin/approval-matrix/{entry_id}",
+        json={"approver2_name": None, "approver2_email": None},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["approver2_name"] is None
+    assert cleared.json()["approver2_email"] is None
 
     deleted = client.delete(f"/api/admin/approval-matrix/{entry_id}")
     assert deleted.status_code == 200
@@ -197,7 +295,7 @@ def test_flagged_invoice_can_be_accepted_back_to_its_workflow_stage(
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("review.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("review.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
 
@@ -224,7 +322,7 @@ def test_flagged_invoice_can_be_rejected_during_review(tmp_path: Path) -> None:
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("reject-review.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("reject-review.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
     client.post(
@@ -250,7 +348,7 @@ def test_duplicate_review_cannot_use_generic_acceptance(tmp_path: Path) -> None:
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("duplicate-review.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("duplicate-review.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
     client.post(
@@ -289,7 +387,7 @@ def _upload_and_confirm(client: TestClient, *, supplier_invoice_number: str = "I
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("invoice.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("invoice.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     assert upload.status_code == 200, upload.text
     invoice_id = upload.json()["id"]
@@ -396,6 +494,34 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     assert reconciled.json()["status"] == "Reconciled / Complete"
 
 
+def test_named_second_approver_is_required_before_email_is_configured(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    route = client.app.state.approval_matrix_store.find(
+        "Acme Trading Ltd", "Supplier Ltd"
+    )
+    assert route is not None
+    client.app.state.approval_matrix_store.update(
+        route.id,
+        approver2_email="",
+    )
+    invoice_id = _upload_and_confirm(
+        client, supplier_invoice_number="MISSING-APPROVER-EMAIL"
+    )
+
+    login(client, "jordan.blake", "ChangeMe-App1!")
+    approved = client.post(
+        f"/api/invoices/{invoice_id}/approve",
+        json={"level": 1, "decision": "approved"},
+    )
+
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "Awaiting Approval 2"
+    assert approved.json()["approver2_name"] == "Sam Ellis"
+    assert approved.json()["approver2_email"] == ""
+
+
 def test_foreign_payment_is_allocated_directly_to_complete(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     invoice_id = _upload_and_confirm(
@@ -476,7 +602,7 @@ def test_missing_approver_route_can_be_configured_and_retried(
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("new-supplier.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("new-supplier.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
     confirmed = client.post(
@@ -525,7 +651,7 @@ def test_po_query_resolution_requires_sage_registration_before_approval(
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("po-invoice.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("po-invoice.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
     confirmed = client.post(
@@ -571,7 +697,7 @@ def test_po_invoice_can_be_rejected_from_matching(tmp_path: Path) -> None:
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("po-reject.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("po-reject.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
     client.post(
@@ -609,7 +735,7 @@ def test_duplicate_invoice_is_flagged_for_review(tmp_path: Path) -> None:
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload2 = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("invoice2.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("invoice2.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice2_id = upload2.json()["id"]
     confirm2 = client.post(
@@ -650,7 +776,7 @@ def test_confirmed_duplicate_can_be_cancelled(tmp_path: Path) -> None:
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("duplicate.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("duplicate.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
     duplicate = client.post(
@@ -684,7 +810,7 @@ def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
 
     upload1 = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("same-invoice.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("same-invoice.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice1_id = upload1.json()["id"]
     confirm1 = client.post(
@@ -703,7 +829,7 @@ def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
     # confirmed the same way, again without a supplier invoice number.
     upload2 = client.post(
         "/api/invoices/manual-upload",
-        files={"file": ("same-invoice.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        files={"file": ("same-invoice.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice2_id = upload2.json()["id"]
     confirm2 = client.post(

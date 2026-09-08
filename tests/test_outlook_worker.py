@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +11,9 @@ from app.invoices import InvoiceStore
 from app.main import create_app
 from app.outlook_notifications import OutlookNotificationStore
 from app.outlook_worker import OutlookInvoiceWorker
+from app.sharepoint import SharePointClient
+from app.sharepoint_intake import SharePointIncomingMonitor
+from tests.pdf_helpers import VALID_PDF_BYTES
 
 
 class FakeOutlookRetriever:
@@ -68,6 +72,32 @@ class FakeExcelRetriever(FakeOutlookRetriever):
         ]
 
 
+class FakeSharePointIncomingClient:
+    def __init__(self) -> None:
+        self.uploads: list[tuple[str, bytes]] = []
+
+    def upload_to_incoming(
+        self, filename: str, content: bytes
+    ) -> dict[str, object]:
+        self.uploads.append((filename, content))
+        return {
+            "id": "sharepoint-item-1",
+            "name": filename,
+            "size": len(content),
+            "file": {"mimeType": "application/pdf"},
+            "webUrl": "https://sharepoint.example/invoice.pdf",
+        }
+
+    def list_incoming_pdfs(self) -> list[dict[str, object]]:
+        return []
+
+    def download_item(self, item_id: str) -> bytes:
+        raise AssertionError("Outlook content should be passed directly to intake")
+
+    def get_item_web_url(self, item: dict[str, object]) -> str | None:
+        return str(item["webUrl"])
+
+
 def queued_store(tmp_path: Path) -> OutlookNotificationStore:
     store = OutlookNotificationStore(tmp_path / "notifications.db")
     store.enqueue(
@@ -84,7 +114,7 @@ def test_worker_persists_outlook_pdf_and_completes_notification(
     tmp_path: Path,
 ) -> None:
     pdf_path = tmp_path / "invoice-1001.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\ninvoice\n%%EOF")
+    pdf_path.write_bytes(VALID_PDF_BYTES)
     notifications = queued_store(tmp_path)
     invoices = InvoiceStore(tmp_path / "invoices.db")
     worker = OutlookInvoiceWorker(
@@ -129,7 +159,7 @@ def test_worker_runs_configured_extraction_after_outlook_intake(
     tmp_path: Path,
 ) -> None:
     pdf_path = tmp_path / "invoice-1001.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\ninvoice\n%%EOF")
+    pdf_path.write_bytes(VALID_PDF_BYTES)
     invoices = InvoiceStore(tmp_path / "invoices.db")
     extracted_ids: list[int] = []
     worker = OutlookInvoiceWorker(
@@ -144,9 +174,40 @@ def test_worker_runs_configured_extraction_after_outlook_intake(
     assert extracted_ids == [invoices.list()[0].id]
 
 
+def test_worker_uploads_outlook_pdf_to_sharepoint_before_registration(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "invoice-1001.pdf"
+    content = VALID_PDF_BYTES
+    pdf_path.write_bytes(content)
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    fake_sharepoint = FakeSharePointIncomingClient()
+    extracted_ids: list[int] = []
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, fake_sharepoint),
+        invoices,
+        cache_directory=tmp_path / "cache",
+        extraction_runner=extracted_ids.append,
+    )
+    worker = OutlookInvoiceWorker(
+        queued_store(tmp_path),
+        invoices,
+        FakeOutlookRetriever(pdf_path),
+        incoming_monitor=monitor,
+    )
+
+    assert asyncio.run(worker.process_next()) is True
+
+    record = invoices.list()[0]
+    assert fake_sharepoint.uploads == [("invoice-1001.pdf", content)]
+    assert record.sharepoint_item_id == "sharepoint-item-1"
+    assert record.sender_address == "accounts@supplier.example"
+    assert extracted_ids == [record.id]
+
+
 def test_worker_persists_converted_excel_as_a_pdf(tmp_path: Path) -> None:
     converted_pdf = tmp_path / "invoice-1001.pdf"
-    converted_pdf.write_bytes(b"%PDF-1.7\nconverted\n%%EOF")
+    converted_pdf.write_bytes(VALID_PDF_BYTES)
     notifications = queued_store(tmp_path)
     invoices = InvoiceStore(tmp_path / "invoices.db")
     worker = OutlookInvoiceWorker(
@@ -166,7 +227,7 @@ def test_worker_persists_converted_excel_as_a_pdf(tmp_path: Path) -> None:
 
 def test_worker_places_no_pdf_email_in_failed_queue(tmp_path: Path) -> None:
     pdf_path = tmp_path / "unused.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    pdf_path.write_bytes(VALID_PDF_BYTES)
     notifications = queued_store(tmp_path)
     worker = OutlookInvoiceWorker(
         notifications,
@@ -187,7 +248,7 @@ def test_worker_is_idempotent_for_duplicate_invoice_attachment(
     tmp_path: Path,
 ) -> None:
     pdf_path = tmp_path / "invoice.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    pdf_path.write_bytes(VALID_PDF_BYTES)
     notifications = queued_store(tmp_path)
     invoices = InvoiceStore(tmp_path / "invoices.db")
     worker = OutlookInvoiceWorker(
@@ -211,7 +272,7 @@ def test_worker_is_idempotent_for_duplicate_invoice_attachment(
 
 def test_local_polling_enqueues_unread_outlook_messages(tmp_path: Path) -> None:
     pdf_path = tmp_path / "invoice.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    pdf_path.write_bytes(VALID_PDF_BYTES)
     notifications = OutlookNotificationStore(tmp_path / "notifications.db")
     worker = OutlookInvoiceWorker(
         notifications,

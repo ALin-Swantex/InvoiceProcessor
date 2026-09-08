@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -28,8 +29,14 @@ from app.auth import (
     get_current_user,
     require_role,
 )
-from app.bulk_import import import_supplier_workbook
-from app.companies import CompanyStore
+from app.bulk_import import find_existing_supplier_imports, import_supplier_workbook
+from app.company_folders import (
+    INCOMING_INVOICES_FOLDER,
+    REJECTED_INVOICES_FOLDER,
+    CompanyFolderStructure,
+    discover_company_folder_structures,
+)
+from app.companies import CompanyProfile, CompanyStore
 from app.config_db import config_database_path, set_setting
 from app.environment import load_project_environment
 from app.invoice_lifecycle import (
@@ -37,6 +44,8 @@ from app.invoice_lifecycle import (
     InvoiceLifecycle,
     InvoiceLifecycleError,
 )
+from app.pdf_validation import InvalidPdfError, validate_pdf
+from app.sharepoint_intake import SharePointIncomingMonitor
 from app.invoices import InvoiceStore
 from app.irj import IrjNumberGenerator
 from app.outlook_notifications import (
@@ -169,14 +178,16 @@ class LoginRequest(BaseModel):
 
 class CompanyRequest(BaseModel):
     name: str
-    company_folder: str
-    po_matching_folder: str
+    sharepoint_root_folder: str | None = None
+    company_folder: str | None = None
+    po_matching_folder: str | None = None
     aliases: list[str] | None = None
     vat_number: str | None = None
     address: str | None = None
 
 
 class CompanyUpdateRequest(BaseModel):
+    sharepoint_root_folder: str | None = None
     company_folder: str | None = None
     po_matching_folder: str | None = None
     aliases: list[str] | None = None
@@ -215,6 +226,15 @@ class ApprovalMatrixUpdateRequest(BaseModel):
     approver2_email: str | None = None
 
 
+class SupplierTermsUpdateRequest(BaseModel):
+    company: str
+    supplier: str
+    supplier_account_number: str | None = None
+    default_payment_method: str | None = None
+    payment_terms_notice: str | None = None
+    bank_account: str | None = None
+
+
 class ThresholdUpdateRequest(BaseModel):
     threshold: float
 
@@ -225,6 +245,13 @@ class UserCreateRequest(BaseModel):
     email: str | None = None
     role: str
     password: str
+
+
+class UserUpdateRequest(BaseModel):
+    display_name: str | None = None
+    email: str | None = None
+    role: str | None = None
+    password: str | None = None
 
 
 def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore:
@@ -255,6 +282,14 @@ def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore
     )
 
 
+def _company_response(profile: CompanyProfile) -> dict[str, object]:
+    structure = CompanyFolderStructure.from_root(profile.sharepoint_root_folder)
+    return {
+        **asdict(profile),
+        "folder_structure": structure.as_dict(),
+    }
+
+
 def create_app(
     *,
     notification_store: OutlookNotificationStore | None = None,
@@ -268,6 +303,7 @@ def create_app(
     suppliers_store: SupplierStore | None = None,
     approval_matrix_store: ApprovalMatrixStore | None = None,
     supplier_terms_store: SupplierTermsStore | None = None,
+    auto_configure_sharepoint: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="Invoice Intake Prototype", version="0.1.0")
     app.state.notification_store = notification_store or OutlookNotificationStore(
@@ -322,6 +358,7 @@ def create_app(
             Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
         )
     app.state.sharepoint_folder_paths = None
+    app.state.sharepoint_company_structures = None
     app.state.auth_store = auth_store or auth_store_from_environment()
     app.state.companies_store = companies_store or CompanyStore(
         Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
@@ -344,7 +381,9 @@ def create_app(
         approval_matrix_store=app.state.approval_matrix_store,
         suppliers_store=app.state.suppliers_store,
     )
-    app.state.sharepoint_attach_attempted = app.state.sharepoint_client is not None
+    app.state.sharepoint_attach_attempted = (
+        app.state.sharepoint_client is not None or not auto_configure_sharepoint
+    )
 
     logger.info(
         "Invoice Processor starting: invoice store backend=%s, SharePoint filing=%s",
@@ -544,6 +583,64 @@ def create_app(
             table.section-table th, table.section-table td {
               text-align: left; padding: .6rem .55rem; border-bottom: 1px solid #e4e7eb;
             }
+            table.section-table tr.invoice-summary-row {
+              cursor: pointer;
+            }
+            table.section-table tr.invoice-summary-row:hover,
+            table.section-table tr.invoice-summary-row:focus {
+              background: #f0f7ff;
+              outline: none;
+            }
+            table.section-table tr.invoice-summary-row[aria-expanded="true"] {
+              background: #e8f2ff;
+            }
+            .invoice-expand-hint {
+              display: block; margin-top: .25rem; color: #627d98;
+              font-size: .7rem; font-weight: 600;
+            }
+            .invoice-analysis-cell {
+              padding: 0 !important; background: #f8fbff;
+            }
+            .invoice-analysis {
+              display: grid; grid-template-columns: minmax(320px, 1.2fr) minmax(280px, .8fr);
+              gap: 1rem; padding: 1rem;
+            }
+            .invoice-analysis-pdf {
+              width: 100%; min-height: 620px; border: 1px solid #bcccdc;
+              border-radius: 8px; background: white;
+            }
+            .invoice-analysis-fields {
+              min-width: 0; padding: .9rem; border: 1px solid #d9e2ec;
+              border-radius: 8px; background: white;
+            }
+            .invoice-analysis-fields h3 {
+              margin: 0 0 .75rem; color: #243b53; font-size: .95rem;
+            }
+            .invoice-analysis-fields h4 {
+              margin: 1rem 0 .45rem; color: #486581; font-size: .75rem;
+              letter-spacing: .035em; text-transform: uppercase;
+            }
+            .invoice-analysis-list {
+              display: grid; grid-template-columns: minmax(120px, .7fr) minmax(0, 1.3fr);
+              gap: .45rem .75rem; margin: 0;
+            }
+            .invoice-analysis-list dt {
+              color: #627d98; font-size: .74rem; font-weight: 700;
+            }
+            .invoice-analysis-list dd {
+              min-width: 0; margin: 0; color: #243b53; font-size: .8rem;
+              overflow-wrap: anywhere;
+            }
+            .field-confidence {
+              display: inline-block; margin-left: .35rem; padding: .1rem .35rem;
+              border-radius: 999px; background: #e8f2ff; color: #1f5f99;
+              font-size: .66rem; font-weight: 700;
+            }
+            .analysis-warning {
+              margin-top: .75rem; padding: .65rem; border-left: 3px solid #d97706;
+              background: #fff8e7; color: #7c4a03; font-size: .78rem;
+              line-height: 1.45; white-space: pre-wrap;
+            }
             table.section-table th { color: #52606d; font-size: .72rem; text-transform: uppercase; }
             table.section-table tr:last-child td { border-bottom: 0; }
             .row-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
@@ -563,11 +660,21 @@ def create_app(
               width: min(460px, calc(100vw - 2rem)); border: 0; border-radius: 12px;
               padding: 0; box-shadow: 0 20px 60px rgba(16,42,67,.3);
             }
+            dialog.admin-edit-dialog { width: min(640px, calc(100vw - 2rem)); }
             dialog::backdrop { background: rgba(11,31,51,.55); }
             .dialog-content { padding: 1rem; }
             .dialog-content h2 { margin: 0 0 .35rem; font-size: 1.05rem; }
             .dialog-content p { margin: 0 0 1rem; color: #52606d; font-size: .82rem; }
             .dialog-content .actions { margin: 1rem -1rem -1rem; }
+            .admin-edit-fields {
+              display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+              gap: .75rem; margin-top: 1rem;
+            }
+            .admin-edit-fields label.full-width { grid-column: 1 / -1; }
+            @media (max-width: 600px) {
+              .admin-edit-fields { grid-template-columns: 1fr; }
+              .admin-edit-fields label.full-width { grid-column: auto; }
+            }
             @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
             @media (max-width: 950px) {
               #app-root { grid-template-columns: 190px minmax(0, 1fr); }
@@ -618,11 +725,112 @@ def create_app(
               background: transparent; border: 1px solid rgba(255,255,255,.4); color: white;
               padding: .25rem .55rem; font-size: .72rem; border-radius: 999px;
             }
-            .admin-block { margin-bottom: 1.5rem; }
-            .admin-block h3 { margin: 0 0 .6rem; font-size: .95rem; }
-            .admin-form { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .8rem; }
-            .admin-form input, .admin-form select { width: auto; flex: 1 1 140px; min-height: 36px; }
-            .admin-form button { white-space: nowrap; }
+            #admin-panel { display: grid; gap: 1rem; }
+            .admin-block {
+              min-width: 0; margin: 0; padding: 1rem;
+              border: 1px solid #d9e2ec; border-radius: 10px; background: #fbfdff;
+            }
+            .admin-block h3 {
+              margin: 0 0 .45rem; color: #243b53; font-size: .98rem;
+            }
+            details.admin-collapsible { padding: 0; }
+            details.admin-collapsible > summary {
+              display: flex; align-items: center; justify-content: space-between;
+              gap: 1rem; padding: 1rem; cursor: pointer; color: #243b53;
+              font-size: .98rem; font-weight: 700; list-style: none;
+              user-select: none;
+            }
+            details.admin-collapsible > summary::-webkit-details-marker {
+              display: none;
+            }
+            details.admin-collapsible > summary::after {
+              content: "⌄"; color: #52606d; font-size: 1.2rem;
+              line-height: 1; transition: transform .15s ease;
+            }
+            details.admin-collapsible[open] > summary {
+              border-bottom: 1px solid #d9e2ec;
+            }
+            details.admin-collapsible[open] > summary::after {
+              transform: rotate(180deg);
+            }
+            .admin-collapsible-content { padding: 1rem; }
+            .admin-help {
+              max-width: 82ch; margin: 0 0 .9rem; color: #52606d;
+              font-size: .82rem; line-height: 1.5;
+            }
+            .admin-form {
+              display: grid;
+              grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+              gap: .7rem; margin: .85rem 0 1rem; align-items: end;
+            }
+            .admin-form input, .admin-form select {
+              width: 100%; min-width: 0; min-height: 40px;
+            }
+            .admin-form button {
+              min-height: 40px; justify-self: start; white-space: nowrap;
+            }
+            #admin-company-root-folder { grid-column: span 2; }
+            .admin-table-wrap {
+              width: 100%; max-width: 100%; overflow-x: auto;
+              border: 1px solid #d9e2ec; border-radius: 8px; background: white;
+            }
+            table.admin-table {
+              width: 100%; border-collapse: collapse; font-size: .8rem;
+            }
+            table.admin-table th, table.admin-table td {
+              padding: .65rem .7rem; border-bottom: 1px solid #e4e7eb;
+              text-align: left; vertical-align: top; overflow-wrap: anywhere;
+            }
+            table.admin-table th {
+              background: #f0f4f8; color: #52606d; font-size: .68rem;
+              font-weight: 800; letter-spacing: .035em; text-transform: uppercase;
+              white-space: normal;
+            }
+            table.admin-table tr:last-child td { border-bottom: 0; }
+            table.admin-table td:last-child { width: 1%; white-space: nowrap; }
+            table.admin-table button { padding: .4rem .6rem; font-size: .75rem; }
+            .path-list {
+              display: grid; gap: .45rem; min-width: min(320px, 50vw);
+            }
+            .path-list div { display: grid; gap: .08rem; }
+            .path-list strong {
+              color: #52606d; font-size: .66rem; letter-spacing: .035em;
+              text-transform: uppercase;
+            }
+            .path-value {
+              color: #243b53; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size: .73rem; line-height: 1.35; overflow-wrap: anywhere;
+            }
+            #admin-company-folder-preview {
+              margin: .8rem 0 1rem; padding: .8rem; overflow-x: auto;
+              border: 1px solid #d9e2ec; border-radius: 8px; background: white;
+              color: #52606d; font-size: .8rem;
+            }
+            #admin-company-folder-preview table {
+              width: 100%; border-collapse: collapse;
+            }
+            #admin-company-folder-preview th,
+            #admin-company-folder-preview td {
+              padding: .4rem .5rem; border-bottom: 1px solid #e4e7eb;
+              text-align: left; vertical-align: top;
+            }
+            #admin-company-folder-preview th {
+              width: 150px; color: #52606d; font-size: .68rem;
+              text-transform: uppercase;
+            }
+            #admin-company-folder-preview td {
+              font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              overflow-wrap: anywhere;
+            }
+            @media (max-width: 700px) {
+              .admin-block { padding: .8rem; }
+              .admin-form { grid-template-columns: 1fr; }
+              #admin-company-root-folder { grid-column: auto; }
+              .admin-form button { width: 100%; }
+              .path-list { min-width: 230px; }
+              .invoice-analysis { grid-template-columns: 1fr; padding: .7rem; }
+              .invoice-analysis-pdf { min-height: 480px; }
+            }
           </style>
         </head>
         <body>
@@ -666,6 +874,18 @@ def create_app(
               <div class="actions">
                 <button type="button" class="secondary" id="payment-cancel">Cancel</button>
                 <button type="submit" class="primary">Record payment</button>
+              </div>
+            </form>
+          </dialog>
+
+          <dialog id="admin-edit-dialog" class="admin-edit-dialog">
+            <form id="admin-edit-form" class="dialog-content">
+              <h2 id="admin-edit-title">Edit record</h2>
+              <p>Update the fields below, then save your changes.</p>
+              <div id="admin-edit-fields" class="admin-edit-fields"></div>
+              <div class="actions">
+                <button type="button" class="secondary" id="admin-edit-cancel">Cancel</button>
+                <button type="submit" class="primary">Save changes</button>
               </div>
             </form>
           </dialog>
@@ -923,44 +1143,53 @@ def create_app(
                 <div class="content" id="admin-panel">
                   <div class="admin-block">
                     <h3>Bulk import supplier master data</h3>
-                    <p style="margin: 0 0 8px; color: #555;">
-                      Upload an Excel (.xlsx) sheet with columns for Trading Partner Name,
-                      Supplier Account Number, Default Payment Method, Payment Terms,
-                      Bank Account, and Approver(s). Each trading partner is imported as
-                      a supplier company and applies across all invoice companies.
+                    <p class="admin-help">
+                      Choose the invoice company, then upload an Excel (.xlsx) sheet
+                      containing Trading Partner Name, Supplier Account Number,
+                      Default Payment Method, Payment Terms, Bank Account, and
+                      Approver(s). Optional Approver Email columns can also be
+                      included. Every supplier and approval route will be assigned
+                      to the selected company.
                     </p>
                     <form class="admin-form" id="admin-import-form">
+                      <select id="admin-import-company" required>
+                        <option value="">Select invoice company…</option>
+                      </select>
                       <input id="admin-import-file" type="file" accept=".xlsx,.xlsm" required>
                       <button type="submit" class="primary">Import workbook</button>
                     </form>
                     <div id="admin-import-result"></div>
                   </div>
 
-                  <div class="admin-block">
-                    <h3>Companies</h3>
-                    <p id="admin-sharepoint-folder-status" style="margin: 0 0 8px; color: #555;">
-                      Loading SharePoint folders…
-                    </p>
-                    <form class="admin-form" id="admin-company-form">
-                      <input id="admin-company-name" placeholder="Company name" required>
-                      <select id="admin-company-folder" required disabled>
-                        <option value="">Select nominal invoice folder…</option>
-                      </select>
-                      <select id="admin-company-po-folder" required disabled>
-                        <option value="">Select PO matching folder…</option>
-                      </select>
-                      <input id="admin-company-aliases" placeholder="Aliases (comma separated)">
-                      <button type="submit" class="primary" id="admin-company-submit" disabled>Add company</button>
-                    </form>
-                    <div id="admin-companies-table"></div>
-                  </div>
+                  <details class="admin-block admin-collapsible">
+                    <summary>Companies</summary>
+                    <div class="admin-collapsible-content">
+                      <p id="admin-sharepoint-folder-status" class="admin-help">
+                        Loading SharePoint folders…
+                      </p>
+                      <form class="admin-form" id="admin-company-form">
+                        <input id="admin-company-name" placeholder="Company name" required>
+                        <select id="admin-company-root-folder" required disabled>
+                          <option value="">Select SharePoint company folder…</option>
+                        </select>
+                        <input id="admin-company-aliases" placeholder="Aliases (comma separated)">
+                        <button type="submit" class="primary" id="admin-company-submit" disabled>Add company</button>
+                      </form>
+                      <div id="admin-company-folder-preview" class="empty">
+                        Select a company folder to preview its workflow destinations.
+                      </div>
+                      <div id="admin-companies-table"></div>
+                    </div>
+                  </details>
 
                   <div class="admin-block">
                     <h3>Suppliers</h3>
                     <form class="admin-form" id="admin-supplier-form">
                       <input id="admin-supplier-name" placeholder="Supplier name" required>
                       <input id="admin-supplier-aliases" placeholder="Aliases (comma separated)">
-                      <input id="admin-supplier-default-company" placeholder="Default company (optional)">
+                      <select id="admin-supplier-default-company">
+                        <option value="">No default company</option>
+                      </select>
                       <input id="admin-supplier-contact" placeholder="Contact email (optional)">
                       <button type="submit" class="primary">Add supplier</button>
                     </form>
@@ -975,8 +1204,13 @@ def create_app(
                   <div class="admin-block">
                     <h3>Approval matrix</h3>
                     <form class="admin-form" id="admin-matrix-form">
-                      <input id="admin-matrix-company" placeholder="Company" required>
-                      <input id="admin-matrix-supplier" placeholder="Supplier" required>
+                      <select id="admin-matrix-company" required>
+                        <option value="">Select invoice company…</option>
+                        <option value="*">All invoice companies</option>
+                      </select>
+                      <select id="admin-matrix-supplier" required>
+                        <option value="">Select supplier company…</option>
+                      </select>
                       <input id="admin-matrix-approver1-name" placeholder="Approver 1 name" required>
                       <input id="admin-matrix-approver1-email" placeholder="Approver 1 email" required>
                       <input id="admin-matrix-approver2-name" placeholder="Approver 2 name (optional)">
@@ -1056,6 +1290,10 @@ def create_app(
             let currentTab = "incoming";
             let lastActivityId = null;
             let currentUser = null;
+            let sharePointCompanyFolders = new Map();
+            let adminCompanies = [];
+            let adminSuppliers = [];
+            const expandedInvoiceIds = new Set();
 
             function setValue(id, value) {
               const el = document.getElementById(id);
@@ -1237,6 +1475,85 @@ def create_app(
               return div.innerHTML;
             }
 
+            function fieldConfidences(invoice) {
+              if (!invoice.ai_field_confidences) return {};
+              try {
+                const parsed = JSON.parse(invoice.ai_field_confidences);
+                return parsed && typeof parsed === "object" ? parsed : {};
+              } catch (error) {
+                return {};
+              }
+            }
+
+            function analysisValue(value) {
+              return value === null || value === undefined || value === ""
+                ? "—"
+                : escapeHtml(value);
+            }
+
+            function analysisField(label, value, confidence = null) {
+              const confidenceBadge = confidence === null || confidence === undefined
+                ? ""
+                : `<span class="field-confidence">${Math.round(Number(confidence) * 100)}%</span>`;
+              return `<dt>${escapeHtml(label)}</dt><dd>${analysisValue(value)}${confidenceBadge}</dd>`;
+            }
+
+            function invoiceAnalysisHtml(invoice) {
+              const confidences = fieldConfidences(invoice);
+              const overallConfidence = invoice.ai_confidence === null ||
+                  invoice.ai_confidence === undefined
+                ? "—"
+                : `${Math.round(Number(invoice.ai_confidence) * 100)}%`;
+              const warnings = invoice.ai_review_warnings || invoice.review_reason;
+              return `
+                <div class="invoice-analysis">
+                  <iframe
+                    class="invoice-analysis-pdf"
+                    src="/api/invoices/${invoice.id}/pdf"
+                    title="Invoice ${escapeHtml(invoice.irj_number || invoice.original_filename)} PDF"
+                  ></iframe>
+                  <section class="invoice-analysis-fields" aria-label="Invoice analysis">
+                    <h3>Extracted invoice analysis</h3>
+                    <h4>Workflow</h4>
+                    <dl class="invoice-analysis-list">
+                      ${analysisField("Status", invoice.status)}
+                      ${analysisField("IRJ number", invoice.irj_number)}
+                      ${analysisField("Invoice type", invoice.invoice_type)}
+                      ${analysisField("Overall confidence", overallConfidence)}
+                    </dl>
+                    <h4>Extracted fields</h4>
+                    <dl class="invoice-analysis-list">
+                      ${analysisField("Company", invoice.company, confidences.company)}
+                      ${analysisField("Supplier", invoice.supplier, confidences.supplier)}
+                      ${analysisField("Supplier invoice no.", invoice.supplier_invoice_number, confidences.supplier_invoice_number)}
+                      ${analysisField("PO number", invoice.po_number, confidences.purchase_order_number)}
+                      ${analysisField("Invoice date", invoice.invoice_date, confidences.invoice_date)}
+                      ${analysisField("Invoice value", invoice.invoice_value, confidences.invoice_value)}
+                      ${analysisField("Currency", invoice.currency, confidences.currency)}
+                    </dl>
+                    <h4>Source</h4>
+                    <dl class="invoice-analysis-list">
+                      ${analysisField("Filename", invoice.original_filename)}
+                      ${analysisField("Sender", invoice.sender_address || invoice.sender_name)}
+                      ${analysisField("Received", invoice.received_at)}
+                      ${analysisField("Subject", invoice.subject)}
+                    </dl>
+                    ${invoice.sage_reference || invoice.approver1_name ? `
+                      <h4>Processing</h4>
+                      <dl class="invoice-analysis-list">
+                        ${analysisField("Sage reference", invoice.sage_reference)}
+                        ${analysisField("Approver 1", invoice.approver1_name)}
+                        ${analysisField("Approver 1 decision", invoice.approver1_decision)}
+                        ${analysisField("Approver 2", invoice.approver2_name)}
+                        ${analysisField("Approver 2 decision", invoice.approver2_decision)}
+                      </dl>
+                    ` : ""}
+                    ${warnings ? `<div class="analysis-warning">${escapeHtml(warnings)}</div>` : ""}
+                  </section>
+                </div>
+              `;
+            }
+
             function renderSectionTable(containerId, statuses, columns, actionsFn) {
               const container = document.getElementById(containerId);
               if (!container) return;
@@ -1249,17 +1566,40 @@ def create_app(
               for (const column of columns) html += `<th>${column.label}</th>`;
               html += "<th>Actions</th></tr></thead><tbody>";
               for (const invoice of rows) {
-                html += "<tr>";
+                const expanded = expandedInvoiceIds.has(String(invoice.id));
+                html += `<tr class="invoice-summary-row" data-expand-invoice="${invoice.id}" ` +
+                  `tabindex="0" aria-expanded="${expanded}" title="Click to view invoice analysis">`;
                 for (const column of columns) {
                   html += `<td>${escapeHtml(column.value(invoice))}</td>`;
                 }
-                html += `<td class="row-actions">${actionsFn(invoice)}</td>`;
+                html += `<td class="row-actions">${actionsFn(invoice)}` +
+                  `<span class="invoice-expand-hint">${expanded ? "Hide" : "View"} PDF and extracted fields</span></td>`;
                 html += "</tr>";
+                if (expanded) {
+                  html += `<tr class="invoice-analysis-row"><td colspan="${columns.length + 1}" ` +
+                    `class="invoice-analysis-cell">${invoiceAnalysisHtml(invoice)}</td></tr>`;
+                }
               }
               html += "</tbody></table>";
               container.innerHTML = html;
               container.querySelectorAll("[data-action]").forEach(button => {
                 button.addEventListener("click", () => handleRowAction(button));
+              });
+              container.querySelectorAll("[data-expand-invoice]").forEach(row => {
+                const toggle = event => {
+                  if (event.target.closest("button, a, input, select, textarea")) return;
+                  if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
+                  event.preventDefault();
+                  const id = String(row.dataset.expandInvoice);
+                  if (expandedInvoiceIds.has(id)) {
+                    expandedInvoiceIds.delete(id);
+                  } else {
+                    expandedInvoiceIds.add(id);
+                  }
+                  renderAllSections();
+                };
+                row.addEventListener("click", toggle);
+                row.addEventListener("keydown", toggle);
               });
             }
 
@@ -1393,9 +1733,9 @@ def create_app(
               );
             }
 
-            async function postJson(url, body) {
+            async function sendJson(url, method, body) {
               const response = await fetch(url, {
-                method: "POST",
+                method,
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body || {}),
               });
@@ -1404,6 +1744,14 @@ def create_app(
                 throw new Error(detail.detail || `Request failed (${response.status}).`);
               }
               return response.json();
+            }
+
+            async function postJson(url, body) {
+              return sendJson(url, "POST", body);
+            }
+
+            async function putJson(url, body) {
+              return sendJson(url, "PUT", body);
             }
 
             async function collectDomesticPayment(invoice) {
@@ -1754,33 +2102,179 @@ def create_app(
                 .filter(Boolean);
             }
 
-            function renderSimpleTable(container, columns, rows, onDelete, idKey = "id") {
+            function renderSimpleTable(
+              container,
+              columns,
+              rows,
+              onDelete,
+              idKey = "id",
+              onEdit = null
+            ) {
               if (!rows.length) {
                 container.innerHTML = '<p class="empty">Nothing here yet.</p>';
                 return;
               }
-              const head = columns.map(c => `<th>${c.label}</th>`).join("") + (onDelete ? "<th></th>" : "");
+              const hasActions = Boolean(onDelete || onEdit);
+              const head = columns.map(c => `<th>${c.label}</th>`).join("") +
+                (hasActions ? "<th>Actions</th>" : "");
               const body = rows
-                .map(row => {
+                .map((row, index) => {
                   const cells = columns.map(c => `<td>${c.value(row) ?? "—"}</td>`).join("");
-                  const deleteCell = onDelete
-                    ? `<td><button class="danger" data-delete-id="${row[idKey]}">Delete</button></td>`
+                  const actionCell = hasActions
+                    ? `<td><div class="row-actions">` +
+                      (onEdit
+                        ? `<button class="secondary" data-edit-index="${index}">Edit</button>`
+                        : "") +
+                      (onDelete
+                        ? `<button class="danger" data-delete-id="${row[idKey]}">Delete</button>`
+                        : "") +
+                      `</div></td>`
                     : "";
-                  return `<tr>${cells}${deleteCell}</tr>`;
+                  return `<tr>${cells}${actionCell}</tr>`;
                 })
                 .join("");
-              container.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+              container.innerHTML =
+                `<div class="admin-table-wrap"><table class="admin-table">` +
+                `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>` +
+                `</table></div>`;
               if (onDelete) {
                 container.querySelectorAll("[data-delete-id]").forEach(button => {
                   button.addEventListener("click", () => onDelete(button.dataset.deleteId));
                 });
               }
+              if (onEdit) {
+                container.querySelectorAll("[data-edit-index]").forEach(button => {
+                  button.addEventListener(
+                    "click",
+                    () => onEdit(rows[Number(button.dataset.editIndex)])
+                  );
+                });
+              }
+            }
+
+            function openAdminEditor(title, fields, onSave) {
+              const dialog = document.getElementById("admin-edit-dialog");
+              const form = document.getElementById("admin-edit-form");
+              const container = document.getElementById("admin-edit-fields");
+              document.getElementById("admin-edit-title").textContent = title;
+              container.replaceChildren();
+              const controls = new Map();
+              for (const field of fields) {
+                const label = document.createElement("label");
+                label.textContent = field.label;
+                if (field.fullWidth) label.classList.add("full-width");
+                let control;
+                if (field.type === "select") {
+                  control = document.createElement("select");
+                  for (const [value, optionLabel] of field.options || []) {
+                    const option = document.createElement("option");
+                    option.value = value;
+                    option.textContent = optionLabel;
+                    control.appendChild(option);
+                  }
+                } else if (field.type === "textarea") {
+                  control = document.createElement("textarea");
+                } else {
+                  control = document.createElement("input");
+                  control.type = field.type || "text";
+                }
+                control.value = field.value ?? "";
+                control.required = Boolean(field.required);
+                control.autocomplete = field.type === "password" ? "new-password" : "off";
+                label.appendChild(control);
+                container.appendChild(label);
+                controls.set(field.key, { control, field });
+              }
+              document.getElementById("admin-edit-cancel").onclick = () => dialog.close();
+              form.onsubmit = async event => {
+                event.preventDefault();
+                const values = {};
+                for (const [key, { control, field }] of controls) {
+                  if (field.omitWhenBlank && !control.value) continue;
+                  values[key] = field.nullWhenBlank && !control.value
+                    ? null
+                    : control.value;
+                }
+                try {
+                  await onSave(values);
+                  dialog.close();
+                } catch (error) {
+                  showToast(error.message, true);
+                }
+              };
+              dialog.showModal();
+            }
+
+            function companyOptions(includeAll = false) {
+              return [
+                ["", "Select invoice company…"],
+                ...(includeAll ? [["*", "All invoice companies"]] : []),
+                ...adminCompanies.map(company => [company.name, company.name]),
+              ];
+            }
+
+            function supplierOptions() {
+              return [
+                ["", "Select supplier company…"],
+                ...adminSuppliers.map(supplier => [supplier.name, supplier.name]),
+              ];
+            }
+
+            function includeCurrentOption(options, value, label = value) {
+              if (!value || options.some(([optionValue]) => optionValue === value)) {
+                return options;
+              }
+              return [...options, [value, label]];
+            }
+
+            function replaceSelectOptions(select, options) {
+              const selected = select.value;
+              select.replaceChildren();
+              for (const [value, label] of options) {
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = label;
+                select.appendChild(option);
+              }
+              if (options.some(([value]) => value === selected)) {
+                select.value = selected;
+              }
+            }
+
+            function loadAdminReferenceOptions(companies, suppliers) {
+              const companyOptions = companies.map(company => [
+                company.name,
+                company.name,
+              ]);
+              replaceSelectOptions(
+                document.getElementById("admin-supplier-default-company"),
+                [["", "No default company"], ...companyOptions]
+              );
+              replaceSelectOptions(
+                document.getElementById("admin-import-company"),
+                [["", "Select invoice company…"], ...companyOptions]
+              );
+              replaceSelectOptions(
+                document.getElementById("admin-matrix-company"),
+                [
+                  ["", "Select invoice company…"],
+                  ["*", "All invoice companies"],
+                  ...companyOptions,
+                ]
+              );
+              replaceSelectOptions(
+                document.getElementById("admin-matrix-supplier"),
+                [
+                  ["", "Select supplier company…"],
+                  ...suppliers.map(supplier => [supplier.name, supplier.name]),
+                ]
+              );
             }
 
             async function loadSharePointFolderOptions() {
               const status = document.getElementById("admin-sharepoint-folder-status");
-              const nominalSelect = document.getElementById("admin-company-folder");
-              const poSelect = document.getElementById("admin-company-po-folder");
+              const rootSelect = document.getElementById("admin-company-root-folder");
+              const preview = document.getElementById("admin-company-folder-preview");
               const submit = document.getElementById("admin-company-submit");
               try {
                 const response = await fetch("/api/admin/sharepoint/folders");
@@ -1788,28 +2282,30 @@ def create_app(
                 if (!response.ok) {
                   throw new Error(body.detail || "SharePoint folders could not be loaded.");
                 }
-                const populate = (select, placeholder) => {
-                  select.replaceChildren();
-                  const emptyOption = document.createElement("option");
-                  emptyOption.value = "";
-                  emptyOption.textContent = placeholder;
-                  select.appendChild(emptyOption);
-                  for (const path of body.folders) {
-                    const option = document.createElement("option");
-                    option.value = path;
-                    option.textContent = path;
-                    select.appendChild(option);
-                  }
-                };
-                populate(nominalSelect, "Select nominal invoice folder…");
-                populate(poSelect, "Select PO matching folder…");
-                nominalSelect.disabled = false;
-                poSelect.disabled = false;
+                sharePointCompanyFolders = new Map(
+                  body.company_roots.map(structure => [structure.root, structure])
+                );
+                rootSelect.replaceChildren();
+                const emptyOption = document.createElement("option");
+                emptyOption.value = "";
+                emptyOption.textContent = "Select SharePoint company folder…";
+                rootSelect.appendChild(emptyOption);
+                for (const structure of body.company_roots) {
+                  const option = document.createElement("option");
+                  option.value = structure.root;
+                  option.textContent = structure.root.split("/").pop();
+                  rootSelect.appendChild(option);
+                }
+                rootSelect.disabled = false;
                 submit.disabled = false;
-                status.textContent = `${body.folders.length} SharePoint folder(s) available.`;
+                status.textContent =
+                  `${body.company_roots.length} complete company folder structure(s) found. ` +
+                  `Incoming and Rejected are shared across all companies.`;
+                preview.textContent =
+                  "Select a company folder to preview its workflow destinations.";
               } catch (error) {
-                nominalSelect.disabled = true;
-                poSelect.disabled = true;
+                sharePointCompanyFolders = new Map();
+                rootSelect.disabled = true;
                 submit.disabled = true;
                 status.textContent = `SharePoint folders unavailable: ${error.message}`;
               }
@@ -1825,12 +2321,27 @@ def create_app(
                   fetch("/api/admin/ai-threshold").then(r => r.json()),
                   fetch("/api/admin/users").then(r => r.json()),
                 ]);
+                adminCompanies = companies;
+                adminSuppliers = suppliers;
+                loadAdminReferenceOptions(companies, suppliers);
                 renderSimpleTable(
                   document.getElementById("admin-companies-table"),
                   [
                     { label: "Name", value: c => c.name },
-                    { label: "Invoice folder", value: c => c.company_folder },
-                    { label: "PO folder", value: c => c.po_matching_folder },
+                    { label: "SharePoint company folder", value: c => c.sharepoint_root_folder },
+                    {
+                      label: "Workflow destinations",
+                      value: c => `<div class="path-list">${[
+                          ["Nominal", c.folder_structure.nominal_invoices],
+                          ["PO Match", c.folder_structure.po_match],
+                          ["Approved", c.folder_structure.approved_for_payment],
+                          ["Paid", c.folder_structure.paid],
+                          ["Reconciled", c.folder_structure.reconciled],
+                        ].map(([label, path]) =>
+                          `<div><strong>${escapeHtml(label)}</strong>` +
+                          `<span class="path-value">${escapeHtml(path)}</span></div>`
+                        ).join("")}</div>`
+                    },
                     { label: "Aliases", value: c => (c.aliases || []).join(", ") },
                   ],
                   companies,
@@ -1839,7 +2350,58 @@ def create_app(
                     await loadAdminPanel();
                     await loadCompanies();
                   },
-                  "name"
+                  "name",
+                  company => {
+                    const rootOptions = includeCurrentOption(
+                      [
+                        ["", "Select SharePoint company folder…"],
+                        ...[...sharePointCompanyFolders.values()].map(structure => [
+                          structure.root,
+                          structure.root.split("/").pop(),
+                        ]),
+                      ],
+                      company.sharepoint_root_folder
+                    );
+                    openAdminEditor(`Edit ${company.name}`, [
+                      {
+                        key: "sharepoint_root_folder",
+                        label: "SharePoint company folder",
+                        type: "select",
+                        options: rootOptions,
+                        value: company.sharepoint_root_folder,
+                        required: true,
+                        fullWidth: true,
+                      },
+                      {
+                        key: "aliases",
+                        label: "Aliases (comma separated)",
+                        value: (company.aliases || []).join(", "),
+                        fullWidth: true,
+                      },
+                      {
+                        key: "vat_number",
+                        label: "VAT number",
+                        value: company.vat_number,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "address",
+                        label: "Address",
+                        type: "textarea",
+                        value: company.address,
+                        nullWhenBlank: true,
+                        fullWidth: true,
+                      },
+                    ], async values => {
+                      values.aliases = splitCommaList(values.aliases);
+                      await putJson(
+                        `/api/admin/companies/${encodeURIComponent(company.name)}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                      await loadCompanies();
+                    });
+                  }
                 );
                 renderSimpleTable(
                   document.getElementById("admin-suppliers-table"),
@@ -1855,7 +2417,43 @@ def create_app(
                     await loadAdminPanel();
                     await loadSuppliers();
                   },
-                  "name"
+                  "name",
+                  supplier => {
+                    openAdminEditor(`Edit ${supplier.name}`, [
+                      {
+                        key: "aliases",
+                        label: "Aliases (comma separated)",
+                        value: (supplier.aliases || []).join(", "),
+                        fullWidth: true,
+                      },
+                      {
+                        key: "default_company",
+                        label: "Default company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          [["", "No default company"], ...companyOptions().slice(1)],
+                          supplier.default_company
+                        ),
+                        value: supplier.default_company,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "contact_email",
+                        label: "Contact email",
+                        type: "email",
+                        value: supplier.contact_email,
+                        nullWhenBlank: true,
+                      },
+                    ], async values => {
+                      values.aliases = splitCommaList(values.aliases);
+                      await putJson(
+                        `/api/admin/suppliers/${encodeURIComponent(supplier.name)}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                      await loadSuppliers();
+                    });
+                  }
                 );
                 renderSimpleTable(
                   document.getElementById("admin-supplier-terms-table"),
@@ -1867,20 +2465,148 @@ def create_app(
                     { label: "Terms", value: t => t.payment_terms_notice },
                     { label: "Bank account", value: t => t.bank_account },
                   ],
-                  supplierTerms
+                  supplierTerms,
+                  null,
+                  "id",
+                  terms => {
+                    openAdminEditor("Edit supplier payment settings", [
+                      {
+                        key: "company",
+                        label: "Invoice company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          companyOptions(true),
+                          terms.company,
+                          terms.company === "*" ? "All invoice companies" : terms.company
+                        ),
+                        value: terms.company,
+                        required: true,
+                      },
+                      {
+                        key: "supplier",
+                        label: "Supplier company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          supplierOptions(),
+                          terms.supplier
+                        ),
+                        value: terms.supplier,
+                        required: true,
+                      },
+                      {
+                        key: "supplier_account_number",
+                        label: "Supplier account number",
+                        value: terms.supplier_account_number,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "default_payment_method",
+                        label: "Default payment method",
+                        value: terms.default_payment_method,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "payment_terms_notice",
+                        label: "Payment terms",
+                        value: terms.payment_terms_notice,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "bank_account",
+                        label: "Bank account",
+                        value: terms.bank_account,
+                        nullWhenBlank: true,
+                      },
+                    ], async values => {
+                      await putJson(`/api/admin/supplier-terms/${terms.id}`, values);
+                      await loadAdminPanel();
+                    });
+                  }
                 );
                 renderSimpleTable(
                   document.getElementById("admin-matrix-table"),
                   [
                     { label: "Applies to", value: m => m.company === "*" ? "All invoice companies" : m.company },
                     { label: "Supplier company", value: m => m.supplier },
-                    { label: "Approver 1", value: m => `${m.approver1_name} <${m.approver1_email}>` },
-                    { label: "Approver 2", value: m => (m.approver2_name ? `${m.approver2_name} <${m.approver2_email}>` : "—") },
+                    {
+                      label: "Approver 1",
+                      value: m => m.approver1_email
+                        ? `${m.approver1_name} <${m.approver1_email}>`
+                        : m.approver1_name,
+                    },
+                    {
+                      label: "Approver 2",
+                      value: m => m.approver2_name
+                        ? (m.approver2_email
+                          ? `${m.approver2_name} <${m.approver2_email}>`
+                          : m.approver2_name)
+                        : "—",
+                    },
                   ],
                   matrix,
                   async id => {
                     await fetch(`/api/admin/approval-matrix/${id}`, { method: "DELETE" });
                     await loadAdminPanel();
+                  },
+                  "id",
+                  entry => {
+                    openAdminEditor("Edit approval route", [
+                      {
+                        key: "company",
+                        label: "Invoice company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          companyOptions(true),
+                          entry.company,
+                          entry.company === "*" ? "All invoice companies" : entry.company
+                        ),
+                        value: entry.company,
+                        required: true,
+                      },
+                      {
+                        key: "supplier",
+                        label: "Supplier company",
+                        type: "select",
+                        options: includeCurrentOption(
+                          supplierOptions(),
+                          entry.supplier
+                        ),
+                        value: entry.supplier,
+                        required: true,
+                      },
+                      {
+                        key: "approver1_name",
+                        label: "Approver 1 name",
+                        value: entry.approver1_name,
+                        required: true,
+                      },
+                      {
+                        key: "approver1_email",
+                        label: "Approver 1 email",
+                        type: "email",
+                        value: entry.approver1_email,
+                        required: true,
+                      },
+                      {
+                        key: "approver2_name",
+                        label: "Approver 2 name",
+                        value: entry.approver2_name,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "approver2_email",
+                        label: "Approver 2 email",
+                        type: "email",
+                        value: entry.approver2_email,
+                        nullWhenBlank: true,
+                      },
+                    ], async values => {
+                      await putJson(
+                        `/api/admin/approval-matrix/${entry.id}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                    });
                   }
                 );
                 document.getElementById("admin-threshold-value").value = threshold.threshold ?? 0.8;
@@ -1896,7 +2622,51 @@ def create_app(
                     await fetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: "DELETE" });
                     await loadAdminPanel();
                   },
-                  "username"
+                  "username",
+                  account => {
+                    openAdminEditor(`Edit ${account.username}`, [
+                      {
+                        key: "display_name",
+                        label: "Display name",
+                        value: account.display_name,
+                        required: true,
+                      },
+                      {
+                        key: "email",
+                        label: "Email",
+                        type: "email",
+                        value: account.email,
+                        nullWhenBlank: true,
+                      },
+                      {
+                        key: "role",
+                        label: "Role",
+                        type: "select",
+                        options: [
+                          ["admin", "Admin"],
+                          ["purchase_ledger", "Purchase Ledger"],
+                          ["approver1", "Approver 1"],
+                          ["approver2", "Approver 2"],
+                          ["purchasing", "Purchasing"],
+                        ],
+                        value: account.role,
+                        required: true,
+                      },
+                      {
+                        key: "password",
+                        label: "New password (leave blank to keep current)",
+                        type: "password",
+                        omitWhenBlank: true,
+                        fullWidth: true,
+                      },
+                    ], async values => {
+                      await putJson(
+                        `/api/admin/users/${encodeURIComponent(account.username)}`,
+                        values
+                      );
+                      await loadAdminPanel();
+                    });
+                  }
                 );
               } catch (error) {
                 showToast(`Failed to load admin panel: ${error.message}`, true);
@@ -1906,21 +2676,48 @@ def create_app(
             document.getElementById("admin-import-form").addEventListener("submit", async event => {
               event.preventDefault();
               const fileInput = document.getElementById("admin-import-file");
+              const companySelect = document.getElementById("admin-import-company");
               const resultBox = document.getElementById("admin-import-result");
-              if (!fileInput.files.length) {
+              if (!companySelect.value || !fileInput.files.length) {
                 return;
               }
               const formData = new FormData();
               formData.append("file", fileInput.files[0]);
+              formData.append("company", companySelect.value);
               resultBox.innerHTML = "<p>Importing…</p>";
               try {
-                const response = await fetch("/api/admin/import/supplier-master-data", {
+                let response = await fetch("/api/admin/import/supplier-master-data", {
                   method: "POST",
                   body: formData,
                 });
-                const body = await response.json();
+                let body = await response.json();
+                if (response.status === 409 && body.detail?.duplicates) {
+                  const duplicates = body.detail.duplicates
+                    .map(item =>
+                      `${item.existing_name} (spreadsheet row${item.row_numbers.length === 1 ? "" : "s"} ` +
+                      `${item.row_numbers.join(", ")})`
+                    )
+                    .join("\\n");
+                  const replace = window.confirm(
+                    `The following supplier companies already exist:\n\n${duplicates}\n\n` +
+                    `Replace their configured values with the spreadsheet rows?`
+                  );
+                  if (!replace) {
+                    resultBox.innerHTML = "<p>Import cancelled; no records were changed.</p>";
+                    return;
+                  }
+                  formData.set("replace_existing", "true");
+                  response = await fetch("/api/admin/import/supplier-master-data", {
+                    method: "POST",
+                    body: formData,
+                  });
+                  body = await response.json();
+                }
                 if (!response.ok) {
-                  throw new Error(body.detail || "Import failed.");
+                  const detail = typeof body.detail === "string"
+                    ? body.detail
+                    : body.detail?.message;
+                  throw new Error(detail || "Import failed.");
                 }
                 const issueRows = body.rows.filter(r => r.status !== "imported");
                 const issueList = issueRows.length
@@ -1948,14 +2745,46 @@ def create_app(
               try {
                 await postJson("/api/admin/companies", {
                   name: document.getElementById("admin-company-name").value,
-                  company_folder: document.getElementById("admin-company-folder").value,
-                  po_matching_folder: document.getElementById("admin-company-po-folder").value,
+                  sharepoint_root_folder: document.getElementById("admin-company-root-folder").value,
                   aliases: splitCommaList(document.getElementById("admin-company-aliases").value),
                 });
                 event.target.reset();
                 await loadAdminPanel();
               } catch (error) {
                 showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("admin-company-root-folder").addEventListener("change", event => {
+              const structure = sharePointCompanyFolders.get(event.target.value);
+              const preview = document.getElementById("admin-company-folder-preview");
+              if (!structure) {
+                preview.textContent =
+                  "Select a company folder to preview its workflow destinations.";
+                return;
+              }
+              const rows = [
+                ["Nominal invoices", structure.nominal_invoices],
+                ["Approver 1", structure.nominal_approver_1],
+                ["Approver 2", structure.nominal_approver_2],
+                ["Nominal on hold", structure.nominal_on_hold],
+                ["PO match", structure.po_match],
+                ["PO on hold", structure.po_on_hold],
+                ["Approved — BACS", structure.approved_bacs],
+                ["Approved — BANKLINE", structure.approved_bankline],
+                ["Approved — FOREIGN POA", structure.approved_foreign_poa],
+                ["Paid", structure.paid],
+                ["Reconciled", structure.reconciled],
+              ];
+              preview.innerHTML =
+                "<table><tbody>" +
+                rows.map(([label, path]) =>
+                  `<tr><th>${escapeHtml(label)}</th><td>${escapeHtml(path)}</td></tr>`
+                ).join("") +
+                "</tbody></table>";
+              const nameInput = document.getElementById("admin-company-name");
+              if (!nameInput.value) {
+                nameInput.value = structure.root.split("/").pop();
               }
             });
 
@@ -2200,13 +3029,9 @@ def create_app(
         outside of the normal email process can still enter the same
         workflow."
 
-        The uploaded PDF is stored locally (mirroring how the Outlook
-        worker stores downloaded attachments) and a synthetic
-        message/attachment pair is created so the same
-        InvoiceStore.add_from_outlook() call used by the Outlook worker can
-        be reused unchanged -- the invoice then proceeds through AI
-        extraction, confirmation, routing, approval, payment, and
-        reconciliation exactly like an email-sourced invoice.
+        In the connected deployment, the PDF is uploaded to SharePoint
+        Incoming first and registered from its DriveItem identity. A local
+        cache is retained only for Document Intelligence and PDF preview.
         """
         if file.content_type not in {"application/pdf", "application/octet-stream"} and not (
             file.filename or ""
@@ -2216,16 +3041,15 @@ def create_app(
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="The uploaded file was empty.")
+        try:
+            validate_pdf(content)
+        except InvalidPdfError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
-        upload_dir = Path(os.environ.get("MANUAL_UPLOAD_DIR", "manual_uploads"))
-        upload_dir.mkdir(parents=True, exist_ok=True)
         unique_id = uuid.uuid4().hex
         original_filename = file.filename or f"manual-invoice-{unique_id}.pdf"
-        stored_path = upload_dir / f"{unique_id}-{original_filename}"
-        stored_path.write_bytes(content)
 
         message = {
-            "id": f"manual-{unique_id}",
             "internetMessageId": None,
             "subject": subject or "(Manually added invoice)",
             "receivedDateTime": received_at
@@ -2237,32 +3061,77 @@ def create_app(
                 }
             },
         }
-        attachment = {
-            "id": f"manual-attachment-{unique_id}",
-            "name": original_filename,
-            "size": len(content),
-        }
 
-        record = app.state.invoice_store.add_from_outlook(
-            message=message, attachment=attachment, stored_path=stored_path
-        )
-        app.state.activity_feed.add_event(
-            event_type="manual_intake",
-            target_role=ROLE_PURCHASE_LEDGER,
-            message=(
-                f"'{original_filename}' was manually added to Incoming Invoices "
-                "and is awaiting AI extraction."
-            ),
-            invoice_id=record.id,
-        )
-        if ai_extraction_configured():
+        lifecycle = _lifecycle()
+        if lifecycle.sharepoint_client is not None:
+            monitor = SharePointIncomingMonitor(
+                lifecycle.sharepoint_client,
+                app.state.invoice_store,
+                cache_directory=Path(
+                    os.environ.get(
+                        "SHAREPOINT_INVOICE_CACHE_DIR",
+                        "runtime_data/sharepoint_invoice_cache",
+                    )
+                ),
+                extraction_runner=(
+                    lifecycle.run_extraction if ai_extraction_configured() else None
+                ),
+                activity_feed=app.state.activity_feed,
+            )
             try:
-                record = _lifecycle().run_extraction(record.id)
+                item = await asyncio.to_thread(
+                    lifecycle.sharepoint_client.upload_to_incoming,
+                    original_filename,
+                    content,
+                )
+                record = await asyncio.to_thread(
+                    monitor.ingest_item,
+                    item,
+                    source_message=message,
+                    content=content,
+                    event_type="manual_intake",
+                )
             except InvoiceExtractionUnavailableError:
-                # Intake has already succeeded. Keep the invoice retryable
-                # rather than turning a temporary Azure outage into a failed
-                # manual upload or losing the newly created record.
-                record = app.state.invoice_store.get(record.id) or record
+                item_id = str(item.get("id", ""))
+                record = app.state.invoice_store.get_by_sharepoint_item_id(item_id)
+            except SharePointError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"SharePoint Incoming upload failed: {error}",
+                ) from error
+            if record is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The SharePoint invoice is already registered.",
+                )
+        else:
+            upload_dir = Path(os.environ.get("MANUAL_UPLOAD_DIR", "manual_uploads"))
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            stored_path = upload_dir / f"{unique_id}-{original_filename}"
+            stored_path.write_bytes(content)
+            message["id"] = f"manual-{unique_id}"
+            attachment = {
+                "id": f"manual-attachment-{unique_id}",
+                "name": original_filename,
+                "size": len(content),
+            }
+            record = app.state.invoice_store.add_from_outlook(
+                message=message, attachment=attachment, stored_path=stored_path
+            )
+            app.state.activity_feed.add_event(
+                event_type="manual_intake",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"'{original_filename}' was manually added in offline mode "
+                    "and is awaiting AI extraction."
+                ),
+                invoice_id=record.id,
+            )
+            if ai_extraction_configured():
+                try:
+                    record = lifecycle.run_extraction(record.id)
+                except InvoiceExtractionUnavailableError:
+                    record = app.state.invoice_store.get(record.id) or record
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/register-sage")
@@ -2546,7 +3415,7 @@ def create_app(
     def admin_list_companies(
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> list[dict[str, object]]:
-        return [asdict(profile) for profile in app.state.companies_store.list()]
+        return [_company_response(profile) for profile in app.state.companies_store.list()]
 
     @app.get("/api/admin/sharepoint/folders")
     def admin_list_sharepoint_folders(
@@ -2563,30 +3432,47 @@ def create_app(
         except SharePointError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         app.state.sharepoint_folder_paths = frozenset(folders)
-        return {"folders": folders}
+        structures = discover_company_folder_structures(folders)
+        app.state.sharepoint_company_structures = {
+            structure.root: structure for structure in structures
+        }
+        return {
+            "folders": folders,
+            "company_roots": [structure.as_dict() for structure in structures],
+            "shared_folders": {
+                "incoming": INCOMING_INVOICES_FOLDER,
+                "rejected": REJECTED_INVOICES_FOLDER,
+            },
+        }
 
     @app.post("/api/admin/companies")
     def admin_create_company(
         request: CompanyRequest, user: User = Depends(require_role(ROLE_ADMIN))
     ) -> dict[str, object]:
-        folder_paths = app.state.sharepoint_folder_paths
-        if folder_paths is not None:
-            if (
-                request.company_folder not in folder_paths
-                or request.po_matching_folder not in folder_paths
-            ):
+        request_fields = request.model_dump()
+        root = request_fields.pop("sharepoint_root_folder")
+        structure: CompanyFolderStructure | None = None
+        if root:
+            structures = app.state.sharepoint_company_structures
+            structure = structures.get(root) if structures is not None else None
+            if structure is None:
                 raise HTTPException(
                     status_code=400,
-                    detail=(
-                        "Select existing SharePoint folders for nominal invoices "
-                        "and PO matching."
-                    ),
+                    detail="Select a complete company folder structure from SharePoint.",
                 )
+            request_fields["sharepoint_root_folder"] = structure.root
+            request_fields["company_folder"] = structure.nominal_invoices
+            request_fields["po_matching_folder"] = structure.po_match
+        elif not request.company_folder or not request.po_matching_folder:
+            raise HTTPException(
+                status_code=400,
+                detail="Select a SharePoint company folder.",
+            )
         try:
-            profile = app.state.companies_store.create(**request.model_dump())
+            profile = app.state.companies_store.create(**request_fields)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return asdict(profile)
+        return _company_response(profile)
 
     @app.put("/api/admin/companies/{name}")
     def admin_update_company(
@@ -2594,14 +3480,28 @@ def create_app(
         request: CompanyUpdateRequest,
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        fields = request.model_dump(exclude_unset=True)
+        root = fields.get("sharepoint_root_folder")
+        if isinstance(root, str):
+            structures = app.state.sharepoint_company_structures
+            structure = structures.get(root) if structures is not None else None
+            if structure is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select a complete company folder structure from SharePoint.",
+                )
+            fields.update(
+                sharepoint_root_folder=structure.root,
+                company_folder=structure.nominal_invoices,
+                po_matching_folder=structure.po_match,
+            )
         try:
             profile = app.state.companies_store.update(name, **fields)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        return asdict(profile)
+        return _company_response(profile)
 
     @app.delete("/api/admin/companies/{name}")
     def admin_delete_company(
@@ -2637,7 +3537,7 @@ def create_app(
         request: SupplierUpdateRequest,
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        fields = request.model_dump(exclude_unset=True)
         try:
             profile = app.state.suppliers_store.update(name, **fields)
         except KeyError as error:
@@ -2699,7 +3599,7 @@ def create_app(
         request: ApprovalMatrixUpdateRequest,
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        fields = {key: value for key, value in request.model_dump().items() if value is not None}
+        fields = request.model_dump(exclude_unset=True)
         try:
             entry = app.state.approval_matrix_store.update(entry_id, **fields)
         except KeyError as error:
@@ -2732,16 +3632,34 @@ def create_app(
     ) -> list[dict[str, object]]:
         return [asdict(terms) for terms in app.state.supplier_terms_store.list()]
 
+    @app.put("/api/admin/supplier-terms/{terms_id}")
+    def admin_update_supplier_terms(
+        terms_id: int,
+        request: SupplierTermsUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            terms = app.state.supplier_terms_store.update(
+                terms_id, **request.model_dump()
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(terms)
+
     @app.post("/api/admin/import/supplier-master-data")
     async def admin_import_supplier_master_data(
         file: UploadFile = File(...),
-        company: str | None = Form(None),
+        company: str = Form(...),
+        replace_existing: bool = Form(False),
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
         """Bulk-import supplier companies, approval matrix entries, and
-        supplier payment terms from an uploaded .xlsx workbook, so an admin
-        doesn't have to manually re-key every row from an existing Excel
-        sheet. Expected columns (header names are flexible, see
+        supplier payment terms from an uploaded .xlsx workbook, scoped to
+        the company selected by the admin. A Company column in the workbook
+        is ignored when this selection is provided. Expected columns (header
+        names are flexible, see
         app/bulk_import.py): Trading Partner Name, Supplier Account Number,
         Default Payment Method, Payment Terms, Bank Account, Approver(s)."""
         if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
@@ -2750,6 +3668,21 @@ def create_app(
             )
         contents = await file.read()
         try:
+            duplicates = find_existing_supplier_imports(
+                io.BytesIO(contents),
+                supplier_store=app.state.suppliers_store,
+            )
+            if duplicates and not replace_existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "One or more supplier companies already exist. "
+                            "Confirm before replacing their configured values."
+                        ),
+                        "duplicates": [asdict(duplicate) for duplicate in duplicates],
+                    },
+                )
             summary = import_supplier_workbook(
                 io.BytesIO(contents),
                 company_store=app.state.companies_store,
@@ -2759,6 +3692,8 @@ def create_app(
                 auth_store=app.state.auth_store,
                 default_company=company,
             )
+        except HTTPException:
+            raise
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return {
@@ -2800,6 +3735,20 @@ def create_app(
         except AuthError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(created)
+
+    @app.put("/api/admin/users/{username}")
+    def admin_update_user(
+        username: str,
+        request: UserUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            updated = app.state.auth_store.update_user(
+                username, **request.model_dump(exclude_unset=True)
+            )
+        except AuthError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(updated)
 
     @app.delete("/api/admin/users/{username}")
     def admin_delete_user(

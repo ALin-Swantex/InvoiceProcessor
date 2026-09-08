@@ -111,7 +111,9 @@ def test_import_supplier_workbook_creates_master_data_and_terms(tmp_path) -> Non
     assert "Nobody Real" in summary.rows[1].reason
 
     assert company_store.get("Brand New Co") is not None
-    assert supplier_store.get("Brand New Supplier") is not None
+    imported_supplier = supplier_store.get("Brand New Supplier")
+    assert imported_supplier is not None
+    assert imported_supplier.default_company == "Brand New Co"
 
     matrix_entry = approval_matrix_store.find("Brand New Co", "Brand New Supplier")
     assert matrix_entry is not None
@@ -125,12 +127,19 @@ def test_import_supplier_workbook_creates_master_data_and_terms(tmp_path) -> Non
     assert terms.payment_terms_notice == "30 days net"
     assert terms.bank_account == "GBP Main Account"
 
-    # Supplier/payment data remains useful even when the route needs users.
+    # Supplier/payment and routing data remain useful before login accounts
+    # and notification email addresses have been configured.
     assert supplier_store.get("Unresolvable Supplier") is not None
     assert (
         supplier_terms_store.get("Brand New Co", "Unresolvable Supplier")
         is not None
     )
+    unresolved_route = approval_matrix_store.find_exact(
+        "Brand New Co", "Unresolvable Supplier"
+    )
+    assert unresolved_route is not None
+    assert unresolved_route.approver1.name == "Nobody Real"
+    assert unresolved_route.approver1.email == ""
 
 
 def test_admin_import_endpoint_requires_admin_role(tmp_path) -> None:
@@ -169,12 +178,41 @@ def test_admin_import_endpoint_imports_rows_end_to_end(tmp_path) -> None:
             ]
         ]
     )
-    response = client.post(
+    workbook_bytes = workbook.read()
+    duplicate_response = client.post(
         "/api/admin/import/supplier-master-data",
+        data={"company": "Acme Trading Ltd"},
         files={
             "file": (
                 "suppliers.xlsx",
-                workbook.read(),
+                workbook_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert duplicate_response.status_code == 409
+    duplicate_detail = duplicate_response.json()["detail"]
+    assert duplicate_detail["duplicates"] == [
+        {
+            "existing_name": "Supplier Ltd",
+            "spreadsheet_names": ["Supplier Ltd"],
+            "row_numbers": [2],
+        }
+    ]
+    assert (
+        client.app.state.supplier_terms_store.get(
+            "Acme Trading Ltd", "Supplier Ltd"
+        )
+        is None
+    )
+
+    response = client.post(
+        "/api/admin/import/supplier-master-data",
+        data={"company": "Acme Trading Ltd", "replace_existing": "true"},
+        files={
+            "file": (
+                "suppliers.xlsx",
+                workbook_bytes,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         },
@@ -197,6 +235,133 @@ def test_admin_import_endpoint_imports_rows_end_to_end(tmp_path) -> None:
     )
     assert payment_defaults.status_code == 200
     assert payment_defaults.json()["profiles"][0]["default_payment_method"] == "Cheque"
+
+
+def test_import_confirmation_groups_duplicate_supplier_rows(tmp_path) -> None:
+    client = client_for(tmp_path)
+    login(client, "admin", "ChangeMe-Admin1!")
+    workbook = make_workbook(
+        [
+            [
+                None,
+                "Supplier Ltd",
+                "ACC-001",
+                "BACS",
+                "30 days",
+                "GBP account",
+                None,
+                None,
+            ],
+            [
+                None,
+                "Supplier Limited",
+                "ACC-002",
+                "BACS",
+                "30 days",
+                "GBP account",
+                None,
+                None,
+            ],
+            [
+                None,
+                "New Supplier",
+                "NEW-001",
+                "BACS",
+                "30 days",
+                "GBP account",
+                None,
+                None,
+            ],
+        ]
+    )
+    workbook_bytes = workbook.read()
+
+    response = client.post(
+        "/api/admin/import/supplier-master-data",
+        data={"company": "Acme Trading Ltd"},
+        files={
+            "file": (
+                "suppliers.xlsx",
+                workbook_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["duplicates"] == [
+        {
+            "existing_name": "Supplier Ltd",
+            "spreadsheet_names": ["Supplier Ltd", "Supplier Limited"],
+            "row_numbers": [2, 3],
+        }
+    ]
+    assert client.app.state.suppliers_store.get("New Supplier") is None
+
+    confirmed = client.post(
+        "/api/admin/import/supplier-master-data",
+        data={"company": "Acme Trading Ltd", "replace_existing": "true"},
+        files={
+            "file": (
+                "suppliers.xlsx",
+                workbook_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    imported_terms = client.app.state.supplier_terms_store.list_for_supplier(
+        "Acme Trading Ltd", "Supplier Ltd"
+    )
+    assert {terms.supplier for terms in imported_terms} == {"Supplier Ltd"}
+
+
+def test_selected_company_overrides_company_column_for_every_row(tmp_path) -> None:
+    company_store = CompanyStore(tmp_path / "config.db")
+    workbook = make_workbook(
+        [
+            [
+                "Wrong Company",
+                "Supplier One",
+                "ONE-1",
+                "BACS",
+                "30 days",
+                "Main account",
+                None,
+                None,
+            ],
+            [
+                "Another Wrong Company",
+                "Supplier Two",
+                "TWO-1",
+                "BANKLINE",
+                "14 days",
+                "Main account",
+                None,
+                None,
+            ],
+        ]
+    )
+    supplier_store = SupplierStore(tmp_path / "config.db")
+    terms_store = SupplierTermsStore(tmp_path / "config.db")
+
+    summary = import_supplier_workbook(
+        workbook,
+        company_store=company_store,
+        supplier_store=supplier_store,
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+        supplier_terms_store=terms_store,
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        default_company="Acme Trading Ltd",
+    )
+
+    assert {row.company for row in summary.rows} == {"Acme Trading Ltd"}
+    assert terms_store.get("Acme Trading Ltd", "Supplier One") is not None
+    assert terms_store.get("Acme Trading Ltd", "Supplier Two") is not None
+    assert supplier_store.get("Supplier One").default_company == "Acme Trading Ltd"
+    assert supplier_store.get("Supplier Two").default_company == "Acme Trading Ltd"
+    assert company_store.get("Wrong Company") is None
+    assert company_store.get("Another Wrong Company") is None
 
 
 def test_imports_attached_workbook_shape_for_selected_company(tmp_path) -> None:
@@ -256,6 +421,138 @@ def test_imports_attached_workbook_shape_for_selected_company(tmp_path) -> None:
     assert terms.payment_terms_notice == "7 Days"
     assert terms.bank_account == "Nat West - Onecard"
     assert "Mark Kelly" in summary.rows[0].reason
+    route = approval_matrix_store.find_exact(
+        ALL_COMPANIES, "Adobe Systems Software"
+    )
+    assert route is not None
+    assert route.approver1.name == "Mark Kelly"
+    assert route.approver1.email == ""
+    assert route.approver2 is not None
+    assert route.approver2.name == "Graham Rogers"
+    assert route.approver2.email == ""
+
+
+def test_selected_company_updates_existing_supplier_and_imports_named_approvers(
+    tmp_path,
+) -> None:
+    company_store = CompanyStore(tmp_path / "config.db")
+    company_store.create(
+        name="GIFTED",
+        sharepoint_root_folder="Invoices/GIFTED",
+    )
+    supplier_store = SupplierStore(tmp_path / "config.db")
+    supplier_store.create(
+        name="123RF GB Ltd",
+        default_company="Acme Trading Ltd",
+    )
+    approval_matrix_store = ApprovalMatrixStore(tmp_path / "config.db")
+    workbook = make_workbook(
+        [
+            [
+                "Ignored workbook company",
+                "123RF GB Ltd",
+                "123R0001",
+                "BACS",
+                "30 days",
+                "GBP account",
+                "Jess Moon",
+                "Julian Massie",
+            ]
+        ]
+    )
+
+    summary = import_supplier_workbook(
+        workbook,
+        company_store=company_store,
+        supplier_store=supplier_store,
+        approval_matrix_store=approval_matrix_store,
+        supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        default_company="GIFTED",
+    )
+
+    assert supplier_store.get("123RF GB Ltd").default_company == "GIFTED"
+    route = approval_matrix_store.find_exact("GIFTED", "123RF GB Ltd")
+    assert route is not None
+    assert route.approver1.name == "Jess Moon"
+    assert route.approver1.email == ""
+    assert route.approver2 is not None
+    assert route.approver2.name == "Julian Massie"
+    assert route.approver2.email == ""
+    assert summary.warning_count == 1
+    assert summary.rows[0].reason == (
+        "Approval route imported. Add email addresses for: "
+        "Jess Moon, Julian Massie."
+    )
+
+    approval_matrix_store.update(
+        route.id,
+        approver1_email="jess@example.test",
+        approver2_email="julian@example.test",
+    )
+    workbook.seek(0)
+    repeated = import_supplier_workbook(
+        workbook,
+        company_store=company_store,
+        supplier_store=supplier_store,
+        approval_matrix_store=approval_matrix_store,
+        supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        default_company="GIFTED",
+    )
+    preserved = approval_matrix_store.find_exact("GIFTED", "123RF GB Ltd")
+    assert preserved is not None
+    assert preserved.approver1.email == "jess@example.test"
+    assert preserved.approver2 is not None
+    assert preserved.approver2.email == "julian@example.test"
+    assert repeated.imported_count == 1
+
+
+def test_company_specific_import_does_not_overwrite_global_route(tmp_path) -> None:
+    company_store = CompanyStore(tmp_path / "config.db")
+    supplier_store = SupplierStore(tmp_path / "config.db")
+    approval_matrix_store = ApprovalMatrixStore(tmp_path / "config.db")
+    approval_matrix_store.create(
+        company=ALL_COMPANIES,
+        supplier="Shared Supplier",
+        approver1_name="Global Approver",
+        approver1_email="global@example.test",
+    )
+    workbook = make_workbook(
+        [
+            [
+                None,
+                "Shared Supplier",
+                "SHAR0001",
+                "BACS",
+                "30 days",
+                "GBP account",
+                "Jess Moon",
+                None,
+            ]
+        ]
+    )
+
+    import_supplier_workbook(
+        workbook,
+        company_store=company_store,
+        supplier_store=supplier_store,
+        approval_matrix_store=approval_matrix_store,
+        supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        default_company="Acme Trading Ltd",
+    )
+
+    global_route = approval_matrix_store.find_exact(
+        ALL_COMPANIES, "Shared Supplier"
+    )
+    company_route = approval_matrix_store.find_exact(
+        "Acme Trading Ltd", "Shared Supplier"
+    )
+    assert global_route is not None
+    assert global_route.approver1.name == "Global Approver"
+    assert company_route is not None
+    assert company_route.approver1.name == "Jess Moon"
 
 
 def test_global_approval_route_is_used_for_any_invoice_company(tmp_path) -> None:
@@ -351,6 +648,64 @@ def test_supplier_terms_store_migrates_legacy_company_supplier_key(tmp_path) -> 
         "SUPR0001",
         "SUPR0002",
     ]
+
+
+def test_admin_can_edit_supplier_payment_settings(tmp_path) -> None:
+    client = client_for(tmp_path)
+    login(client, "admin", "ChangeMe-Admin1!")
+    terms = client.app.state.supplier_terms_store.upsert(
+        company="Acme Trading Ltd",
+        supplier="Supplier Ltd",
+        supplier_account_number="ACC-100",
+        default_payment_method="BACS",
+        payment_terms_notice="30 days",
+    )
+
+    response = client.put(
+        f"/api/admin/supplier-terms/{terms.id}",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_account_number": "ACC-200",
+            "default_payment_method": "Bankline",
+            "payment_terms_notice": None,
+            "bank_account": "GBP current",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["supplier_account_number"] == "ACC-200"
+    assert response.json()["default_payment_method"] == "Bankline"
+    assert response.json()["payment_terms_notice"] is None
+    assert response.json()["bank_account"] == "GBP current"
+
+
+def test_supplier_payment_update_rejects_duplicate_company_account(tmp_path) -> None:
+    client = client_for(tmp_path)
+    login(client, "admin", "ChangeMe-Admin1!")
+    store = client.app.state.supplier_terms_store
+    first = store.upsert(
+        company="Acme Trading Ltd",
+        supplier="Supplier One",
+        supplier_account_number="ACC-100",
+    )
+    store.upsert(
+        company="Acme Trading Ltd",
+        supplier="Supplier Two",
+        supplier_account_number="ACC-200",
+    )
+
+    response = client.put(
+        f"/api/admin/supplier-terms/{first.id}",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier One",
+            "supplier_account_number": "ACC-200",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "already exists" in response.json()["detail"]
 
 
 def test_deleting_supplier_cascades_payment_profiles_and_routes(tmp_path) -> None:

@@ -249,6 +249,14 @@ class InvoiceStore:
             ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
 
+    def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM invoices WHERE sharepoint_item_id = ? LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return InvoiceRecord(**dict(row)) if row is not None else None
+
     def update_status(self, invoice_id: int, status: str) -> None:
         self.update_fields(invoice_id, status=status)
 

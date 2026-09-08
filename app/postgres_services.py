@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Callable
 
 from app.activity_feed import ActivityEvent
-from app.postgres_settings import PostgresSettings, connect_postgres
-
-
-ConnectionFactory = Callable[[], object]
+from app.postgres_settings import (
+    ConnectionFactory,
+    PostgresSettings,
+    postgres_connection_factory,
+)
 
 
 class PostgresIrjNumberGenerator:
@@ -18,8 +18,7 @@ class PostgresIrjNumberGenerator:
         connection_factory: ConnectionFactory | None = None,
     ) -> None:
         if connection_factory is None:
-            resolved = settings or PostgresSettings.from_env()
-            connection_factory = lambda: connect_postgres(resolved)
+            connection_factory = postgres_connection_factory(settings)
         self._connection_factory = connection_factory
 
     def generate(self) -> str:
@@ -48,8 +47,7 @@ class PostgresActivityFeedStore:
         connection_factory: ConnectionFactory | None = None,
     ) -> None:
         if connection_factory is None:
-            resolved = settings or PostgresSettings.from_env()
-            connection_factory = lambda: connect_postgres(resolved)
+            connection_factory = postgres_connection_factory(settings)
         self._connection_factory = connection_factory
 
     def add_event(
