@@ -49,6 +49,9 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert 'id="admin-edit-dialog"' in home.text
     assert "function openAdminEditor" in home.text
     assert 'data-edit-index="${index}"' in home.text
+    assert '${escapeHtml(c.value(row) ?? "—")}' in home.text
+    assert 'data-delete-index="${index}"' in home.text
+    assert "${escapeHtml(r.reason)}</li>" in home.text
     assert "supplier companies already exist" in home.text
     assert 'formData.set("replace_existing", "true")' in home.text
     assert '.join("\\n")' in home.text

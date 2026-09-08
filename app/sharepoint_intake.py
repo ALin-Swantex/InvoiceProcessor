@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import Callable, Protocol
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
+from app.company_folders import REJECTED_INVOICES_FOLDER
 from app.invoice_lifecycle import InvoiceExtractionUnavailableError
 from app.invoices import InvoiceRecord
 from app.pdf_validation import InvalidPdfError, validate_pdf
 from app.sharepoint import SharePointClient, SharePointError
+
+
+logger = logging.getLogger(__name__)
+
+
+class InvalidIncomingPdfError(SharePointError):
+    """Raised when an Incoming DriveItem cannot be processed as a PDF."""
 
 
 class InvoiceIntakeStore(Protocol):
@@ -21,6 +30,10 @@ class InvoiceIntakeStore(Protocol):
     ) -> InvoiceRecord: ...
 
     def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None: ...
+
+    def get_by_source_attachment(
+        self, message_id: str, attachment_id: str
+    ) -> InvoiceRecord | None: ...
 
     def update_fields(self, invoice_id: int, **fields: object) -> InvoiceRecord: ...
 
@@ -50,8 +63,17 @@ class SharePointIncomingMonitor:
     def scan_once(self) -> int:
         ingested = 0
         for item in self.client.list_incoming_pdfs():
-            if self.ingest_item(item) is not None:
-                ingested += 1
+            try:
+                if self.ingest_item(item) is not None:
+                    ingested += 1
+            except InvalidIncomingPdfError as error:
+                self._handle_invalid_item(item, error)
+            except Exception:
+                logger.exception(
+                    "SharePoint Incoming item %r could not be ingested; "
+                    "continuing with the remaining items.",
+                    item.get("id"),
+                )
         return ingested
 
     def ingest_item(
@@ -59,12 +81,30 @@ class SharePointIncomingMonitor:
         item: dict[str, object],
         *,
         source_message: dict[str, object] | None = None,
+        source_attachment: dict[str, object] | None = None,
         content: bytes | None = None,
         event_type: str = "sharepoint_intake",
     ) -> InvoiceRecord | None:
         item_id = self._required_string(item, "id")
         existing = self.invoice_store.get_by_sharepoint_item_id(item_id)
         if existing is not None:
+            if source_message is not None and source_attachment is not None:
+                message_id = self._required_string(source_message, "id")
+                attachment_id = self._required_string(source_attachment, "id")
+                source_record = self.invoice_store.get_by_source_attachment(
+                    message_id, attachment_id
+                )
+                if source_record is None:
+                    self.invoice_store.update_fields(
+                        existing.id,
+                        message_id=message_id,
+                        attachment_id=attachment_id,
+                    )
+                elif source_record.id != existing.id:
+                    raise SharePointError(
+                        "The Outlook attachment and SharePoint DriveItem are "
+                        "already linked to different invoice records."
+                    )
             return None
 
         filename = self._required_string(item, "name")
@@ -76,7 +116,7 @@ class SharePointIncomingMonitor:
         try:
             validate_pdf(pdf_content)
         except InvalidPdfError as error:
-            raise SharePointError(
+            raise InvalidIncomingPdfError(
                 f"SharePoint Incoming item '{filename}' is not a usable PDF: {error}"
             ) from error
 
@@ -86,24 +126,20 @@ class SharePointIncomingMonitor:
         cached_path.write_bytes(pdf_content)
 
         message = dict(source_message or {})
-        message["id"] = f"sharepoint:{item_id}"
+        message.setdefault("id", f"sharepoint:{item_id}")
         message.setdefault("subject", "Invoice added to SharePoint Incoming")
         message.setdefault("receivedDateTime", item.get("createdDateTime"))
-        attachment: dict[str, object] = {
-            "id": item_id,
-            "name": filename,
-            "size": item.get("size", len(pdf_content)),
-            "contentType": "application/pdf",
-        }
+        attachment = dict(source_attachment or {})
+        attachment.setdefault("id", item_id)
+        attachment.setdefault("name", filename)
+        attachment["size"] = item.get("size", len(pdf_content))
+        attachment["contentType"] = "application/pdf"
+        attachment["sharepoint_item_id"] = item_id
+        attachment["sharepoint_web_url"] = self.client.get_item_web_url(item)
         record = self.invoice_store.add_from_outlook(
             message=message,
             attachment=attachment,
             stored_path=cached_path,
-        )
-        record = self.invoice_store.update_fields(
-            record.id,
-            sharepoint_item_id=item_id,
-            sharepoint_web_url=self.client.get_item_web_url(item),
         )
         if self.activity_feed is not None:
             self.activity_feed.add_event(
@@ -127,6 +163,31 @@ class SharePointIncomingMonitor:
                 pass
             return self.invoice_store.get_by_sharepoint_item_id(item_id)
         return record
+
+    def _handle_invalid_item(
+        self, item: dict[str, object], error: InvalidIncomingPdfError
+    ) -> None:
+        item_id = str(item.get("id") or "")
+        filename = str(item.get("name") or "unknown.pdf")
+        try:
+            if item_id:
+                self.client.move_to_folder(
+                    item_id,
+                    REJECTED_INVOICES_FOLDER,
+                    filename,
+                )
+        except Exception:
+            logger.exception(
+                "Invalid SharePoint Incoming item %r could not be moved to Rejected.",
+                item_id,
+            )
+        logger.warning("%s", error)
+        if self.activity_feed is not None:
+            self.activity_feed.add_event(
+                event_type="sharepoint_intake_rejected",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=f"'{filename}' was rejected during intake: {error}",
+            )
 
     @staticmethod
     def _required_string(data: dict[str, object], key: str) -> str:

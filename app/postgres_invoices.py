@@ -88,6 +88,12 @@ class PostgresInvoiceStore:
         attachment_id = self._required_string(attachment, "id")
         filename = self._required_string(attachment, "name")
         sender_name, sender_address = self._sender(message)
+        sharepoint_item_id = self._optional_string(
+            attachment.get("sharepoint_item_id")
+        )
+        sharepoint_web_url = self._optional_string(
+            attachment.get("sharepoint_web_url")
+        )
         values = (
             message_id,
             attachment_id,
@@ -101,6 +107,8 @@ class PostgresInvoiceStore:
             self._optional_int(attachment.get("size")),
             "Awaiting AI Extraction",
             datetime.now(timezone.utc).isoformat(),
+            sharepoint_item_id,
+            sharepoint_web_url,
         )
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
@@ -109,10 +117,26 @@ class PostgresInvoiceStore:
                     INSERT INTO invoices (
                         message_id, attachment_id, internet_message_id,
                         sender_name, sender_address, subject, received_at,
-                        original_filename, stored_path, size_bytes, status, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        original_filename, stored_path, size_bytes, status, created_at,
+                        sharepoint_item_id, sharepoint_web_url
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s
+                    )
                     ON CONFLICT (message_id, attachment_id) DO UPDATE
-                    SET message_id = EXCLUDED.message_id
+                    SET stored_path = CASE
+                            WHEN invoices.sharepoint_item_id IS NULL
+                            THEN EXCLUDED.stored_path
+                            ELSE invoices.stored_path
+                        END,
+                        sharepoint_item_id = COALESCE(
+                            invoices.sharepoint_item_id,
+                            EXCLUDED.sharepoint_item_id
+                        ),
+                        sharepoint_web_url = COALESCE(
+                            invoices.sharepoint_web_url,
+                            EXCLUDED.sharepoint_web_url
+                        )
                     RETURNING {_SELECT_COLUMNS}
                     """,
                     values,
@@ -157,6 +181,19 @@ class PostgresInvoiceStore:
                     f"SELECT {_SELECT_COLUMNS} FROM invoices "
                     "WHERE sharepoint_item_id = %s LIMIT 1",
                     (item_id,),
+                )
+                row = cursor.fetchone()
+        return self._record(row) if row is not None else None
+
+    def get_by_source_attachment(
+        self, message_id: str, attachment_id: str
+    ) -> InvoiceRecord | None:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT {_SELECT_COLUMNS} FROM invoices "
+                    "WHERE message_id = %s AND attachment_id = %s LIMIT 1",
+                    (message_id, attachment_id),
                 )
                 row = cursor.fetchone()
         return self._record(row) if row is not None else None

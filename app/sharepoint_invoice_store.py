@@ -211,6 +211,28 @@ class SharePointInvoiceStore:
 
         existing = self._find_by_message_and_attachment(message_id, attachment_id)
         if existing is not None:
+            if (
+                existing.sharepoint_item_id is None
+                and self._optional_string(attachment.get("sharepoint_item_id"))
+            ):
+                self._update_item_fields(
+                    existing.id,
+                    self._to_sharepoint_fields(
+                        {
+                            "stored_path": str(stored_path),
+                            "sharepoint_item_id": attachment["sharepoint_item_id"],
+                            "sharepoint_web_url": self._optional_string(
+                                attachment.get("sharepoint_web_url")
+                            ),
+                        }
+                    ),
+                )
+                refreshed = self.get(existing.id)
+                if refreshed is None:
+                    raise RuntimeError(
+                        f"Invoice {existing.id} could not be read after linking."
+                    )
+                return refreshed
             return existing
 
         from datetime import datetime, timezone
@@ -231,6 +253,12 @@ class SharePointInvoiceStore:
             "size_bytes": self._optional_int(attachment.get("size")),
             "status": "Awaiting AI Extraction",
             "created_at": created_at,
+            "sharepoint_item_id": self._optional_string(
+                attachment.get("sharepoint_item_id")
+            ),
+            "sharepoint_web_url": self._optional_string(
+                attachment.get("sharepoint_web_url")
+            ),
         }
         item = self._create_item(fields)
         return self._item_to_record(item)
@@ -262,6 +290,11 @@ class SharePointInvoiceStore:
             if record.sharepoint_item_id == item_id:
                 return record
         return None
+
+    def get_by_source_attachment(
+        self, message_id: str, attachment_id: str
+    ) -> InvoiceRecord | None:
+        return self._find_by_message_and_attachment(message_id, attachment_id)
 
     def update_status(self, invoice_id: int, status: str) -> None:
         self.update_fields(invoice_id, status=status)

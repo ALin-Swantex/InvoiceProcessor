@@ -62,12 +62,23 @@ class SharePointClient:
         self.token_provider = token_provider or MsalTokenProvider(outlook_settings)
         self.http_client = http_client or httpx.Client(timeout=60.0)
 
-    def upload_to_incoming(self, filename: str, content: bytes) -> dict[str, Any]:
+    def upload_to_incoming(
+        self,
+        filename: str,
+        content: bytes,
+        *,
+        conflict_behavior: str = "rename",
+    ) -> dict[str, Any]:
         """Upload a PDF to the configured incoming invoices folder.
 
         Returns the Graph DriveItem for the uploaded file.
         """
-        return self._upload(self.settings.incoming_folder, filename, content)
+        return self._upload(
+            self.settings.incoming_folder,
+            filename,
+            content,
+            conflict_behavior=conflict_behavior,
+        )
 
     def list_incoming_pdfs(self) -> list[dict[str, Any]]:
         """Return PDFs currently waiting in the configured Incoming folder."""
@@ -249,7 +260,16 @@ class SharePointClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _upload(self, folder_path: str, filename: str, content: bytes) -> dict[str, Any]:
+    def _upload(
+        self,
+        folder_path: str,
+        filename: str,
+        content: bytes,
+        *,
+        conflict_behavior: str = "rename",
+    ) -> dict[str, Any]:
+        if conflict_behavior not in {"fail", "replace", "rename"}:
+            raise ValueError("Unsupported SharePoint upload conflict behavior.")
         safe_folder = str(PurePosixPath(folder_path))
         safe_filename = quote(filename, safe="")
         url = (
@@ -259,7 +279,7 @@ class SharePointClient:
         )
         response = self.http_client.put(
             url,
-            params={"@microsoft.graph.conflictBehavior": "rename"},
+            params={"@microsoft.graph.conflictBehavior": conflict_behavior},
             content=content,
             headers={
                 "Authorization": f"Bearer {self.token_provider()}",

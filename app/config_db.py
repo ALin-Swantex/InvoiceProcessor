@@ -98,6 +98,15 @@ def connect(database_path: Path | None = None) -> sqlite3.Connection:
         WHERE sharepoint_root_folder IS NULL OR sharepoint_root_folder = ''
         """
     )
+    connection.execute(
+        """
+        UPDATE companies
+        SET company_folder = sharepoint_root_folder || '/Nominal Invoices',
+            po_matching_folder = sharepoint_root_folder || '/PO Invoices/PO Match'
+        WHERE sharepoint_root_folder IS NOT NULL
+          AND sharepoint_root_folder != ''
+        """
+    )
     connection.commit()
     return connection
 

@@ -1768,8 +1768,9 @@ def create_app(
               const profiles = terms.profiles || [];
               account.innerHTML = profiles.length
                 ? profiles.map(profile =>
-                    `<option value="${profile.supplier_account_number || ""}">` +
-                    `${profile.supplier_account_number || "No account number"} — ${profile.bank_account || "No bank specified"}` +
+                    `<option value="${escapeHtml(profile.supplier_account_number || "")}">` +
+                    `${escapeHtml(profile.supplier_account_number || "No account number")} — ` +
+                    `${escapeHtml(profile.bank_account || "No bank specified")}` +
                     `</option>`
                   ).join("")
                 : '<option value="">No configured supplier account</option>';
@@ -1781,7 +1782,7 @@ def create_app(
                   methods.unshift(profile.default_payment_method);
                 }
                 method.innerHTML = methods
-                  .map(value => `<option value="${value}">${value}</option>`)
+                  .map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`)
                   .join("");
                 method.value = profile.default_payment_method || "BACS";
                 document.getElementById("payment-terms").value = profile.payment_terms_notice || "";
@@ -2115,18 +2116,20 @@ def create_app(
                 return;
               }
               const hasActions = Boolean(onDelete || onEdit);
-              const head = columns.map(c => `<th>${c.label}</th>`).join("") +
+              const head = columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("") +
                 (hasActions ? "<th>Actions</th>" : "");
               const body = rows
                 .map((row, index) => {
-                  const cells = columns.map(c => `<td>${c.value(row) ?? "—"}</td>`).join("");
+                  const cells = columns
+                    .map(c => `<td>${escapeHtml(c.value(row) ?? "—")}</td>`)
+                    .join("");
                   const actionCell = hasActions
                     ? `<td><div class="row-actions">` +
                       (onEdit
                         ? `<button class="secondary" data-edit-index="${index}">Edit</button>`
                         : "") +
                       (onDelete
-                        ? `<button class="danger" data-delete-id="${row[idKey]}">Delete</button>`
+                        ? `<button class="danger" data-delete-index="${index}">Delete</button>`
                         : "") +
                       `</div></td>`
                     : "";
@@ -2138,8 +2141,11 @@ def create_app(
                 `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>` +
                 `</table></div>`;
               if (onDelete) {
-                container.querySelectorAll("[data-delete-id]").forEach(button => {
-                  button.addEventListener("click", () => onDelete(button.dataset.deleteId));
+                container.querySelectorAll("[data-delete-index]").forEach(button => {
+                  button.addEventListener("click", () => {
+                    const row = rows[Number(button.dataset.deleteIndex)];
+                    onDelete(row[idKey]);
+                  });
                 });
               }
               if (onEdit) {
@@ -2723,14 +2729,18 @@ def create_app(
                 const issueList = issueRows.length
                   ? "<ul>" +
                     issueRows
-                      .map(r => `<li>Row ${r.row_number} (${r.company === "*" ? "All invoice companies" : (r.company || "—")} / ${r.supplier || "—"}): ${r.reason}</li>`)
+                      .map(r =>
+                        `<li>Row ${escapeHtml(r.row_number)} (` +
+                        `${escapeHtml(r.company === "*" ? "All invoice companies" : (r.company || "—"))} / ` +
+                        `${escapeHtml(r.supplier || "—")}): ${escapeHtml(r.reason)}</li>`
+                      )
                       .join("") +
                     "</ul>"
                   : "";
                 resultBox.innerHTML =
-                  `<p><strong>${body.imported}</strong> row(s) imported, ` +
-                  `<strong>${body.warnings}</strong> warning(s), ` +
-                  `<strong>${body.skipped}</strong> row(s) skipped.</p>${issueList}`;
+                  `<p><strong>${escapeHtml(body.imported)}</strong> row(s) imported, ` +
+                  `<strong>${escapeHtml(body.warnings)}</strong> warning(s), ` +
+                  `<strong>${escapeHtml(body.skipped)}</strong> row(s) skipped.</p>${issueList}`;
                 event.target.reset();
                 await loadAdminPanel();
                 await loadSuppliers();

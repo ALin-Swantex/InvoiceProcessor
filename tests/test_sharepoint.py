@@ -266,6 +266,52 @@ def test_incoming_monitor_registers_each_drive_item_once(tmp_path: Path) -> None
     assert extracted == [records[0].id]
 
 
+def test_incoming_monitor_quarantines_invalid_pdf_and_continues(
+    tmp_path: Path,
+) -> None:
+    class MixedIncomingClient(FakeIncomingClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.valid_item = dict(self.item)
+            self.valid_item["id"] = "drive-item-2"
+            self.valid_item["name"] = "valid-invoice.pdf"
+            self.item["name"] = "invalid-invoice.pdf"
+            self.moves: list[tuple[str, str, str]] = []
+
+        def list_incoming_pdfs(self) -> list[dict[str, object]]:
+            return [self.item, self.valid_item]
+
+        def download_item(self, item_id: str) -> bytes:
+            return b"%PDF-1.4\n%%EOF" if item_id == "drive-item-1" else VALID_PDF_BYTES
+
+        def move_to_folder(
+            self, item_id: str, folder: str, filename: str
+        ) -> dict[str, object]:
+            self.moves.append((item_id, folder, filename))
+            return {"id": item_id, "name": filename}
+
+    store = InvoiceStore(tmp_path / "invoices.db")
+    fake_client = MixedIncomingClient()
+    activity = ActivityFeedStore(tmp_path / "activity.db")
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, fake_client),
+        store,
+        cache_directory=tmp_path / "cache",
+        activity_feed=activity,
+    )
+
+    assert monitor.scan_once() == 1
+    assert [record.sharepoint_item_id for record in store.list()] == ["drive-item-2"]
+    assert fake_client.moves == [
+        (
+            "drive-item-1",
+            "Invoices/Rejected Invoices",
+            "invalid-invoice.pdf",
+        )
+    ]
+    assert activity.list_since()[0].event_type == "sharepoint_intake_rejected"
+
+
 def test_manual_upload_uses_sharepoint_incoming_as_source(
     tmp_path: Path,
     monkeypatch,

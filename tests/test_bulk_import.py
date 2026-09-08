@@ -63,6 +63,46 @@ def make_workbook(rows: list[list[object]]) -> io.BytesIO:
     return buffer
 
 
+def test_legacy_company_paths_are_normalized_to_current_structure(tmp_path) -> None:
+    database_path = tmp_path / "config.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE companies (
+                name TEXT PRIMARY KEY,
+                company_folder TEXT NOT NULL,
+                po_matching_folder TEXT NOT NULL,
+                aliases TEXT,
+                vat_number TEXT,
+                address TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO companies (
+                name, company_folder, po_matching_folder, aliases
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                "Legacy Company",
+                "Invoices/Legacy Company",
+                "Invoices/Legacy Company/PO Matching",
+                "",
+            ),
+        )
+
+    company = CompanyStore(database_path).get("Legacy Company")
+
+    assert company is not None
+    assert company.sharepoint_root_folder == "Invoices/Legacy Company"
+    assert company.company_folder == "Invoices/Legacy Company/Nominal Invoices"
+    assert (
+        company.po_matching_folder
+        == "Invoices/Legacy Company/PO Invoices/PO Match"
+    )
+
+
 def test_import_supplier_workbook_creates_master_data_and_terms(tmp_path) -> None:
     company_store = CompanyStore(tmp_path / "config.db")
     supplier_store = SupplierStore(tmp_path / "config.db")

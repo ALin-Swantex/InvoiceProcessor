@@ -320,8 +320,7 @@ def import_supplier_workbook(
         if company != ALL_COMPANIES and company_store.get(company) is None:
             company_store.create(
                 name=company,
-                company_folder=f"Invoices/{company}",
-                po_matching_folder=f"Invoices/{company}/PO Matching",
+                sharepoint_root_folder=f"Invoices/{company}",
             )
         supplier_default_company = company if company != ALL_COMPANIES else None
         if supplier_profile is None:

@@ -179,15 +179,36 @@ class InvoiceStore:
         filename = self._required_string(attachment, "name")
         sender_name, sender_address = self._sender(message)
         created_at = datetime.now(timezone.utc).isoformat()
+        sharepoint_item_id = self._optional_string(
+            attachment.get("sharepoint_item_id")
+        )
+        sharepoint_web_url = self._optional_string(
+            attachment.get("sharepoint_web_url")
+        )
 
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO invoices (
+                INSERT INTO invoices (
                     message_id, attachment_id, internet_message_id,
                     sender_name, sender_address, subject, received_at,
-                    original_filename, stored_path, size_bytes, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    original_filename, stored_path, size_bytes, status, created_at,
+                    sharepoint_item_id, sharepoint_web_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id, attachment_id) DO UPDATE SET
+                    stored_path = CASE
+                        WHEN invoices.sharepoint_item_id IS NULL
+                        THEN excluded.stored_path
+                        ELSE invoices.stored_path
+                    END,
+                    sharepoint_item_id = COALESCE(
+                        invoices.sharepoint_item_id,
+                        excluded.sharepoint_item_id
+                    ),
+                    sharepoint_web_url = COALESCE(
+                        invoices.sharepoint_web_url,
+                        excluded.sharepoint_web_url
+                    )
                 """,
                 (
                     message_id,
@@ -202,6 +223,8 @@ class InvoiceStore:
                     self._optional_int(attachment.get("size")),
                     "Awaiting AI Extraction",
                     created_at,
+                    sharepoint_item_id,
+                    sharepoint_web_url,
                 ),
             )
             connection.commit()
@@ -254,6 +277,20 @@ class InvoiceStore:
             row = connection.execute(
                 "SELECT * FROM invoices WHERE sharepoint_item_id = ? LIMIT 1",
                 (item_id,),
+            ).fetchone()
+        return InvoiceRecord(**dict(row)) if row is not None else None
+
+    def get_by_source_attachment(
+        self, message_id: str, attachment_id: str
+    ) -> InvoiceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM invoices
+                WHERE message_id = ? AND attachment_id = ?
+                LIMIT 1
+                """,
+                (message_id, attachment_id),
             ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
 

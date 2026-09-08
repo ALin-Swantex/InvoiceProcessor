@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -132,6 +133,11 @@ class OutlookInvoiceWorker:
             for attachment in attachments:
                 attachment_id = self._required_string(attachment, "id")
                 filename = self._required_string(attachment, "name")
+                existing = self.invoice_store.get_by_source_attachment(
+                    notification.message_id, attachment_id
+                )
+                if existing is not None and existing.sharepoint_item_id:
+                    continue
                 stored_path = Path(
                     await self.retriever.download_invoice_attachment(
                         notification.message_id,
@@ -152,13 +158,19 @@ class OutlookInvoiceWorker:
                     validate_pdf(content)
                     item = await asyncio.to_thread(
                         self.incoming_monitor.client.upload_to_incoming,
-                        stored_path.name,
+                        self._outlook_upload_filename(
+                            notification.message_id,
+                            attachment_id,
+                            stored_path.name,
+                        ),
                         content,
+                        conflict_behavior="replace",
                     )
                     record = await asyncio.to_thread(
                         self.incoming_monitor.ingest_item,
                         item,
                         source_message=message,
+                        source_attachment=processed_attachment,
                         content=content,
                         event_type="outlook_intake",
                     )
@@ -196,6 +208,14 @@ class OutlookInvoiceWorker:
         if not isinstance(value, str) or not value:
             raise RuntimeError(f"Outlook attachment is missing '{key}'.")
         return value
+
+    @staticmethod
+    def _outlook_upload_filename(
+        message_id: str, attachment_id: str, filename: str
+    ) -> str:
+        source_key = f"{message_id}\0{attachment_id}".encode("utf-8")
+        digest = hashlib.sha256(source_key).hexdigest()[:20]
+        return f"outlook-{digest}-{Path(filename).name}"
 
 
 def build_worker_from_environment() -> OutlookInvoiceWorker:
