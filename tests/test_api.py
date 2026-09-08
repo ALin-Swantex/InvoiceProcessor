@@ -34,9 +34,17 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert "<h1>Swantex</h1>" in home.text
     assert "OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED" not in home.text
     assert '<aside class="sidebar">' in home.text
+    assert 'data-tab="needs-review"' in home.text
+    assert "Flagged Invoices — Purchase Ledger Review" in home.text
+    assert 'id="payment-method"' in home.text
+    assert 'id="admin-import-company"' not in home.text
+    assert "Supplier payment settings" in home.text
+    assert 'id="admin-company-folder" required disabled' in home.text
+    assert 'id="admin-company-po-folder" required disabled' in home.text
     assert "Invoice PDF" in home.text
     assert "IRJ number" in home.text
     assert "Company being invoiced" in home.text
+    assert '<select id="confirm-supplier">' in home.text
     assert "Supplier invoice number" in home.text
     assert "Purchase Order number" in home.text
     assert "Invoice value" in home.text

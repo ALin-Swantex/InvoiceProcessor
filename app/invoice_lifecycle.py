@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from app.activity_feed import (
     ROLE_APPROVER_1,
@@ -10,7 +11,12 @@ from app.activity_feed import (
     ROLE_PURCHASING,
     ActivityFeedStore,
 )
-from app.ai_extraction import run_ai_extraction
+from app.ai_extraction import (
+    DocumentIntelligenceConfigurationError,
+    DocumentIntelligenceServiceError,
+    ExtractionResult,
+    run_ai_extraction,
+)
 from app.approval_matrix import ApprovalMatrixStore
 from app.approval_matrix import find_approvers as _default_find_approvers
 from app.companies import CompanyStore
@@ -20,12 +26,18 @@ from app.email_notifications import send_email_notification
 from app.invoices import InvoiceRecord, InvoiceStore
 from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
+from app.suppliers import SupplierStore
+from app.suppliers import get_supplier as _default_get_supplier
 from app.workflow import ConfirmedInvoice, RoutingValidationError, route_confirmed_invoice
 
 
 class InvoiceLifecycleError(ValueError):
     """Raised for business-rule violations (invalid state transitions,
     unknown company, etc.). Callers should map this to HTTP 422/409."""
+
+
+class InvoiceExtractionUnavailableError(InvoiceLifecycleError):
+    pass
 
 
 class InvoiceLifecycle:
@@ -58,6 +70,8 @@ class InvoiceLifecycle:
         sharepoint_client: SharePointClient | None,
         companies_store: CompanyStore | None = None,
         approval_matrix_store: ApprovalMatrixStore | None = None,
+        suppliers_store: SupplierStore | None = None,
+        extraction_runner: Callable[[Path], ExtractionResult] = run_ai_extraction,
     ) -> None:
         self.invoice_store = invoice_store
         self.irj_generator = irj_generator
@@ -65,6 +79,8 @@ class InvoiceLifecycle:
         self.sharepoint_client = sharepoint_client
         self.companies_store = companies_store
         self.approval_matrix_store = approval_matrix_store
+        self.suppliers_store = suppliers_store
+        self.extraction_runner = extraction_runner
 
     def _get_company(self, name: str):
         if self.companies_store is not None:
@@ -76,12 +92,21 @@ class InvoiceLifecycle:
             return self.approval_matrix_store.find(company, supplier)
         return _default_find_approvers(company, supplier)
 
+    def _get_supplier(self, name: str):
+        if self.suppliers_store is not None:
+            return self.suppliers_store.get(name)
+        return _default_get_supplier(name)
+
     # ------------------------------------------------------------------
-    # Stage 1: AI extraction (placeholder)
+    # Stage 1: AI extraction
     # ------------------------------------------------------------------
 
     def run_extraction(self, invoice_id: int) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Awaiting AI Extraction":
+            raise InvoiceLifecycleError(
+                "AI extraction may only run while an invoice is awaiting extraction."
+            )
         # SOFTWARE_SPEC.md section 13 ("Exceptions and Errors") lists "the
         # PDF cannot be read" as a scenario the system must handle sensibly
         # rather than crash on. Once real AI extraction (Azure Document
@@ -89,11 +114,26 @@ class InvoiceLifecycle:
         # PDF should flag the invoice for review, not raise an unhandled
         # error and stall the pipeline.
         try:
-            result = run_ai_extraction(Path(invoice.stored_path))
+            result = self.extraction_runner(Path(invoice.stored_path))
+        except (
+            DocumentIntelligenceConfigurationError,
+            DocumentIntelligenceServiceError,
+        ) as error:
+            self.activity_feed.add_event(
+                event_type="extraction_unavailable",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Automatic extraction for {invoice.original_filename} "
+                    "is temporarily unavailable and will need retrying."
+                ),
+                invoice_id=invoice_id,
+            )
+            raise InvoiceExtractionUnavailableError(str(error)) from error
         except Exception as error:
             record = self.invoice_store.update_fields(
                 invoice_id,
                 status="Needs Review",
+                review_return_status=None,
                 review_reason=f"The PDF could not be read automatically: {error}",
             )
             self.activity_feed.add_event(
@@ -106,14 +146,43 @@ class InvoiceLifecycle:
                 invoice_id=invoice_id,
             )
             return record
-        if result.needs_review:
+        warnings = list(result.warnings)
+        company = result.company
+        supplier = result.supplier
+        if company:
+            company_profile = self._get_company(company)
+            if company_profile is None:
+                warnings.append(
+                    f"Company '{company}' does not match a configured company or alias."
+                )
+            else:
+                company = company_profile.name
+        if supplier:
+            supplier_profile = self._get_supplier(supplier)
+            if supplier_profile is None:
+                warnings.append(
+                    f"Supplier '{supplier}' is not in the supplier register."
+                )
+            else:
+                supplier = supplier_profile.name
+
+        if result.needs_review or warnings:
+            warning_text = "\n".join(warnings)
             record = self.invoice_store.update_fields(
                 invoice_id,
+                company=company,
+                supplier=supplier,
+                supplier_invoice_number=result.supplier_invoice_number,
+                po_number=result.purchase_order_number,
+                invoice_date=result.invoice_date,
+                invoice_value=result.invoice_value,
+                currency=result.currency,
+                ai_confidence=result.confidence,
+                ai_field_confidences=result.field_confidences_json(),
+                ai_review_warnings=warning_text,
                 status="Needs Review",
-                review_reason=(
-                    "AI extraction is not yet connected (placeholder). "
-                    "Purchase Ledger must confirm invoice details manually."
-                ),
+                review_return_status=None,
+                review_reason=warning_text or "Purchase Ledger must confirm invoice details.",
             )
             self.activity_feed.add_event(
                 event_type="needs_review",
@@ -128,14 +197,18 @@ class InvoiceLifecycle:
         # Reached only once real AI extraction is connected and confident.
         return self.invoice_store.update_fields(
             invoice_id,
-            company=result.company,
-            supplier=result.supplier,
+            company=company,
+            supplier=supplier,
             supplier_invoice_number=result.supplier_invoice_number,
             po_number=result.purchase_order_number,
             invoice_date=result.invoice_date,
             invoice_value=result.invoice_value,
             currency=result.currency,
+            ai_confidence=result.confidence,
+            ai_field_confidences=result.field_confidences_json(),
+            ai_review_warnings=None,
             status="Needs Review",
+            review_return_status=None,
             review_reason="Awaiting Purchase Ledger confirmation.",
         )
 
@@ -189,6 +262,7 @@ class InvoiceLifecycle:
                     invoice_value=invoice_value,
                     currency=currency,
                     status="Needs Review",
+                    review_return_status=None,
                     duplicate_of_invoice_id=duplicate.invoice_id,
                     review_reason=(
                         f"Possible duplicate of invoice #{duplicate.invoice_id} "
@@ -240,6 +314,7 @@ class InvoiceLifecycle:
             "currency": currency,
             "irj_number": irj_number,
             "duplicate_of_invoice_id": None,
+            "review_return_status": None,
         }
 
         if decision.route == "purchase_order":
@@ -387,6 +462,7 @@ class InvoiceLifecycle:
             record = self.invoice_store.update_fields(
                 invoice_id,
                 status="Needs Review",
+                review_return_status=None,
                 review_reason=(
                     f"No approval matrix entry found for supplier '{invoice.supplier}' "
                     f"under '{invoice.company}'. Configure the route, then retry."
@@ -655,14 +731,76 @@ class InvoiceLifecycle:
     # ------------------------------------------------------------------
 
     def flag_for_review(self, invoice_id: int, *, reason: str) -> InvoiceRecord:
-        self._require_invoice(invoice_id)
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status == "Needs Review":
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} is already awaiting review."
+            )
+        if not reason.strip():
+            raise InvoiceLifecycleError("A review reason is required.")
         record = self.invoice_store.update_fields(
-            invoice_id, status="Needs Review", review_reason=reason
+            invoice_id,
+            status="Needs Review",
+            review_reason=reason.strip(),
+            review_return_status=invoice.status,
         )
         self.activity_feed.add_event(
             event_type="needs_review",
             target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice flagged for review: {reason}",
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def resolve_flagged_review(
+        self,
+        invoice_id: int,
+        *,
+        accepted: bool,
+        reason: str | None,
+        recorded_by: str,
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Needs Review" or not invoice.review_return_status:
+            raise InvoiceLifecycleError(
+                "This invoice requires its dedicated review action and cannot "
+                "be resolved as a manually flagged invoice."
+            )
+        return_status = invoice.review_return_status
+        if accepted:
+            record = self.invoice_store.update_fields(
+                invoice_id,
+                status=return_status,
+                review_reason=None,
+                review_return_status=None,
+            )
+            self.activity_feed.add_event(
+                event_type="review_accepted",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Invoice {invoice.irj_number or invoice.original_filename} "
+                    f"accepted by {recorded_by} and returned to {return_status}."
+                ),
+                invoice_id=invoice_id,
+            )
+            return record
+
+        if not reason or not reason.strip():
+            raise InvoiceLifecycleError("A rejection reason is required.")
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Rejected",
+            rejection_reason=reason.strip(),
+            review_reason=None,
+            review_return_status=None,
+        )
+        self.activity_feed.add_event(
+            event_type="rejected",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Invoice {invoice.irj_number or invoice.original_filename} "
+                f"rejected during review by {recorded_by}: {reason.strip()}"
+            ),
             invoice_id=invoice_id,
         )
         return record
@@ -677,6 +815,7 @@ class InvoiceLifecycle:
         *,
         payment_date: str,
         payment_reference: str | None,
+        supplier_account_number: str | None = None,
         payment_method: str | None = None,
         recorded_by: str | None = None,
     ) -> InvoiceRecord:
@@ -698,6 +837,7 @@ class InvoiceLifecycle:
             invoice_id,
             status="Paid / Awaiting Bank Reconciliation",
             payment_date=payment_date,
+            supplier_account_number=supplier_account_number,
             payment_reference=payment_reference,
             payment_method=payment_method.strip(),
             paid_by=recorded_by,

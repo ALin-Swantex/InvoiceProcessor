@@ -6,7 +6,7 @@ from typing import BinaryIO
 
 from openpyxl import load_workbook
 
-from app.approval_matrix import ApprovalMatrixStore
+from app.approval_matrix import ALL_COMPANIES, ApprovalMatrixStore
 from app.auth import AuthStore
 from app.companies import CompanyStore
 from app.suppliers import SupplierStore
@@ -30,18 +30,25 @@ from app.supplier_terms import SupplierTermsStore
 
 _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "company": ("company", "company name"),
-    "supplier": ("supplier", "supplier name"),
+    "supplier": (
+        "supplier",
+        "supplier name",
+        "trading partner name",
+    ),
     "supplier_account_number": (
         "supplier account number",
+        "supplier account no",
         "account number",
         "supplier account",
     ),
     "default_payment_method": (
         "default payment method",
+        "defaultpaymentmethod",
         "payment method",
     ),
     "payment_terms_notice": (
         "payment terms",
+        "paymentterms",
         "payment terms notice",
         "terms",
     ),
@@ -54,12 +61,14 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
         "approver",
         "approver 1",
         "approver1",
+        "1st approval",
         "approvers",
     ),
     "approver2": (
         "approver 2",
         "approver2",
         "second approver",
+        "final signature",
     ),
 }
 
@@ -69,7 +78,7 @@ class ImportRowResult:
     row_number: int
     company: str
     supplier: str
-    status: str  # "imported" or "skipped"
+    status: str  # "imported", "warning", or "skipped"
     reason: str | None = None
 
 
@@ -84,6 +93,10 @@ class ImportSummary:
     @property
     def skipped_count(self) -> int:
         return sum(1 for row in self.rows if row.status == "skipped")
+
+    @property
+    def warning_count(self) -> int:
+        return sum(1 for row in self.rows if row.status == "warning")
 
 
 def _normalise_header(value: object) -> str:
@@ -128,6 +141,7 @@ def import_supplier_workbook(
     approval_matrix_store: ApprovalMatrixStore,
     supplier_terms_store: SupplierTermsStore,
     auth_store: AuthStore,
+    default_company: str | None = None,
 ) -> ImportSummary:
     workbook = load_workbook(source, data_only=True, read_only=True)
     sheet = workbook.active
@@ -139,12 +153,14 @@ def import_supplier_workbook(
         return ImportSummary()
     mapping = _map_headers(header_row)
 
-    missing_required = [f for f in ("company", "supplier") if f not in mapping]
-    if missing_required:
+    if "supplier" not in mapping:
         raise ValueError(
-            "The spreadsheet must have 'Company' and 'Supplier' columns; "
-            f"missing: {', '.join(missing_required)}."
+            "The spreadsheet must have a supplier column (for example "
+            "'Supplier' or 'Trading Partner Name')."
         )
+    selected_company = (default_company or "").strip()
+    if selected_company and company_store.get(selected_company) is None:
+        raise ValueError(f"Selected company '{selected_company}' was not found.")
 
     users_by_name = {
         user.display_name.strip().casefold(): user for user in auth_store.list_users()
@@ -155,7 +171,11 @@ def import_supplier_workbook(
         if row is None or all(cell is None for cell in row):
             continue
 
-        company = _cell(row, mapping, "company")
+        company = (
+            _cell(row, mapping, "company")
+            or selected_company
+            or ALL_COMPANIES
+        )
         supplier = _cell(row, mapping, "supplier")
         if not company or not supplier:
             summary.rows.append(
@@ -179,31 +199,24 @@ def import_supplier_workbook(
         unresolved: list[str] = []
         for name in approver_names[:2]:
             user = users_by_name.get(name.strip().casefold())
-            if user is None:
+            if user is None or not user.email:
                 unresolved.append(name)
             else:
                 resolved.append((user.display_name, user.email))
-
-        if unresolved:
-            summary.rows.append(
-                ImportRowResult(
-                    row_number=row_number,
-                    company=company,
-                    supplier=supplier,
-                    status="skipped",
-                    reason=(
-                        "Approver name(s) not found among existing users "
-                        f"(create the user first): {', '.join(unresolved)}."
-                    ),
-                )
+        route_warning: str | None = None
+        if not approver1_raw:
+            route_warning = "No first approver was supplied."
+        elif unresolved:
+            route_warning = (
+                "Approval route was not updated. Create local users for: "
+                f"{', '.join(unresolved)}."
             )
-            continue
 
         # Ensure the company and supplier master records exist so the
         # approval matrix / supplier terms rows can reference them; leave
         # folder paths for the admin to adjust afterwards if this created a
         # brand-new company.
-        if company_store.get(company) is None:
+        if company != ALL_COMPANIES and company_store.get(company) is None:
             company_store.create(
                 name=company,
                 company_folder=f"Invoices/{company}",
@@ -212,7 +225,7 @@ def import_supplier_workbook(
         if supplier_store.get(supplier) is None:
             supplier_store.create(name=supplier)
 
-        if resolved:
+        if resolved and route_warning is None:
             existing_entry = approval_matrix_store.find(company, supplier)
             approver1_name, approver1_email = resolved[0]
             approver2_name, approver2_email = resolved[1] if len(resolved) > 1 else (None, None)
@@ -248,7 +261,8 @@ def import_supplier_workbook(
                 row_number=row_number,
                 company=company,
                 supplier=supplier,
-                status="imported",
+                status="warning" if route_warning else "imported",
+                reason=route_warning,
             )
         )
 

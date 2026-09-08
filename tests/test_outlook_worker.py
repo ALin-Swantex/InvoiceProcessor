@@ -125,6 +125,25 @@ def test_worker_persists_outlook_pdf_and_completes_notification(
     assert served_pdf.content.startswith(b"%PDF-")
 
 
+def test_worker_runs_configured_extraction_after_outlook_intake(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "invoice-1001.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\ninvoice\n%%EOF")
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    extracted_ids: list[int] = []
+    worker = OutlookInvoiceWorker(
+        queued_store(tmp_path),
+        invoices,
+        FakeOutlookRetriever(pdf_path),
+        extraction_runner=extracted_ids.append,
+    )
+
+    assert asyncio.run(worker.process_next()) is True
+
+    assert extracted_ids == [invoices.list()[0].id]
+
+
 def test_worker_persists_converted_excel_as_a_pdf(tmp_path: Path) -> None:
     converted_pdf = tmp_path / "invoice-1001.pdf"
     converted_pdf.write_bytes(b"%PDF-1.7\nconverted\n%%EOF")

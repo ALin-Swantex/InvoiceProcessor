@@ -4,9 +4,11 @@ flow -- the behaviours added to implement MANUAL_VS_AUTOMATED.md end to end."""
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.activity_feed import ActivityFeedStore
+from app.ai_extraction import ExtractionResult
 from app.approval_matrix import ApprovalMatrixStore
 from app.auth import AuthStore
 from app.companies import CompanyStore
@@ -41,6 +43,44 @@ def login(client: TestClient, username: str, password: str) -> None:
         "/api/auth/login", json={"username": username, "password": password}
     )
     assert response.status_code == 200, response.text
+
+
+def test_manual_upload_runs_extraction_when_azure_is_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.main.ai_extraction_configured", lambda: True)
+    client = make_client(tmp_path)
+    client.app.state.lifecycle.extraction_runner = lambda path: ExtractionResult(
+        company="Acme Trading Ltd",
+        supplier="Supplier Ltd",
+        supplier_invoice_number="INV-AUTO-1",
+        purchase_order_number=None,
+        invoice_date="2026-09-08",
+        invoice_value=250.0,
+        currency="GBP",
+        confidence=0.96,
+        needs_review=False,
+        field_confidences={
+            "company": 0.99,
+            "supplier": 0.98,
+            "supplier_invoice_number": 0.97,
+            "invoice_date": 0.96,
+            "invoice_value": 0.99,
+            "currency": 0.99,
+        },
+        warnings=(),
+    )
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+
+    response = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("auto.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["supplier_invoice_number"] == "INV-AUTO-1"
+    assert response.json()["ai_confidence"] == 0.96
+    assert response.json()["status"] == "Needs Review"
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +190,86 @@ def test_purchase_ledger_cannot_approve_invoice(tmp_path: Path) -> None:
     assert response.status_code == 403
 
 
+def test_flagged_invoice_can_be_accepted_back_to_its_workflow_stage(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("review.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+
+    flagged = client.post(
+        f"/api/invoices/{invoice_id}/flag-review",
+        json={"reason": "Supplier identity needs checking."},
+    )
+    assert flagged.status_code == 200
+    assert flagged.json()["status"] == "Needs Review"
+    assert flagged.json()["review_return_status"] == "Awaiting AI Extraction"
+
+    accepted = client.post(
+        f"/api/invoices/{invoice_id}/review-decision",
+        json={"accepted": True},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "Awaiting AI Extraction"
+    assert accepted.json()["review_reason"] is None
+    assert accepted.json()["review_return_status"] is None
+
+
+def test_flagged_invoice_can_be_rejected_during_review(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("reject-review.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    client.post(
+        f"/api/invoices/{invoice_id}/flag-review",
+        json={"reason": "Invoice appears invalid."},
+    )
+
+    rejected = client.post(
+        f"/api/invoices/{invoice_id}/review-decision",
+        json={"accepted": False, "reason": "Supplier confirmed it was issued in error."},
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "Rejected"
+    assert rejected.json()["rejection_reason"] == (
+        "Supplier confirmed it was issued in error."
+    )
+
+
+def test_duplicate_review_cannot_use_generic_acceptance(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    _upload_and_confirm(client, supplier_invoice_number="DEDICATED-DUP")
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("duplicate-review.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "DEDICATED-DUP",
+        },
+    )
+
+    response = client.post(
+        f"/api/invoices/{invoice_id}/review-decision",
+        json={"accepted": True},
+    )
+
+    assert response.status_code == 422
+
+
 def test_approver1_cannot_decide_level_2(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     login(client, "jordan.blake", "ChangeMe-App1!")
@@ -251,6 +371,7 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
         f"/api/invoices/{invoice_id}/pay",
         json={
             "payment_date": "2026-01-15",
+            "supplier_account_number": "SUPP0001",
             "payment_reference": "BACS-001",
             "payment_method": "BACS",
         },
@@ -258,6 +379,7 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     assert paid.status_code == 200
     assert paid.json()["status"] == "Paid / Awaiting Bank Reconciliation"
     assert paid.json()["is_foreign_payment"] == 0
+    assert paid.json()["supplier_account_number"] == "SUPP0001"
     assert paid.json()["payment_route_decided_by"] == "Purchase Ledger"
     assert paid.json()["foreign_allocation_date"] is None
     assert paid.json()["foreign_allocation_reference"] is None

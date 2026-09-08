@@ -6,11 +6,12 @@ This project connects the first stage of the invoice workflow:
 2. The web application queues the Outlook message ID.
 3. A worker calls Microsoft Graph directly to read the email and download each
    PDF attachment, or convert an XLS/XLSX attachment to PDF.
-4. The worker creates an invoice record.
+4. The worker creates an invoice record and, when configured, sends the PDF
+   to Azure AI Document Intelligence using the Invoice MCP Entra identity.
 5. The web interface lists the received invoices and displays the selected PDF.
 
-AI extraction, SharePoint upload, Sage, approvals, and payment processing are
-not connected yet.
+SharePoint permissions, live Azure resources, Sage, and outbound email delivery
+are not connected yet.
 
 For local testing without a public HTTPS webhook, set
 `OUTLOOK_LOCAL_POLLING_ENABLED=true`. The worker will poll unread messages
@@ -24,7 +25,11 @@ to use Graph webhooks.
 - Real source email sender, subject, and received time.
 - Company, supplier, invoice number, PO number, invoice date, and route.
 - Net amount, VAT, total, currency, payment terms, and due date.
-- AI fields remain empty with status `Awaiting AI Extraction`.
+- Azure's `prebuilt-invoice` fields populate the review form when
+  `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` is configured.
+- Company, supplier, supplier invoice number, invoice date, total, and currency
+  are critical extraction fields; missing or low-confidence values are sent to
+  Purchase Ledger review.
 - Disabled Purchase Ledger confirmation until real data and workflow endpoints are connected.
 - Responsive desktop and mobile layout.
 
@@ -89,6 +94,37 @@ Downloaded PDFs are stored on the same local machine as the worker. SQLite
 stores the notification queue and invoice records. Production should replace
 these with managed storage/queues before processing live invoices.
 
+## Prepared Azure integrations
+
+Install the optional Azure dependencies with:
+
+```bash
+python3 -m pip install -e '.[azure]'
+```
+
+Document Intelligence uses the `prebuilt-invoice` model and the existing
+Invoice MCP Entra service principal. Configure
+`AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`; no Document Intelligence API key is
+required. Assign the service principal the **Cognitive Services User** role on
+the resource.
+
+Set `INVOICE_STORE_BACKEND=postgres` to use Azure Database for PostgreSQL for
+invoice metadata, the activity feed, and atomic IRJ numbering. Configure
+`AZURE_POSTGRES_HOST`, `AZURE_POSTGRES_DATABASE`, and `AZURE_POSTGRES_USER`.
+When `AZURE_POSTGRES_PASSWORD` is omitted, the application obtains an Entra
+token for PostgreSQL using the Invoice MCP credentials. Apply transactional
+schema migrations with a DBA/deployment identity using
+`python -m app.postgres_migrate`; the runtime defaults to
+`AZURE_POSTGRES_AUTO_MIGRATE=false`. IT can use
+`app/postgres_runtime_grants.sql.template` to grant the mapped Invoice MCP role
+the required DML permissions. SQLite remains the default for offline testing.
+
+The first PostgreSQL phase moves invoices, activity events, and IRJ numbering.
+Company, supplier, approval, user, and company-access tables are included in
+the authoritative schema but remain on the existing local stores until their
+PostgreSQL adapters and Entra web sign-in are activated. Row-level security is
+therefore intentionally not enabled yet.
+
 ## Direct Microsoft Graph access
 
 The worker and subscription CLI call Microsoft Graph directly through
@@ -99,6 +135,10 @@ The worker and subscription CLI call Microsoft Graph directly through
 - Convert non-inline XLS/XLSX attachments through a temporary file in the
   configured SharePoint/OneDrive drive, then delete the temporary workbook.
   Source workbooks and converted PDFs have independent configurable size limits.
+- Import supplier workbooks locally from the Admin panel. Each trading partner
+  is stored as a supplier company and applies across all invoice companies by
+  default; supplier account numbers preserve separate payment profiles for
+  suppliers paid from multiple bank accounts.
 - Create and renew the Inbox change-notification subscription.
 
 It does not send, delete, move, or mark email as read. See

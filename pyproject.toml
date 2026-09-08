@@ -18,6 +18,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+azure = [
+    "azure-ai-documentintelligence>=1,<2",
+    "azure-identity>=1.19,<2",
+    "certifi>=2024",
+    "psycopg[binary]>=3.2,<4",
+]
 test = [
     "httpx>=0.28,<1",
     "pytest>=8,<9",

@@ -119,6 +119,43 @@ class SharePointClient:
     def get_item_web_url(self, item: dict[str, Any]) -> str | None:
         return item.get("webUrl") if isinstance(item.get("webUrl"), str) else None
 
+    def list_folder_paths(self, *, max_folders: int = 2000) -> list[str]:
+        """Return every existing folder path in the configured drive.
+
+        Paths are relative to the document-library root and are suitable for
+        storing in company routing configuration.
+        """
+        if max_folders < 1:
+            raise ValueError("max_folders must be greater than zero.")
+
+        drive_prefix = (
+            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
+        )
+        paths: list[str] = []
+        pending: list[tuple[str | None, str]] = [(None, "")]
+        while pending:
+            parent_id, parent_path = pending.pop()
+            url = (
+                f"{drive_prefix}/root/children"
+                if parent_id is None
+                else f"{drive_prefix}/items/{quote(parent_id, safe='')}/children"
+            )
+            for item in self._list_drive_children(url):
+                if not isinstance(item.get("folder"), dict):
+                    continue
+                item_id = item.get("id")
+                name = item.get("name")
+                if not isinstance(item_id, str) or not isinstance(name, str):
+                    continue
+                path = str(PurePosixPath(parent_path) / name)
+                paths.append(path)
+                if len(paths) > max_folders:
+                    raise SharePointError(
+                        f"SharePoint folder scan exceeded {max_folders} folders."
+                    )
+                pending.append((item_id, path))
+        return sorted(paths, key=str.casefold)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -226,6 +263,38 @@ class SharePointClient:
                 f"request ID: {request_id}."
             ) from error
         return response
+
+    def _list_drive_children(self, url: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        params: dict[str, str] | None = {
+            "$select": "id,name,folder",
+            "$top": "200",
+        }
+        while url:
+            response = self.http_client.get(
+                url,
+                params=params,
+                headers={"Authorization": f"******"},
+            )
+            params = None
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                request_id = response.headers.get("request-id", "not provided")
+                raise SharePointError(
+                    f"SharePoint folder listing failed with HTTP "
+                    f"{response.status_code}; request ID: {request_id}."
+                ) from error
+            payload = response.json()
+            page = payload.get("value", [])
+            if not isinstance(page, list):
+                raise SharePointError(
+                    "SharePoint returned an invalid folder listing response."
+                )
+            items.extend(item for item in page if isinstance(item, dict))
+            next_link = payload.get("@odata.nextLink")
+            url = next_link if isinstance(next_link, str) else ""
+        return items
 
 
 def sharepoint_settings_from_environment() -> SharePointSettings:

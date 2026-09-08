@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Res
 from pydantic import BaseModel
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
+from app.ai_extraction import ai_extraction_configured
 from app.approval_matrix import ApprovalMatrixStore
 from app.auth import (
     AuthError,
@@ -31,14 +32,18 @@ from app.bulk_import import import_supplier_workbook
 from app.companies import CompanyStore
 from app.config_db import config_database_path, set_setting
 from app.environment import load_project_environment
-from app.invoice_lifecycle import InvoiceLifecycle, InvoiceLifecycleError
+from app.invoice_lifecycle import (
+    InvoiceExtractionUnavailableError,
+    InvoiceLifecycle,
+    InvoiceLifecycleError,
+)
 from app.invoices import InvoiceStore
 from app.irj import IrjNumberGenerator
 from app.outlook_notifications import (
     OutlookNotificationStore,
     extract_message_id,
 )
-from app.sharepoint import SharePointClient
+from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
 from app.supplier_terms import SupplierTermsStore
 from app.workflow import (
@@ -123,8 +128,14 @@ class FlagReviewRequest(BaseModel):
     reason: str
 
 
+class ReviewDecisionRequest(BaseModel):
+    accepted: bool
+    reason: str | None = None
+
+
 class PaymentRequest(BaseModel):
     payment_date: str
+    supplier_account_number: str | None = None
     payment_reference: str
     payment_method: str
 
@@ -221,15 +232,17 @@ def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore
 
     Defaults to the local SQLite store (INVOICE_STORE_BACKEND unset or
     "sqlite") so tests and prototype usage keep working with zero
-    configuration. Set INVOICE_STORE_BACKEND=sharepoint_list to persist
-    invoice metadata centrally in a SharePoint List instead -- see
-    app/sharepoint_invoice_store.py for the required (currently
-    placeholder) SHAREPOINT_INVOICES_SITE_ID / SHAREPOINT_INVOICES_LIST_ID
-    environment variables.
+    configuration. Set INVOICE_STORE_BACKEND=postgres to persist invoice
+    metadata in Azure Database for PostgreSQL. The legacy sharepoint_list
+    adapter remains available for compatibility.
     """
     backend = os.environ.get("INVOICE_STORE_BACKEND", "sqlite").strip().lower()
     if backend == "sqlite":
         return InvoiceStore(invoice_db_path)
+    if backend == "postgres":
+        from app.postgres_invoices import create_postgres_invoice_store
+
+        return create_postgres_invoice_store()  # type: ignore[return-value]
     if backend == "sharepoint_list":
         from app.sharepoint_invoice_store import (
             sharepoint_invoice_store_from_environment,
@@ -237,8 +250,8 @@ def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore
 
         return sharepoint_invoice_store_from_environment()  # type: ignore[return-value]
     raise ValueError(
-        f"Unknown INVOICE_STORE_BACKEND '{backend}'. Expected 'sqlite' or "
-        "'sharepoint_list'."
+        f"Unknown INVOICE_STORE_BACKEND '{backend}'. Expected 'sqlite', "
+        "'postgres', or 'sharepoint_list'."
     )
 
 
@@ -290,10 +303,25 @@ def create_app(
     # watches in the app -- making genuinely still-pending invoices look like
     # they had skipped approvers and gone straight to Approved.
     irj_db_path = getattr(app.state.invoice_store, "database_path", invoice_db_path)
-    app.state.irj_generator = irj_generator or IrjNumberGenerator(irj_db_path)
-    app.state.activity_feed = activity_feed or ActivityFeedStore(
-        Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
-    )
+    if irj_generator is not None:
+        app.state.irj_generator = irj_generator
+    elif invoice_store is None and invoice_store_backend == "postgres":
+        from app.postgres_services import PostgresIrjNumberGenerator
+
+        app.state.irj_generator = PostgresIrjNumberGenerator()
+    else:
+        app.state.irj_generator = IrjNumberGenerator(irj_db_path)
+    if activity_feed is not None:
+        app.state.activity_feed = activity_feed
+    elif invoice_store is None and invoice_store_backend == "postgres":
+        from app.postgres_services import PostgresActivityFeedStore
+
+        app.state.activity_feed = PostgresActivityFeedStore()
+    else:
+        app.state.activity_feed = ActivityFeedStore(
+            Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
+        )
+    app.state.sharepoint_folder_paths = None
     app.state.auth_store = auth_store or auth_store_from_environment()
     app.state.companies_store = companies_store or CompanyStore(
         Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
@@ -314,6 +342,7 @@ def create_app(
         app.state.sharepoint_client,
         companies_store=app.state.companies_store,
         approval_matrix_store=app.state.approval_matrix_store,
+        suppliers_store=app.state.suppliers_store,
     )
     app.state.sharepoint_attach_attempted = app.state.sharepoint_client is not None
 
@@ -530,6 +559,15 @@ def create_app(
               animation: toast-in .15s ease-out;
             }
             .toast.error { background: #9b1c1c; }
+            dialog {
+              width: min(460px, calc(100vw - 2rem)); border: 0; border-radius: 12px;
+              padding: 0; box-shadow: 0 20px 60px rgba(16,42,67,.3);
+            }
+            dialog::backdrop { background: rgba(11,31,51,.55); }
+            .dialog-content { padding: 1rem; }
+            .dialog-content h2 { margin: 0 0 .35rem; font-size: 1.05rem; }
+            .dialog-content p { margin: 0 0 1rem; color: #52606d; font-size: .82rem; }
+            .dialog-content .actions { margin: 1rem -1rem -1rem; }
             @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
             @media (max-width: 950px) {
               #app-root { grid-template-columns: 190px minmax(0, 1fr); }
@@ -601,6 +639,37 @@ def create_app(
             </form>
           </div>
 
+          <dialog id="payment-dialog">
+            <form id="payment-form" class="dialog-content">
+              <h2>Record domestic payment</h2>
+              <p id="payment-supplier-context"></p>
+              <div class="grid">
+                <label>Payment date
+                  <input id="payment-date" type="date" required>
+                </label>
+                <label>Payment method
+                  <select id="payment-method" required></select>
+                </label>
+                <label>Supplier account
+                  <select id="payment-supplier-account"></select>
+                </label>
+                <label style="grid-column: 1 / -1">Payment reference
+                  <input id="payment-reference" required>
+                </label>
+                <label>Normal payment terms
+                  <input id="payment-terms" disabled>
+                </label>
+                <label>Pay from bank account
+                  <input id="payment-bank-account" disabled>
+                </label>
+              </div>
+              <div class="actions">
+                <button type="button" class="secondary" id="payment-cancel">Cancel</button>
+                <button type="submit" class="primary">Record payment</button>
+              </div>
+            </form>
+          </dialog>
+
           <div id="app-root" class="hidden">
           <aside class="sidebar">
             <div class="brand">
@@ -609,6 +678,7 @@ def create_app(
             </div>
             <nav class="section-nav" id="section-nav">
               <button data-tab="incoming" class="active">Incoming<span class="count" id="count-incoming">0</span></button>
+              <button data-tab="needs-review">Flagged Invoices<span class="count" id="count-needs-review">0</span></button>
               <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
               <button data-tab="sage-registration">Sage Registration<span class="count" id="count-sage-registration">0</span></button>
               <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
@@ -727,8 +797,8 @@ def create_app(
                       </label>
                       <label>Overall confidence
                         <div class="confidence">
-                          <input disabled placeholder="Not calculated">
-                          <small>—</small>
+                          <input id="ai-confidence" disabled placeholder="Not calculated">
+                          <small id="ai-confidence-percent">—</small>
                         </div>
                       </label>
                       <label style="grid-column: 1 / -1">Review warnings
@@ -742,7 +812,9 @@ def create_app(
                         <select id="confirm-company"><option value="">Select company…</option></select>
                       </label>
                       <label>Supplier
-                        <input id="confirm-supplier" placeholder="Supplier name">
+                        <select id="confirm-supplier">
+                          <option value="">Select supplier…</option>
+                        </select>
                       </label>
                       <label>Supplier invoice number
                         <input id="confirm-supplier-invoice" placeholder="Supplier's invoice number">
@@ -774,6 +846,13 @@ def create_app(
                   </div>
                 </section>
               </div>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="needs-review">
+              <section class="card">
+                <div class="card-header"><h2>Flagged Invoices — Purchase Ledger Review</h2></div>
+                <div class="content" id="needs-review-table"></div>
+              </section>
             </div>
 
             <div class="tab-panel" data-tab-panel="po-matching">
@@ -845,10 +924,10 @@ def create_app(
                   <div class="admin-block">
                     <h3>Bulk import supplier master data</h3>
                     <p style="margin: 0 0 8px; color: #555;">
-                      Upload an Excel (.xlsx) sheet with columns for Company, Supplier,
+                      Upload an Excel (.xlsx) sheet with columns for Trading Partner Name,
                       Supplier Account Number, Default Payment Method, Payment Terms,
-                      Bank Account, and Approver(s) to create/update these records in bulk
-                      instead of entering every row by hand.
+                      Bank Account, and Approver(s). Each trading partner is imported as
+                      a supplier company and applies across all invoice companies.
                     </p>
                     <form class="admin-form" id="admin-import-form">
                       <input id="admin-import-file" type="file" accept=".xlsx,.xlsm" required>
@@ -859,12 +938,19 @@ def create_app(
 
                   <div class="admin-block">
                     <h3>Companies</h3>
+                    <p id="admin-sharepoint-folder-status" style="margin: 0 0 8px; color: #555;">
+                      Loading SharePoint folders…
+                    </p>
                     <form class="admin-form" id="admin-company-form">
                       <input id="admin-company-name" placeholder="Company name" required>
-                      <input id="admin-company-folder" placeholder="Company folder path" required>
-                      <input id="admin-company-po-folder" placeholder="PO matching folder path" required>
+                      <select id="admin-company-folder" required disabled>
+                        <option value="">Select nominal invoice folder…</option>
+                      </select>
+                      <select id="admin-company-po-folder" required disabled>
+                        <option value="">Select PO matching folder…</option>
+                      </select>
                       <input id="admin-company-aliases" placeholder="Aliases (comma separated)">
-                      <button type="submit" class="primary">Add company</button>
+                      <button type="submit" class="primary" id="admin-company-submit" disabled>Add company</button>
                     </form>
                     <div id="admin-companies-table"></div>
                   </div>
@@ -879,6 +965,11 @@ def create_app(
                       <button type="submit" class="primary">Add supplier</button>
                     </form>
                     <div id="admin-suppliers-table"></div>
+                  </div>
+
+                  <div class="admin-block">
+                    <h3>Supplier payment settings</h3>
+                    <div id="admin-supplier-terms-table"></div>
                   </div>
 
                   <div class="admin-block">
@@ -928,7 +1019,8 @@ def create_app(
           </div>
           <script>
             const SECTION_STATUSES = {
-              "incoming": ["Awaiting AI Extraction", "Needs Review"],
+              "incoming": ["Awaiting AI Extraction"],
+              "needs-review": ["Needs Review"],
               "po-matching": ["Awaiting PO Matching", "PO Query / Matching Issue"],
               "sage-registration": ["Awaiting Sage Registration"],
               "approver1": ["Awaiting Approval 1"],
@@ -944,8 +1036,8 @@ def create_app(
             // shown to the admin role. Every other tab maps 1:1 onto
             // MANUAL_VS_AUTOMATED.md's manual decision steps.
             const ROLE_TABS = {
-              "admin": ["incoming", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
-              "purchase_ledger": ["incoming", "po-matching", "sage-registration", "on-hold", "approved", "reconciliation", "complete", "rejected"],
+              "admin": ["incoming", "needs-review", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
+              "purchase_ledger": ["incoming", "needs-review", "po-matching", "sage-registration", "on-hold", "approved", "reconciliation", "complete", "rejected"],
               "approver1": ["approver1"],
               "approver2": ["approver2"],
               "purchasing": ["po-matching"],
@@ -985,6 +1077,13 @@ def create_app(
               setValue("source-received", invoice.received_at);
               setValue("source-subject", invoice.subject);
               setValue("processing-status", invoice.status);
+              const confidence = invoice.ai_confidence;
+              setValue(
+                "ai-confidence",
+                confidence == null ? "" : Number(confidence).toFixed(2)
+              );
+              document.getElementById("ai-confidence-percent").textContent =
+                confidence == null ? "—" : `${Math.round(Number(confidence) * 100)}%`;
               setValue("preview-irj", invoice.irj_number);
               setValue("preview-company", invoice.company);
               setValue("preview-supplier", invoice.supplier);
@@ -993,7 +1092,10 @@ def create_app(
               setValue("preview-invoice-date", invoice.invoice_date);
               setValue("preview-value", invoice.invoice_value);
               setValue("preview-currency", invoice.currency);
-              setValue("review-warnings", invoice.review_reason);
+              setValue(
+                "review-warnings",
+                invoice.ai_review_warnings || invoice.review_reason
+              );
               document.getElementById("intake-notice").textContent =
                 invoice.review_reason ||
                 "This PDF and its email metadata were retrieved from Outlook. AI extraction has not run yet.";
@@ -1041,7 +1143,10 @@ def create_app(
             }
 
             function incomingInvoices() {
-              return invoices.filter(i => SECTION_STATUSES["incoming"].includes(i.status));
+              return invoices.filter(i =>
+                SECTION_STATUSES["incoming"].includes(i.status) ||
+                SECTION_STATUSES["needs-review"].includes(i.status)
+              );
             }
 
             function refreshPicker() {
@@ -1094,6 +1199,28 @@ def create_app(
                 option.textContent = company.name;
                 select.appendChild(option);
               }
+            }
+
+            async function loadSuppliers() {
+              const response = await fetch("/api/suppliers");
+              if (!response.ok) return;
+              const suppliers = await response.json();
+              const select = document.getElementById("confirm-supplier");
+              const selected = select.value;
+              select.innerHTML = '<option value="">Select supplier…</option>';
+              for (const supplier of suppliers) {
+                const option = document.createElement("option");
+                option.value = supplier.name;
+                option.textContent = supplier.name;
+                select.appendChild(option);
+              }
+              if (selected && !suppliers.some(supplier => supplier.name === selected)) {
+                const option = document.createElement("option");
+                option.value = selected;
+                option.textContent = `${selected} (not in supplier register)`;
+                select.appendChild(option);
+              }
+              select.value = selected;
             }
 
             function updateCounts() {
@@ -1149,6 +1276,23 @@ def create_app(
             }
 
             function renderAllSections() {
+              renderSectionTable(
+                "needs-review-table",
+                SECTION_STATUSES["needs-review"],
+                [
+                  ...BASE_COLUMNS,
+                  { label: "Reason", value: i => i.review_reason || "—" },
+                  { label: "Return stage", value: i => i.review_return_status || "Requires a dedicated resolution" },
+                ],
+                invoice => `
+                  ${pdfLinkButton(invoice)}
+                  <button data-action="open-review" data-id="${invoice.id}" class="secondary">Open review</button>
+                  ${invoice.review_return_status ? `
+                    <button data-action="accept-review" data-id="${invoice.id}">Accept</button>
+                    <button data-action="reject-review" data-id="${invoice.id}" class="danger">Reject</button>
+                  ` : ""}
+                `
+              );
               renderSectionTable(
                 "po-matching-table",
                 SECTION_STATUSES["po-matching"],
@@ -1262,12 +1406,94 @@ def create_app(
               return response.json();
             }
 
+            async function collectDomesticPayment(invoice) {
+              const response = await fetch(
+                `/api/supplier-terms?company=${encodeURIComponent(invoice.company || "")}` +
+                `&supplier=${encodeURIComponent(invoice.supplier || "")}`
+              );
+              const terms = response.ok ? await response.json() : {};
+              const dialog = document.getElementById("payment-dialog");
+              const form = document.getElementById("payment-form");
+              const method = document.getElementById("payment-method");
+              const account = document.getElementById("payment-supplier-account");
+              const standardMethods = ["BACS", "Direct Debit", "CHAPS", "Card", "Cheque", "Other"];
+              const profiles = terms.profiles || [];
+              account.innerHTML = profiles.length
+                ? profiles.map(profile =>
+                    `<option value="${profile.supplier_account_number || ""}">` +
+                    `${profile.supplier_account_number || "No account number"} — ${profile.bank_account || "No bank specified"}` +
+                    `</option>`
+                  ).join("")
+                : '<option value="">No configured supplier account</option>';
+              account.disabled = !profiles.length;
+              const applyProfile = () => {
+                const profile = profiles.find(item => item.supplier_account_number === account.value) || profiles[0] || {};
+                const methods = [...standardMethods];
+                if (profile.default_payment_method && !methods.includes(profile.default_payment_method)) {
+                  methods.unshift(profile.default_payment_method);
+                }
+                method.innerHTML = methods
+                  .map(value => `<option value="${value}">${value}</option>`)
+                  .join("");
+                method.value = profile.default_payment_method || "BACS";
+                document.getElementById("payment-terms").value = profile.payment_terms_notice || "";
+                document.getElementById("payment-bank-account").value = profile.bank_account || "";
+              };
+              account.onchange = applyProfile;
+              applyProfile();
+              document.getElementById("payment-date").value = new Date().toISOString().slice(0, 10);
+              document.getElementById("payment-reference").value = "";
+              document.getElementById("payment-supplier-context").textContent =
+                invoice.supplier || "Supplier";
+
+              return new Promise(resolve => {
+                let settled = false;
+                const finish = value => {
+                  if (settled) return;
+                  settled = true;
+                  resolve(value);
+                };
+                form.onsubmit = event => {
+                  event.preventDefault();
+                  const payment = {
+                    payment_date: document.getElementById("payment-date").value,
+                    supplier_account_number: account.value || null,
+                    payment_reference: document.getElementById("payment-reference").value,
+                    payment_method: method.value,
+                  };
+                  dialog.close();
+                  finish(payment);
+                };
+                document.getElementById("payment-cancel").onclick = () => dialog.close();
+                dialog.onclose = () => finish(null);
+                dialog.showModal();
+              });
+            }
+
             async function handleRowAction(button) {
               const action = button.dataset.action;
               const id = button.dataset.id;
               try {
                 if (action === "po-match") {
                   await postJson(`/api/invoices/${id}/po-match`, { matched: true, notes: null });
+                } else if (action === "open-review") {
+                  document.querySelector('#section-nav button[data-tab="incoming"]').click();
+                  picker.value = String(id);
+                  const invoice = invoices.find(item => String(item.id) === String(id));
+                  if (invoice) showInvoice(invoice);
+                  return;
+                } else if (action === "accept-review") {
+                  await postJson(`/api/invoices/${id}/review-decision`, {
+                    accepted: true,
+                    reason: null,
+                  });
+                } else if (action === "reject-review") {
+                  const reason = window.prompt("Reason for rejecting this invoice:");
+                  if (!reason) return;
+                  await postJson(`/api/invoices/${id}/review-decision`, {
+                    accepted: false,
+                    reason,
+                  });
                 } else if (action === "po-query") {
                   const notes = window.prompt("Describe the PO matching issue:");
                   if (notes === null) return;
@@ -1313,17 +1539,11 @@ def create_app(
                   const notes = window.prompt("Resolution notes for resuming approval (optional):");
                   await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
                 } else if (action === "pay") {
-                  const paymentDate = window.prompt("Payment date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
-                  if (!paymentDate) return;
-                  const paymentReference = window.prompt("Payment reference:");
-                  if (!paymentReference) return;
-                  const paymentMethod = window.prompt("Payment method (e.g. BACS, Bankline, CHAPS, card):");
-                  if (!paymentMethod) return;
-                  await postJson(`/api/invoices/${id}/pay`, {
-                    payment_date: paymentDate,
-                    payment_reference: paymentReference,
-                    payment_method: paymentMethod,
-                  });
+                  const invoice = invoices.find(item => String(item.id) === String(id));
+                  if (!invoice) throw new Error("Invoice could not be found.");
+                  const payment = await collectDomesticPayment(invoice);
+                  if (!payment) return;
+                  await postJson(`/api/invoices/${id}/pay`, payment);
                 } else if (action === "route-foreign") {
                   if (!window.confirm("Confirm this is a foreign payment requiring allocation?")) return;
                   await postJson(`/api/invoices/${id}/route-foreign-payment`, {});
@@ -1557,12 +1777,51 @@ def create_app(
               }
             }
 
+            async function loadSharePointFolderOptions() {
+              const status = document.getElementById("admin-sharepoint-folder-status");
+              const nominalSelect = document.getElementById("admin-company-folder");
+              const poSelect = document.getElementById("admin-company-po-folder");
+              const submit = document.getElementById("admin-company-submit");
+              try {
+                const response = await fetch("/api/admin/sharepoint/folders");
+                const body = await response.json();
+                if (!response.ok) {
+                  throw new Error(body.detail || "SharePoint folders could not be loaded.");
+                }
+                const populate = (select, placeholder) => {
+                  select.replaceChildren();
+                  const emptyOption = document.createElement("option");
+                  emptyOption.value = "";
+                  emptyOption.textContent = placeholder;
+                  select.appendChild(emptyOption);
+                  for (const path of body.folders) {
+                    const option = document.createElement("option");
+                    option.value = path;
+                    option.textContent = path;
+                    select.appendChild(option);
+                  }
+                };
+                populate(nominalSelect, "Select nominal invoice folder…");
+                populate(poSelect, "Select PO matching folder…");
+                nominalSelect.disabled = false;
+                poSelect.disabled = false;
+                submit.disabled = false;
+                status.textContent = `${body.folders.length} SharePoint folder(s) available.`;
+              } catch (error) {
+                nominalSelect.disabled = true;
+                poSelect.disabled = true;
+                submit.disabled = true;
+                status.textContent = `SharePoint folders unavailable: ${error.message}`;
+              }
+            }
+
             async function loadAdminPanel() {
               try {
-                const [companies, suppliers, matrix, threshold, users] = await Promise.all([
+                const [companies, suppliers, matrix, supplierTerms, threshold, users] = await Promise.all([
                   fetch("/api/admin/companies").then(r => r.json()),
                   fetch("/api/admin/suppliers").then(r => r.json()),
                   fetch("/api/admin/approval-matrix").then(r => r.json()),
+                  fetch("/api/admin/supplier-terms").then(r => r.json()),
                   fetch("/api/admin/ai-threshold").then(r => r.json()),
                   fetch("/api/admin/users").then(r => r.json()),
                 ]);
@@ -1578,6 +1837,7 @@ def create_app(
                   async name => {
                     await fetch(`/api/admin/companies/${encodeURIComponent(name)}`, { method: "DELETE" });
                     await loadAdminPanel();
+                    await loadCompanies();
                   },
                   "name"
                 );
@@ -1593,14 +1853,27 @@ def create_app(
                   async name => {
                     await fetch(`/api/admin/suppliers/${encodeURIComponent(name)}`, { method: "DELETE" });
                     await loadAdminPanel();
+                    await loadSuppliers();
                   },
                   "name"
                 );
                 renderSimpleTable(
+                  document.getElementById("admin-supplier-terms-table"),
+                  [
+                    { label: "Applies to", value: t => t.company === "*" ? "All invoice companies" : t.company },
+                    { label: "Supplier company", value: t => t.supplier },
+                    { label: "Account no.", value: t => t.supplier_account_number },
+                    { label: "Payment method", value: t => t.default_payment_method },
+                    { label: "Terms", value: t => t.payment_terms_notice },
+                    { label: "Bank account", value: t => t.bank_account },
+                  ],
+                  supplierTerms
+                );
+                renderSimpleTable(
                   document.getElementById("admin-matrix-table"),
                   [
-                    { label: "Company", value: m => m.company },
-                    { label: "Supplier", value: m => m.supplier },
+                    { label: "Applies to", value: m => m.company === "*" ? "All invoice companies" : m.company },
+                    { label: "Supplier company", value: m => m.supplier },
                     { label: "Approver 1", value: m => `${m.approver1_name} <${m.approver1_email}>` },
                     { label: "Approver 2", value: m => (m.approver2_name ? `${m.approver2_name} <${m.approver2_email}>` : "—") },
                   ],
@@ -1649,19 +1922,21 @@ def create_app(
                 if (!response.ok) {
                   throw new Error(body.detail || "Import failed.");
                 }
-                const skippedRows = body.rows.filter(r => r.status === "skipped");
-                const skippedList = skippedRows.length
+                const issueRows = body.rows.filter(r => r.status !== "imported");
+                const issueList = issueRows.length
                   ? "<ul>" +
-                    skippedRows
-                      .map(r => `<li>Row ${r.row_number} (${r.company || "—"} / ${r.supplier || "—"}): ${r.reason}</li>`)
+                    issueRows
+                      .map(r => `<li>Row ${r.row_number} (${r.company === "*" ? "All invoice companies" : (r.company || "—")} / ${r.supplier || "—"}): ${r.reason}</li>`)
                       .join("") +
                     "</ul>"
                   : "";
                 resultBox.innerHTML =
                   `<p><strong>${body.imported}</strong> row(s) imported, ` +
-                  `<strong>${body.skipped}</strong> row(s) skipped.</p>${skippedList}`;
+                  `<strong>${body.warnings}</strong> warning(s), ` +
+                  `<strong>${body.skipped}</strong> row(s) skipped.</p>${issueList}`;
                 event.target.reset();
                 await loadAdminPanel();
+                await loadSuppliers();
               } catch (error) {
                 resultBox.innerHTML = "";
                 showToast(error.message, true);
@@ -1695,6 +1970,7 @@ def create_app(
                 });
                 event.target.reset();
                 await loadAdminPanel();
+                await loadSuppliers();
               } catch (error) {
                 showToast(error.message, true);
               }
@@ -1793,9 +2069,12 @@ def create_app(
               document.getElementById("user-chip-label").textContent =
                 `${currentUser.display_name} (${currentUser.role})`;
               applyRoleVisibility(currentUser.role);
-              await loadInvoices();
               await loadCompanies();
-              if (currentUser.role === "admin") await loadAdminPanel();
+              await loadSuppliers();
+              await loadInvoices();
+              if (currentUser.role === "admin") {
+                await Promise.all([loadAdminPanel(), loadSharePointFolderOptions()]);
+              }
               await initActivityCursor();
               setInterval(pollActivity, 3000);
               setInterval(loadInvoices, 5000);
@@ -1864,6 +2143,10 @@ def create_app(
             for profile in app.state.companies_store.list()
         ]
 
+    @app.get("/api/suppliers")
+    def suppliers(user: User = Depends(get_current_user)) -> list[dict[str, object]]:
+        return [asdict(profile) for profile in app.state.suppliers_store.list()]
+
     @app.get("/api/approval-matrix")
     def approval_matrix(user: User = Depends(get_current_user)) -> list[dict[str, object]]:
         return [
@@ -1879,6 +2162,15 @@ def create_app(
             }
             for entry in app.state.approval_matrix_store.list()
         ]
+
+    @app.get("/api/supplier-terms")
+    def supplier_terms(
+        company: str,
+        supplier: str,
+        user: User = Depends(get_current_user),
+    ) -> dict[str, object]:
+        profiles = app.state.supplier_terms_store.list_for_supplier(company, supplier)
+        return {"profiles": [asdict(terms) for terms in profiles]}
 
     @app.get("/api/activity")
     def activity(
@@ -1963,6 +2255,14 @@ def create_app(
             ),
             invoice_id=record.id,
         )
+        if ai_extraction_configured():
+            try:
+                record = _lifecycle().run_extraction(record.id)
+            except InvoiceExtractionUnavailableError:
+                # Intake has already succeeded. Keep the invoice retryable
+                # rather than turning a temporary Azure outage into a failed
+                # manual upload or losing the newly created record.
+                record = app.state.invoice_store.get(record.id) or record
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/register-sage")
@@ -2038,8 +2338,10 @@ def create_app(
     ) -> dict[str, object]:
         try:
             record = _lifecycle().run_extraction(invoice_id)
+        except InvoiceExtractionUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
         except InvoiceLifecycleError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+            raise HTTPException(status_code=409, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/route-foreign-payment")
@@ -2177,7 +2479,24 @@ def create_app(
         try:
             record = _lifecycle().flag_for_review(invoice_id, reason=request.reason)
         except InvoiceLifecycleError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/review-decision")
+    def decide_flagged_invoice(
+        invoice_id: int,
+        request: ReviewDecisionRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().resolve_flagged_review(
+                invoice_id,
+                accepted=request.accepted,
+                reason=request.reason,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/pay")
@@ -2190,6 +2509,7 @@ def create_app(
             record = _lifecycle().mark_paid(
                 invoice_id,
                 payment_date=request.payment_date,
+                supplier_account_number=request.supplier_account_number,
                 payment_reference=request.payment_reference,
                 payment_method=request.payment_method,
                 recorded_by=user.display_name,
@@ -2228,10 +2548,40 @@ def create_app(
     ) -> list[dict[str, object]]:
         return [asdict(profile) for profile in app.state.companies_store.list()]
 
+    @app.get("/api/admin/sharepoint/folders")
+    def admin_list_sharepoint_folders(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        client = _lifecycle().sharepoint_client
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="SharePoint is not configured or accessible.",
+            )
+        try:
+            folders = client.list_folder_paths()
+        except SharePointError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        app.state.sharepoint_folder_paths = frozenset(folders)
+        return {"folders": folders}
+
     @app.post("/api/admin/companies")
     def admin_create_company(
         request: CompanyRequest, user: User = Depends(require_role(ROLE_ADMIN))
     ) -> dict[str, object]:
+        folder_paths = app.state.sharepoint_folder_paths
+        if folder_paths is not None:
+            if (
+                request.company_folder not in folder_paths
+                or request.po_matching_folder not in folder_paths
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Select existing SharePoint folders for nominal invoices "
+                        "and PO matching."
+                    ),
+                )
         try:
             profile = app.state.companies_store.create(**request.model_dump())
         except ValueError as error:
@@ -2261,6 +2611,8 @@ def create_app(
             app.state.companies_store.delete(name)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        app.state.approval_matrix_store.delete_by_company(name)
+        app.state.supplier_terms_store.delete_by_company(name)
         return {"status": "deleted"}
 
     @app.get("/api/admin/suppliers")
@@ -2302,6 +2654,8 @@ def create_app(
             app.state.suppliers_store.delete(name)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        app.state.approval_matrix_store.delete_by_supplier(name)
+        app.state.supplier_terms_store.delete_by_supplier(name)
         return {"status": "deleted"}
 
     @app.get("/api/admin/approval-matrix")
@@ -2381,13 +2735,14 @@ def create_app(
     @app.post("/api/admin/import/supplier-master-data")
     async def admin_import_supplier_master_data(
         file: UploadFile = File(...),
+        company: str | None = Form(None),
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> dict[str, object]:
-        """Bulk-import companies, suppliers, approval matrix entries, and
+        """Bulk-import supplier companies, approval matrix entries, and
         supplier payment terms from an uploaded .xlsx workbook, so an admin
         doesn't have to manually re-key every row from an existing Excel
         sheet. Expected columns (header names are flexible, see
-        app/bulk_import.py): Company, Supplier, Supplier Account Number,
+        app/bulk_import.py): Trading Partner Name, Supplier Account Number,
         Default Payment Method, Payment Terms, Bank Account, Approver(s)."""
         if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
             raise HTTPException(
@@ -2402,11 +2757,13 @@ def create_app(
                 approval_matrix_store=app.state.approval_matrix_store,
                 supplier_terms_store=app.state.supplier_terms_store,
                 auth_store=app.state.auth_store,
+                default_company=company,
             )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return {
             "imported": summary.imported_count,
+            "warnings": summary.warning_count,
             "skipped": summary.skipped_count,
             "rows": [asdict(row) for row in summary.rows],
         }

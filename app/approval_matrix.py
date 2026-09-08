@@ -6,6 +6,8 @@ from pathlib import Path
 
 from app.config_db import connect
 
+ALL_COMPANIES = "*"
+
 
 # ---------------------------------------------------------------------------
 # Approval Matrix — admin-maintained routing rules mapping (company,
@@ -83,13 +85,15 @@ class ApprovalMatrixStore:
     def find(self, company: str, supplier: str) -> ApprovalMatrixEntry | None:
         company_key = company.strip().casefold()
         supplier_key = supplier.strip().casefold()
+        fallback: ApprovalMatrixEntry | None = None
         for entry in self.list():
-            if (
-                entry.company.strip().casefold() == company_key
-                and entry.supplier.strip().casefold() == supplier_key
-            ):
+            if entry.supplier.strip().casefold() != supplier_key:
+                continue
+            if entry.company.strip().casefold() == company_key:
                 return entry
-        return None
+            if entry.company == ALL_COMPANIES:
+                fallback = entry
+        return fallback
 
     def create(
         self,
@@ -156,6 +160,22 @@ class ApprovalMatrixStore:
             connection.commit()
             if cursor.rowcount == 0:
                 raise KeyError(f"Approval matrix entry {entry_id} was not found.")
+
+    def delete_by_supplier(self, supplier: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM approval_matrix WHERE supplier = ?", (supplier,)
+            )
+            connection.commit()
+            return cursor.rowcount
+
+    def delete_by_company(self, company: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM approval_matrix WHERE company = ?", (company,)
+            )
+            connection.commit()
+            return cursor.rowcount
 
     def _get_by_id(self, entry_id: int) -> ApprovalMatrixEntry | None:
         with self._connect() as connection:

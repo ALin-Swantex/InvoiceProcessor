@@ -1,0 +1,15 @@
+-- Run as the database owner after applying migrations.
+-- Replace invoice_mcp_runtime with the PostgreSQL role mapped to the Invoice
+-- MCP service principal. Keep the identifier quoted if it contains spaces.
+
+GRANT CONNECT ON DATABASE invoice_processing TO invoice_mcp_runtime;
+GRANT USAGE ON SCHEMA public TO invoice_mcp_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public
+    TO invoice_mcp_runtime;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public
+    TO invoice_mcp_runtime;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO invoice_mcp_runtime;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO invoice_mcp_runtime;

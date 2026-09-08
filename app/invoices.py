@@ -43,6 +43,9 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "invoice_date": "TEXT",
     "invoice_value": "REAL",
     "currency": "TEXT",
+    "ai_confidence": "REAL",
+    "ai_field_confidences": "TEXT",
+    "ai_review_warnings": "TEXT",
     "approver1_name": "TEXT",
     "approver1_email": "TEXT",
     "approver1_decision": "TEXT",
@@ -57,6 +60,7 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "po_query_category": "TEXT",
     "po_query_contact": "TEXT",
     "payment_date": "TEXT",
+    "supplier_account_number": "TEXT",
     "payment_reference": "TEXT",
     "payment_method": "TEXT",
     "paid_by": "TEXT",
@@ -65,6 +69,7 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "reconciled_by": "TEXT",
     "rejection_reason": "TEXT",
     "review_reason": "TEXT",
+    "review_return_status": "TEXT",
     "duplicate_of_invoice_id": "INTEGER",
     "hold_reason": "TEXT",
     "hold_level": "INTEGER",
@@ -109,6 +114,9 @@ class InvoiceRecord:
     invoice_date: str | None = None
     invoice_value: float | None = None
     currency: str | None = None
+    ai_confidence: float | None = None
+    ai_field_confidences: str | None = None
+    ai_review_warnings: str | None = None
     approver1_name: str | None = None
     approver1_email: str | None = None
     approver1_decision: str | None = None
@@ -123,6 +131,7 @@ class InvoiceRecord:
     po_query_category: str | None = None
     po_query_contact: str | None = None
     payment_date: str | None = None
+    supplier_account_number: str | None = None
     payment_reference: str | None = None
     payment_method: str | None = None
     paid_by: str | None = None
@@ -131,6 +140,7 @@ class InvoiceRecord:
     reconciled_by: str | None = None
     rejection_reason: str | None = None
     review_reason: str | None = None
+    review_return_status: str | None = None
     duplicate_of_invoice_id: int | None = None
     hold_reason: str | None = None
     hold_level: int | None = None

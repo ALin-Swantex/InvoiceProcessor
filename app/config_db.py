@@ -51,13 +51,14 @@ CREATE TABLE IF NOT EXISTS approval_matrix (
 );
 
 CREATE TABLE IF NOT EXISTS supplier_terms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     company TEXT NOT NULL,
     supplier TEXT NOT NULL,
     supplier_account_number TEXT,
     default_payment_method TEXT,
     payment_terms_notice TEXT,
     bank_account TEXT,
-    PRIMARY KEY (company, supplier)
+    UNIQUE(company, supplier_account_number)
 );
 
 CREATE TABLE IF NOT EXISTS process_configuration (
@@ -101,4 +102,3 @@ def set_setting(key: str, value: str, *, database_path: Path | None = None) -> N
             (key, value),
         )
         connection.commit()
-

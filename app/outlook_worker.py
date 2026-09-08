@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
+from app.activity_feed import ActivityFeedStore
+from app.ai_extraction import ai_extraction_configured
 from app.environment import load_project_environment
+from app.invoice_lifecycle import InvoiceLifecycle
 from app.invoices import InvoiceStore
+from app.irj import IrjNumberGenerator
 from app.outlook_graph import OutlookGraphClient, graph_client_from_environment
 from app.outlook_notifications import OutlookNotificationStore
 
@@ -77,10 +81,12 @@ class OutlookInvoiceWorker:
         notification_store: OutlookNotificationStore,
         invoice_store: InvoiceStore,
         retriever: OutlookRetriever,
+        extraction_runner: Callable[[int], object] | None = None,
     ) -> None:
         self.notification_store = notification_store
         self.invoice_store = invoice_store
         self.retriever = retriever
+        self.extraction_runner = extraction_runner
 
     async def enqueue_from_mailbox(self, limit: int = 20) -> int:
         messages = await self.retriever.list_invoice_emails(
@@ -136,11 +142,16 @@ class OutlookInvoiceWorker:
                 processed_attachment["name"] = stored_path.name
                 processed_attachment["contentType"] = "application/pdf"
                 processed_attachment["size"] = stored_path.stat().st_size
-                self.invoice_store.add_from_outlook(
+                record = self.invoice_store.add_from_outlook(
                     message=message,
                     attachment=processed_attachment,
                     stored_path=stored_path,
                 )
+                if (
+                    self.extraction_runner is not None
+                    and record.status == "Awaiting AI Extraction"
+                ):
+                    await asyncio.to_thread(self.extraction_runner, record.id)
         except Exception as error:
             self.notification_store.mark_failed(notification.id, str(error))
             raise
@@ -165,13 +176,47 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
             )
         )
     )
-    invoice_store = InvoiceStore(
-        Path(os.environ.get("INVOICE_DB_PATH", "runtime_data/invoices.db"))
-    )
+    backend = os.environ.get("INVOICE_STORE_BACKEND", "sqlite").strip().lower()
+    if backend == "postgres":
+        from app.postgres_invoices import create_postgres_invoice_store
+        from app.postgres_services import (
+            PostgresActivityFeedStore,
+            PostgresIrjNumberGenerator,
+        )
+
+        invoice_store = create_postgres_invoice_store()
+        irj_generator = PostgresIrjNumberGenerator()
+        activity_feed = PostgresActivityFeedStore()
+    elif backend == "sqlite":
+        invoice_store = InvoiceStore(
+            Path(os.environ.get("INVOICE_DB_PATH", "runtime_data/invoices.db"))
+        )
+        irj_generator = IrjNumberGenerator(invoice_store.database_path)
+        activity_feed = ActivityFeedStore(
+            Path(
+                os.environ.get(
+                    "ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"
+                )
+            )
+        )
+    else:
+        raise ValueError(
+            "The Outlook worker supports INVOICE_STORE_BACKEND=sqlite or postgres."
+        )
+    extraction_runner: Callable[[int], object] | None = None
+    if ai_extraction_configured():
+        lifecycle = InvoiceLifecycle(
+            invoice_store,
+            irj_generator,
+            activity_feed,
+            None,
+        )
+        extraction_runner = lifecycle.run_extraction
     return OutlookInvoiceWorker(
         notification_store,
         invoice_store,
         OutlookGraphRetriever(graph_client_from_environment()),
+        extraction_runner,
     )
 
 
