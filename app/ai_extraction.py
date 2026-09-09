@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from io import BytesIO
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
+
+from app.document_classification import classify_document_text
 
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.80
@@ -78,6 +81,9 @@ class ExtractionResult:
     needs_review: bool
     field_confidences: dict[str, float]
     warnings: tuple[str, ...]
+    document_type: str = "invoice"
+    document_classification_confidence: float | None = None
+    document_classification_reason: str | None = None
 
     def field_confidences_json(self) -> str:
         return json.dumps(self.field_confidences, sort_keys=True)
@@ -147,13 +153,44 @@ class AzureInvoiceExtractor:
                 f"Azure Document Intelligence analysis failed: {error}"
             ) from error
 
+        classification = classify_document_text(
+            str(getattr(analysis, "content", "") or "")
+        )
+        if classification.document_type == "statement":
+            return ExtractionResult(
+                company=None,
+                supplier=None,
+                supplier_invoice_number=None,
+                purchase_order_number=None,
+                invoice_date=None,
+                invoice_value=None,
+                currency=None,
+                confidence=0.0,
+                needs_review=True,
+                field_confidences={},
+                warnings=(classification.reason,),
+                document_type="statement",
+                document_classification_confidence=classification.confidence,
+                document_classification_reason=classification.reason,
+            )
+
         documents = getattr(analysis, "documents", None) or []
         if not documents:
             raise DocumentIntelligenceError(
                 "Azure Document Intelligence returned no invoice document."
             )
         fields = getattr(documents[0], "fields", None) or {}
-        return self._map_fields(fields)
+        result = self._map_fields(
+            fields,
+            content=str(getattr(analysis, "content", "") or ""),
+        )
+        return ExtractionResult(
+            **{
+                **result.__dict__,
+                "document_classification_confidence": classification.confidence,
+                "document_classification_reason": classification.reason,
+            }
+        )
 
     @staticmethod
     def _build_client(settings: DocumentIntelligenceSettings) -> AnalysisClient:
@@ -185,32 +222,85 @@ class AzureInvoiceExtractor:
         )
 
     @staticmethod
-    def _map_fields(fields: dict[str, Any]) -> ExtractionResult:
+    def _map_fields(
+        fields: dict[str, Any],
+        *,
+        content: str = "",
+    ) -> ExtractionResult:
+        invoice_id_field = fields.get("InvoiceId") or fields.get("InvoiceNumber")
+        invoice_total_field = fields.get("InvoiceTotal")
+        fallback_total_field = None
+        if _currency_amount(invoice_total_field) is None:
+            fallback_total_field = fields.get("AmountDue")
+            if _currency_amount(fallback_total_field) is not None:
+                invoice_total_field = fallback_total_field
+
+        supplier_invoice_number = _string_value(invoice_id_field)
+        invoice_value = _currency_amount(invoice_total_field)
+        currency = (
+            _currency_code(invoice_total_field)
+            or _currency_code(fields.get("InvoiceCurrency"))
+        )
+        fallback_warnings: list[str] = []
+
+        if supplier_invoice_number is None:
+            supplier_invoice_number = _ocr_invoice_number(content)
+            if supplier_invoice_number is not None:
+                fallback_warnings.append(
+                    "Supplier invoice number was recovered from OCR text and "
+                    "requires manual confirmation."
+                )
+
+        ocr_amount, ocr_currency = _ocr_labelled_total(content)
+        if invoice_value is None and ocr_amount is not None:
+            invoice_value = ocr_amount
+            fallback_warnings.append(
+                "Invoice value was recovered from a labelled OCR total and "
+                "requires manual confirmation."
+            )
+        if currency is None and ocr_currency is not None:
+            currency = ocr_currency
+            fallback_warnings.append(
+                "Currency was recovered from a labelled OCR total and "
+                "requires manual confirmation."
+            )
+        if fallback_total_field is not None:
+            fallback_warnings.append(
+                "Invoice value was taken from Azure's amount-due field because "
+                "an invoice-total value was unavailable; confirm it manually."
+            )
+
         mapped_fields = {
             "company": _string_value(fields.get("CustomerName")),
             "supplier": _string_value(fields.get("VendorName")),
-            "supplier_invoice_number": _string_value(fields.get("InvoiceId")),
+            "supplier_invoice_number": supplier_invoice_number,
             "purchase_order_number": _string_value(fields.get("PurchaseOrder")),
             "invoice_date": _date_value(fields.get("InvoiceDate")),
-            "invoice_value": _currency_amount(fields.get("InvoiceTotal")),
-            "currency": _currency_code(fields.get("InvoiceTotal")),
+            "invoice_value": invoice_value,
+            "currency": currency,
         }
         confidences = {
-            name: _confidence(fields.get(source_name))
-            for name, source_name in {
-                "company": "CustomerName",
-                "supplier": "VendorName",
-                "supplier_invoice_number": "InvoiceId",
-                "purchase_order_number": "PurchaseOrder",
-                "invoice_date": "InvoiceDate",
-                "invoice_value": "InvoiceTotal",
-                "currency": "InvoiceTotal",
-            }.items()
-            if fields.get(source_name) is not None
+            "company": _confidence(fields.get("CustomerName")),
+            "supplier": _confidence(fields.get("VendorName")),
+            "supplier_invoice_number": _confidence(invoice_id_field),
+            "purchase_order_number": _confidence(fields.get("PurchaseOrder")),
+            "invoice_date": _confidence(fields.get("InvoiceDate")),
+            "invoice_value": (
+                0.0 if fallback_total_field is not None else _confidence(invoice_total_field)
+            ),
+            "currency": max(
+                _confidence(invoice_total_field),
+                _confidence(fields.get("InvoiceCurrency")),
+            ),
+        }
+        confidences = {
+            name: value
+            for name, value in confidences.items()
+            if value > 0.0
         }
 
         threshold = confidence_threshold()
-        warnings: list[str] = []
+        warnings: list[str] = list(fallback_warnings)
         required_confidences: list[float] = []
         for name in REQUIRED_FIELDS:
             value = mapped_fields[name]
@@ -318,16 +408,85 @@ def _currency_amount(field: Any) -> float | None:
     amount = getattr(value, "amount", None)
     if isinstance(amount, (int, float)):
         return float(amount)
-    return float(value) if isinstance(value, (int, float)) else None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return _parse_amount(str(value)) if value is not None else None
 
 
 def _currency_code(field: Any) -> str | None:
     value = _field_value(field)
     code = getattr(value, "currency_code", None)
-    if not isinstance(code, str):
+    if isinstance(code, str):
+        normalized = code.strip().upper()
+        if len(normalized) == 3 and normalized.isalpha():
+            return normalized
+    text = str(value or "")
+    code_match = re.search(r"\b(GBP|EUR|USD)\b", text, re.IGNORECASE)
+    if code_match:
+        return code_match.group(1).upper()
+    for symbol, currency in (("£", "GBP"), ("€", "EUR"), ("$", "USD")):
+        if symbol in text:
+            return currency
+    return None
+
+
+def _ocr_invoice_number(content: str) -> str | None:
+    match = re.search(
+        r"(?im)^[ \t]*invoice[ \t]*(?:no(?:\.|number)?|#)"
+        r"[ \t:.-]*(?:\r?\n[ \t]*)?([A-Z0-9][A-Z0-9./-]{1,127})[ \t]*$",
+        content,
+    )
+    return match.group(1).strip() if match else None
+
+
+def _ocr_labelled_total(content: str) -> tuple[float | None, str | None]:
+    match = re.search(
+        r"(?im)^[ \t]*(?:invoice[ \t]+total|grand[ \t]+total|total[ \t]+due|"
+        r"amount[ \t]+due)[ \t:.-]*(?:\r?\n[ \t]*)?"
+        r"(?:(GBP|EUR|USD|£|€|\$)[ \t]*)?"
+        r"([0-9][0-9., ]*)"
+        r"(?:[ \t]*(GBP|EUR|USD|£|€|\$))?[ \t]*$",
+        content,
+    )
+    if not match:
+        return None, None
+    amount = _parse_amount(match.group(2))
+    currency_token = match.group(1) or match.group(3)
+    currency = _currency_code_from_token(currency_token)
+    return amount, currency
+
+
+def _parse_amount(value: str) -> float | None:
+    match = re.search(r"-?[0-9][0-9., ]*", value)
+    if not match:
         return None
-    normalized = code.strip().upper()
-    return normalized if len(normalized) == 3 and normalized.isalpha() else None
+    normalized = match.group(0).replace(" ", "")
+    if "," in normalized and "." in normalized:
+        if normalized.rfind(",") > normalized.rfind("."):
+            normalized = normalized.replace(".", "").replace(",", ".")
+        else:
+            normalized = normalized.replace(",", "")
+    elif "," in normalized:
+        decimal_digits = len(normalized) - normalized.rfind(",") - 1
+        normalized = (
+            normalized.replace(",", ".")
+            if decimal_digits == 2
+            else normalized.replace(",", "")
+        )
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _currency_code_from_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    return {
+        "£": "GBP",
+        "€": "EUR",
+        "$": "USD",
+    }.get(token, token.upper())
 
 
 def _confidence(field: Any) -> float:

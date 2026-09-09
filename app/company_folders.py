@@ -7,6 +7,18 @@ from pathlib import PurePosixPath
 INVOICES_ROOT = "Invoices"
 INCOMING_INVOICES_FOLDER = "Invoices/Incoming Invoices"
 REJECTED_INVOICES_FOLDER = "Invoices/Rejected Invoices"
+STATEMENTS_ROOT = "Statements"
+
+
+def statement_company_folder(company: str) -> str:
+    normalized_company = company.strip()
+    if (
+        not normalized_company
+        or "/" in normalized_company
+        or normalized_company in {".", ".."}
+    ):
+        raise ValueError("A valid company name is required for statement filing.")
+    return str(PurePosixPath(STATEMENTS_ROOT) / normalized_company)
 
 
 @dataclass(frozen=True)

@@ -80,6 +80,9 @@ FIELD_COLUMNS: dict[str, str] = {
     "size_bytes": "size_bytes",
     "status": "status",
     "created_at": "created_at",
+    "document_type": "document_type",
+    "document_classification_confidence": "document_classification_confidence",
+    "document_classification_reason": "document_classification_reason",
     "sharepoint_item_id": "sharepoint_item_id",
     "sharepoint_web_url": "sharepoint_web_url",
     "irj_number": "irj_number",
@@ -285,6 +288,13 @@ class SharePointInvoiceStore:
         item = self._get_item(invoice_id)
         return self._item_to_record(item) if item is not None else None
 
+    def get_by_irj_number(self, irj_number: str) -> InvoiceRecord | None:
+        key = irj_number.strip().casefold()
+        for record in self.list(limit=500):
+            if (record.irj_number or "").strip().casefold() == key:
+                return record
+        return None
+
     def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
         for record in self.list(limit=500):
             if record.sharepoint_item_id == item_id:
@@ -334,6 +344,16 @@ class SharePointInvoiceStore:
         if record is None:
             raise KeyError(f"Invoice {invoice_id} was not found.")
         return record
+
+    def delete(self, invoice_id: int) -> None:
+        url = f"{self._list_base_url()}/items/{invoice_id}"
+        response = self.http_client.delete(
+            url,
+            headers={"Authorization": f"******"},
+        )
+        if response.status_code == 404:
+            raise KeyError(f"Invoice {invoice_id} was not found.")
+        self._raise_for_status(response, "delete item")
 
     # ------------------------------------------------------------------
     # Graph API calls against /sites/{site-id}/lists/{list-id}

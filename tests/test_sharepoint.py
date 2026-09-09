@@ -111,6 +111,73 @@ def test_lists_nested_sharepoint_folder_paths_with_pagination() -> None:
     ]
 
 
+def test_lists_statement_pdfs_by_direct_company_folder() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert "Authorization" in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "value": [
+                    {
+                        "id": "statements",
+                        "name": "Statements",
+                        "folder": {},
+                        "parentReference": {"path": "/drives/drive/root:"},
+                    },
+                    {
+                        "id": "acme-folder",
+                        "name": "Acme Trading Ltd",
+                        "folder": {},
+                        "parentReference": {
+                            "path": "/drives/drive/root:/Statements"
+                        },
+                    },
+                    {
+                        "id": "statement-1",
+                        "name": "September statement.pdf",
+                        "size": 2048,
+                        "file": {"mimeType": "application/pdf"},
+                        "webUrl": "https://sharepoint.example/statement-1",
+                        "lastModifiedDateTime": "2026-09-09T08:00:00Z",
+                        "parentReference": {
+                            "path": (
+                                "/drives/drive/root:/Statements/"
+                                "Acme Trading Ltd"
+                            )
+                        },
+                    },
+                    {
+                        "id": "nested-statement",
+                        "name": "nested.pdf",
+                        "file": {"mimeType": "application/pdf"},
+                        "parentReference": {
+                            "path": (
+                                "/drives/drive/root:/Statements/"
+                                "Acme Trading Ltd/Unexpected"
+                            )
+                        },
+                    },
+                ]
+            },
+        )
+
+    library = _client(
+        httpx.MockTransport(respond)
+    ).list_statement_library()
+
+    assert list(library) == ["Acme Trading Ltd"]
+    assert library["Acme Trading Ltd"] == [
+        {
+            "id": "statement-1",
+            "name": "September statement.pdf",
+            "size": 2048,
+            "webUrl": "https://sharepoint.example/statement-1",
+            "createdDateTime": None,
+            "lastModifiedDateTime": "2026-09-09T08:00:00Z",
+        }
+    ]
+
+
 def test_folder_listing_surfaces_graph_error() -> None:
     client = _client(
         httpx.MockTransport(
@@ -127,6 +194,21 @@ def test_folder_listing_surfaces_graph_error() -> None:
         assert "forbidden-request" in str(error)
     else:
         raise AssertionError("Expected SharePointError")
+
+
+def test_deletes_sharepoint_drive_item() -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    _client(httpx.MockTransport(respond)).delete_item("invoice/item")
+
+    assert len(requests) == 1
+    assert requests[0].method == "DELETE"
+    assert requests[0].url.raw_path == b"/v1.0/drives/drive/items/invoice%2Fitem"
+    assert requests[0].headers["Authorization"].startswith("Bearer ")
 
 
 def test_move_resolves_existing_folders_without_unsupported_graph_filter() -> None:
@@ -223,6 +305,7 @@ class FakeIncomingClient:
             "createdDateTime": "2026-09-08T10:00:00Z",
         }
         self.uploads: list[tuple[str, bytes]] = []
+        self.deleted_items: list[str] = []
 
     def list_incoming_pdfs(self) -> list[dict[str, object]]:
         return [self.item]
@@ -236,6 +319,9 @@ class FakeIncomingClient:
     ) -> dict[str, object]:
         self.uploads.append((filename, content))
         return self.item
+
+    def delete_item(self, item_id: str) -> None:
+        self.deleted_items.append(item_id)
 
     def get_item_web_url(self, item: dict[str, object]) -> str | None:
         value = item.get("webUrl")
@@ -341,6 +427,37 @@ def test_manual_upload_uses_sharepoint_incoming_as_source(
         ("supplier-invoice.pdf", VALID_PDF_BYTES)
     ]
     assert response.json()["sharepoint_item_id"] == "drive-item-1"
+
+
+def test_delete_invoice_removes_sharepoint_drive_item(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("app.main.ai_extraction_configured", lambda: False)
+    fake_client = FakeIncomingClient()
+    app = create_app(
+        invoice_store=InvoiceStore(tmp_path / "invoices.db"),
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        activity_feed=ActivityFeedStore(tmp_path / "activity.db"),
+        notification_store=OutlookNotificationStore(tmp_path / "notifications.db"),
+        sharepoint_client=cast(SharePointClient, fake_client),
+    )
+    client = TestClient(app)
+    client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    )
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("supplier-invoice.pdf", VALID_PDF_BYTES, "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+
+    deleted = client.delete(f"/api/invoices/{invoice_id}")
+
+    assert deleted.status_code == 200
+    assert fake_client.deleted_items == ["drive-item-1"]
+    assert client.get(f"/api/invoices/{invoice_id}").status_code == 404
 
 
 def test_manual_upload_rejects_malformed_pdf_before_sharepoint(

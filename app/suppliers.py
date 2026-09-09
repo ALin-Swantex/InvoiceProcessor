@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.config_db import connect
+from app.invoice_number_validation import validate_invoice_number_pattern
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +29,7 @@ class SupplierProfile:
     aliases: tuple[str, ...] = ()
     default_company: str | None = None
     contact_email: str | None = None
+    invoice_number_pattern: str | None = None
 
 
 _DEFAULT_SUPPLIERS: list[SupplierProfile] = [
@@ -67,12 +69,19 @@ class SupplierStore:
         aliases: list[str] | None = None,
         default_company: str | None = None,
         contact_email: str | None = None,
+        invoice_number_pattern: str | None = None,
     ) -> SupplierProfile:
+        normalized_name = name.strip()
+        normalized_aliases = _normalize_aliases(aliases or [])
+        self._ensure_identifiers_available(normalized_name, normalized_aliases)
         profile = SupplierProfile(
-            name=name,
-            aliases=tuple(aliases or []),
+            name=normalized_name,
+            aliases=normalized_aliases,
             default_company=default_company,
             contact_email=contact_email,
+            invoice_number_pattern=validate_invoice_number_pattern(
+                invoice_number_pattern
+            ),
         )
         with self._connect() as connection:
             try:
@@ -83,49 +92,100 @@ class SupplierStore:
         return profile
 
     def update(self, name: str, **fields: object) -> SupplierProfile:
-        allowed = {"aliases", "default_company", "contact_email"}
+        existing = self.get(name)
+        if existing is None:
+            raise KeyError(f"Supplier '{name}' was not found.")
+        allowed = {
+            "aliases",
+            "default_company",
+            "contact_email",
+            "invoice_number_pattern",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unknown supplier fields: {', '.join(sorted(unknown))}.")
         if "aliases" in fields and isinstance(fields["aliases"], (list, tuple)):
-            fields["aliases"] = ",".join(fields["aliases"])
+            aliases = _normalize_aliases(fields["aliases"])
+            self._ensure_identifiers_available(
+                existing.name,
+                aliases,
+                excluding_name=existing.name,
+            )
+            fields["aliases"] = ",".join(aliases)
+        if "invoice_number_pattern" in fields:
+            fields["invoice_number_pattern"] = validate_invoice_number_pattern(
+                fields["invoice_number_pattern"]
+                if isinstance(fields["invoice_number_pattern"], str)
+                else None
+            )
         if not fields:
-            existing = self.get(name)
-            if existing is None:
-                raise KeyError(f"Supplier '{name}' was not found.")
             return existing
         assignments = ", ".join(f"{key} = ?" for key in fields)
         with self._connect() as connection:
             cursor = connection.execute(
                 f"UPDATE suppliers SET {assignments} WHERE name = ?",
-                (*fields.values(), name),
+                (*fields.values(), existing.name),
             )
             connection.commit()
             if cursor.rowcount == 0:
                 raise KeyError(f"Supplier '{name}' was not found.")
-        updated = self.get(name)
+        updated = self.get(existing.name)
         if updated is None:
             raise RuntimeError(f"Supplier '{name}' disappeared after it was updated.")
         return updated
 
     def delete(self, name: str) -> None:
+        existing = self.get(name)
+        if existing is None:
+            raise KeyError(f"Supplier '{name}' was not found.")
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM suppliers WHERE name = ?", (name,))
+            cursor = connection.execute(
+                "DELETE FROM suppliers WHERE name = ?",
+                (existing.name,),
+            )
             connection.commit()
             if cursor.rowcount == 0:
                 raise KeyError(f"Supplier '{name}' was not found.")
 
+    def _ensure_identifiers_available(
+        self,
+        name: str,
+        aliases: tuple[str, ...],
+        *,
+        excluding_name: str | None = None,
+    ) -> None:
+        if not name:
+            raise ValueError("A supplier name is required.")
+        excluded_key = excluding_name.strip().casefold() if excluding_name else None
+        requested = {name.casefold(), *(alias.casefold() for alias in aliases)}
+        for profile in self.list():
+            if profile.name.strip().casefold() == excluded_key:
+                continue
+            existing = {
+                profile.name.strip().casefold(),
+                *(alias.strip().casefold() for alias in profile.aliases),
+            }
+            if requested & existing:
+                raise ValueError(
+                    "Supplier names and aliases must be unique regardless of "
+                    "capitalisation."
+                )
+
     def _insert(self, connection: sqlite3.Connection, profile: SupplierProfile) -> None:
         connection.execute(
             """
-            INSERT INTO suppliers (name, aliases, default_company, contact_email)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO suppliers (
+                name, aliases, default_company, contact_email,
+                invoice_number_pattern
+            )
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 profile.name,
                 ",".join(profile.aliases),
                 profile.default_company,
                 profile.contact_email,
+                profile.invoice_number_pattern,
             ),
         )
 
@@ -140,7 +200,20 @@ def _row_to_profile(row: sqlite3.Row) -> SupplierProfile:
         aliases=aliases,
         default_company=row["default_company"],
         contact_email=row["contact_email"],
+        invoice_number_pattern=row["invoice_number_pattern"],
     )
+
+
+def _normalize_aliases(aliases: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        value = str(alias).strip()
+        key = value.casefold()
+        if value and key not in seen:
+            normalized.append(value)
+            seen.add(key)
+    return tuple(normalized)
 
 
 _default_store: SupplierStore | None = None

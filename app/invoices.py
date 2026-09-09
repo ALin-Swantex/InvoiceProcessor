@@ -32,6 +32,9 @@ ON invoices(created_at DESC);
 # they can be added with ALTER TABLE without a separate migration tool.
 # Every store instance ensures these exist on start-up.
 LIFECYCLE_COLUMNS: dict[str, str] = {
+    "document_type": "TEXT NOT NULL DEFAULT 'invoice'",
+    "document_classification_confidence": "REAL",
+    "document_classification_reason": "TEXT",
     "sharepoint_item_id": "TEXT",
     "sharepoint_web_url": "TEXT",
     "irj_number": "TEXT",
@@ -103,6 +106,9 @@ class InvoiceRecord:
     size_bytes: int | None
     status: str
     created_at: str
+    document_type: str = "invoice"
+    document_classification_confidence: float | None = None
+    document_classification_reason: str | None = None
     sharepoint_item_id: str | None = None
     sharepoint_web_url: str | None = None
     irj_number: str | None = None
@@ -165,6 +171,14 @@ class InvoiceStore:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
             self._ensure_lifecycle_columns(connection)
+            connection.execute(
+                """
+                UPDATE invoices
+                SET irj_number = substr(irj_number, 5)
+                WHERE irj_number GLOB 'IRJ-[0-9][0-9][0-9][0-9][0-9][0-9]'
+                  AND length(irj_number) = 10
+                """
+            )
             connection.commit()
 
     def add_from_outlook(
@@ -272,6 +286,18 @@ class InvoiceStore:
             ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
 
+    def get_by_irj_number(self, irj_number: str) -> InvoiceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM invoices
+                WHERE upper(trim(irj_number)) = upper(trim(?))
+                LIMIT 1
+                """,
+                (irj_number,),
+            ).fetchone()
+        return InvoiceRecord(**dict(row)) if row is not None else None
+
     def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -345,6 +371,16 @@ class InvoiceStore:
                 "SELECT * FROM invoices WHERE id = ?", (invoice_id,)
             ).fetchone()
         return InvoiceRecord(**dict(row))
+
+    def delete(self, invoice_id: int) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM invoices WHERE id = ?",
+                (invoice_id,),
+            )
+            connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError(f"Invoice {invoice_id} was not found.")
 
     @staticmethod
     def _ensure_lifecycle_columns(connection: sqlite3.Connection) -> None:

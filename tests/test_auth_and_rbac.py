@@ -112,6 +112,29 @@ def test_login_fails_with_wrong_password(tmp_path: Path) -> None:
     assert response.status_code == 401
 
 
+def test_supplier_names_and_aliases_are_case_insensitive(tmp_path: Path) -> None:
+    suppliers = SupplierStore(tmp_path / "config.db")
+    profile = suppliers.create(
+        name="Case Sensitive Supplies",
+        aliases=["CSS Limited"],
+    )
+
+    assert suppliers.get("case sensitive supplies") == profile
+    assert suppliers.get("css limited") == profile
+    with pytest.raises(ValueError, match="regardless of capitalisation"):
+        suppliers.create(name="CASE SENSITIVE SUPPLIES")
+    with pytest.raises(ValueError, match="regardless of capitalisation"):
+        suppliers.create(name="Another Supplier", aliases=["css LIMITED"])
+
+    updated = suppliers.update(
+        "CASE SENSITIVE SUPPLIES",
+        contact_email="accounts@example.test",
+    )
+    assert updated.contact_email == "accounts@example.test"
+    suppliers.delete("case SENSITIVE supplies")
+    assert suppliers.get("Case Sensitive Supplies") is None
+
+
 def test_me_requires_authentication(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     response = client.get("/api/auth/me")
@@ -234,7 +257,11 @@ def test_admin_can_manage_companies_suppliers_and_matrix(tmp_path: Path) -> None
 
     supplier = client.post(
         "/api/admin/suppliers",
-        json={"name": "New Supplier", "contact_email": "ns@example.test"},
+        json={
+            "name": "New Supplier",
+            "contact_email": "ns@example.test",
+            "invoice_number_pattern": "INV-######",
+        },
     )
     assert supplier.status_code == 200
     supplier_updated = client.put(
@@ -243,11 +270,13 @@ def test_admin_can_manage_companies_suppliers_and_matrix(tmp_path: Path) -> None
             "aliases": ["Supplier Alias"],
             "default_company": "New Co Ltd",
             "contact_email": None,
+            "invoice_number_pattern": "########@@@",
         },
     )
     assert supplier_updated.status_code == 200, supplier_updated.text
     assert supplier_updated.json()["default_company"] == "New Co Ltd"
     assert supplier_updated.json()["contact_email"] is None
+    assert supplier_updated.json()["invoice_number_pattern"] == "########@@@"
 
     matrix_entry = client.post(
         "/api/admin/approval-matrix",
@@ -315,6 +344,41 @@ def test_flagged_invoice_can_be_accepted_back_to_its_workflow_stage(
     assert accepted.json()["status"] == "Awaiting AI Extraction"
     assert accepted.json()["review_reason"] is None
     assert accepted.json()["review_return_status"] is None
+
+
+def test_purchase_ledger_can_delete_invoice_before_approval(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("delete-me.pdf", VALID_PDF_BYTES, "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    stored_path = Path(upload.json()["stored_path"])
+
+    deleted = client.delete(f"/api/invoices/{invoice_id}")
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"id": invoice_id, "deleted": True}
+    assert client.get(f"/api/invoices/{invoice_id}").status_code == 404
+    assert not stored_path.exists()
+
+
+def test_invoice_cannot_be_deleted_after_approval_starts(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    invoice_id = _upload_and_confirm(client, supplier_invoice_number="NO-DELETE")
+    client.app.state.invoice_store.update_fields(
+        invoice_id,
+        status="Awaiting Approval 1",
+    )
+
+    deleted = client.delete(f"/api/invoices/{invoice_id}")
+
+    assert deleted.status_code == 422
+    assert "before they enter approval or payment" in deleted.json()["detail"]
+    assert client.get(f"/api/invoices/{invoice_id}").status_code == 200
 
 
 def test_flagged_invoice_can_be_rejected_during_review(tmp_path: Path) -> None:

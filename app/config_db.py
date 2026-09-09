@@ -37,8 +37,12 @@ CREATE TABLE IF NOT EXISTS suppliers (
     name TEXT PRIMARY KEY,
     aliases TEXT NOT NULL DEFAULT '',
     default_company TEXT,
-    contact_email TEXT
+    contact_email TEXT,
+    invoice_number_pattern TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_name_nocase
+ON suppliers(name COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS approval_matrix (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +90,14 @@ def connect(database_path: Path | None = None) -> sqlite3.Connection:
     if "sharepoint_root_folder" not in company_columns:
         connection.execute(
             "ALTER TABLE companies ADD COLUMN sharepoint_root_folder TEXT"
+        )
+    supplier_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(suppliers)").fetchall()
+    }
+    if "invoice_number_pattern" not in supplier_columns:
+        connection.execute(
+            "ALTER TABLE suppliers ADD COLUMN invoice_number_pattern TEXT"
         )
     connection.execute(
         """
