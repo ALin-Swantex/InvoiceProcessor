@@ -162,7 +162,7 @@ def test_postgres_irj_generation_is_atomic() -> None:
         connection_factory=lambda: FakeConnection(cursor)
     )
 
-    assert generator.generate() == "IRJ-000042"
+    assert generator.generate() == "000042"
 
     sql, parameters = cursor.calls[0]
     assert "ON CONFLICT (id) DO UPDATE" in sql
@@ -184,6 +184,42 @@ def test_authoritative_schema_contains_current_and_company_scoped_tables() -> No
     assert "CREATE TABLE approval_matrix" in schema
     assert "CREATE TABLE supplier_terms" in schema
     assert "ENABLE ROW LEVEL SECURITY" not in schema
+
+
+def test_document_classification_migration_adds_statement_fields() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "app"
+        / "postgres_migrations"
+        / "002_document_classification.sql"
+    ).read_text()
+
+    assert "document_type text NOT NULL DEFAULT 'invoice'" in migration
+    assert "document_classification_confidence" in migration
+    assert "document_classification_reason" in migration
+
+
+def test_irj_format_migration_removes_legacy_prefix() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "app"
+        / "postgres_migrations"
+        / "003_six_digit_irj_numbers.sql"
+    ).read_text()
+
+    assert "SET irj_number = substring(irj_number FROM 5)" in migration
+    assert "^[0-9]{6}$" in migration
+
+
+def test_supplier_pattern_migration_adds_configuration_field() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "app"
+        / "postgres_migrations"
+        / "004_supplier_invoice_number_patterns.sql"
+    ).read_text()
+
+    assert "ADD COLUMN invoice_number_pattern text" in migration
 
 
 def test_insecure_remote_postgres_sslmode_is_rejected() -> None:

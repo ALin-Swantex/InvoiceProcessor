@@ -174,6 +174,17 @@ class PostgresInvoiceStore:
                 row = cursor.fetchone()
         return self._record(row) if row is not None else None
 
+    def get_by_irj_number(self, irj_number: str) -> InvoiceRecord | None:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT {_SELECT_COLUMNS} FROM invoices "
+                    "WHERE upper(btrim(irj_number)) = upper(btrim(%s)) LIMIT 1",
+                    (irj_number,),
+                )
+                row = cursor.fetchone()
+        return self._record(row) if row is not None else None
+
     def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
@@ -240,6 +251,17 @@ class PostgresInvoiceStore:
         if row is None:
             raise KeyError(f"Invoice {invoice_id} was not found.")
         return self._record(row)
+
+    def delete(self, invoice_id: int) -> None:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM invoices WHERE id = %s RETURNING id",
+                    (invoice_id,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise KeyError(f"Invoice {invoice_id} was not found.")
 
     def _query_many(
         self, sql: str, parameters: tuple[object, ...]

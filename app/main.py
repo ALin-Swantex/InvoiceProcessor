@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
 from app.ai_extraction import ai_extraction_configured
-from app.approval_matrix import ApprovalMatrixStore
+from app.approval_matrix import ALL_COMPANIES, ApprovalMatrixStore
 from app.auth import (
     AuthError,
     AuthStore,
@@ -142,6 +142,10 @@ class ReviewDecisionRequest(BaseModel):
     reason: str | None = None
 
 
+class StatementFileRequest(BaseModel):
+    company: str
+
+
 class PaymentRequest(BaseModel):
     payment_date: str
     supplier_account_number: str | None = None
@@ -200,12 +204,14 @@ class SupplierRequest(BaseModel):
     aliases: list[str] | None = None
     default_company: str | None = None
     contact_email: str | None = None
+    invoice_number_pattern: str | None = None
 
 
 class SupplierUpdateRequest(BaseModel):
     aliases: list[str] | None = None
     default_company: str | None = None
     contact_email: str | None = None
+    invoice_number_pattern: str | None = None
 
 
 class ApprovalMatrixRequest(BaseModel):
@@ -567,10 +573,26 @@ def create_app(
               display: flex; gap: .65rem; justify-content: flex-end; flex-wrap: wrap;
               padding: 1rem; border-top: 1px solid #e4e7eb; background: #f8fafc;
             }
+            #delete-invoice-button { margin-right: auto; }
             button {
-              border: 0; border-radius: 7px; padding: .65rem .9rem;
+              border: 1px solid transparent; border-radius: 7px; padding: .65rem .9rem;
               font: inherit; font-weight: 700; cursor: pointer;
+              transition: transform .08s ease, box-shadow .12s ease,
+                background-color .12s ease, border-color .12s ease;
             }
+            button:not(:disabled):hover {
+              transform: translateY(-1px);
+              box-shadow: 0 3px 8px rgba(16, 42, 67, .16);
+            }
+            button:not(:disabled):active {
+              transform: translateY(1px);
+              box-shadow: inset 0 2px 4px rgba(16, 42, 67, .2);
+            }
+            button:focus-visible, a.action-link:focus-visible {
+              outline: 3px solid rgba(47, 128, 237, .35);
+              outline-offset: 2px;
+            }
+            button[aria-busy="true"] { cursor: wait; }
             button:disabled { background: #d9e2ec; color: #829ab1; cursor: not-allowed; }
             .secondary { background: white; border: 1px solid #bcccdc; color: #486581; }
             .secondary:disabled { border: 1px solid #bcccdc; background: white; }
@@ -595,8 +617,8 @@ def create_app(
               background: #e8f2ff;
             }
             .invoice-expand-hint {
-              display: block; margin-top: .25rem; color: #627d98;
-              font-size: .7rem; font-weight: 600;
+              display: block; padding-top: .45rem; border-top: 1px solid #d9e2ec;
+              color: #52606d; font-size: .7rem; font-weight: 700;
             }
             .invoice-analysis-cell {
               padding: 0 !important; background: #f8fbff;
@@ -643,8 +665,36 @@ def create_app(
             }
             table.section-table th { color: #52606d; font-size: .72rem; text-transform: uppercase; }
             table.section-table tr:last-child td { border-bottom: 0; }
-            .row-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
-            .row-actions button { padding: .4rem .6rem; font-size: .78rem; }
+            .row-actions {
+              display: grid; gap: .45rem; min-width: 190px;
+            }
+            .row-action-buttons {
+              display: flex; align-items: center; gap: .45rem; flex-wrap: wrap;
+            }
+            .row-action-buttons button, a.action-link {
+              display: inline-flex; align-items: center; justify-content: center;
+              min-height: 34px; padding: .42rem .68rem; border-radius: 7px;
+              font-size: .76rem; font-weight: 700; line-height: 1.2;
+              text-decoration: none; white-space: nowrap; text-align: center;
+            }
+            a.action-link {
+              border: 1px solid #8aacc8; background: #eef6ff; color: #185b91;
+              transition: transform .08s ease, box-shadow .12s ease,
+                background-color .12s ease;
+            }
+            a.action-link:hover {
+              background: #dceeff; transform: translateY(-1px);
+              box-shadow: 0 3px 8px rgba(16, 42, 67, .14);
+            }
+            a.action-link:active {
+              transform: translateY(1px);
+              box-shadow: inset 0 2px 4px rgba(16, 42, 67, .18);
+            }
+            .row-action-buttons select {
+              flex: 1 1 180px; min-width: 160px; min-height: 34px;
+              padding: .4rem .55rem;
+            }
+            .tab-panel > .card > .content { overflow-x: auto; }
             .empty-state { padding: 2rem; text-align: center; color: #7b8794; }
             #toast-container {
               position: fixed; top: 1rem; right: 1rem; z-index: 1000;
@@ -754,6 +804,29 @@ def create_app(
               transform: rotate(180deg);
             }
             .admin-collapsible-content { padding: 1rem; }
+            .admin-company-groups {
+              display: grid; gap: .65rem; margin-top: .85rem;
+            }
+            details.admin-company-group {
+              overflow: hidden; border: 1px solid #d9e2ec;
+              border-radius: 10px; background: white;
+            }
+            details.admin-company-group > summary {
+              display: flex; align-items: center; justify-content: space-between;
+              gap: .75rem; padding: .8rem 1rem; cursor: pointer;
+              color: #243b53; background: #f8fafc; font-weight: 700;
+              list-style: none; user-select: none;
+            }
+            details.admin-company-group > summary::-webkit-details-marker {
+              display: none;
+            }
+            details.admin-company-group > summary::after {
+              content: "⌄"; color: #52606d; transition: transform .15s ease;
+            }
+            details.admin-company-group[open] > summary::after {
+              transform: rotate(180deg);
+            }
+            .admin-company-group-content { padding: .75rem; }
             .admin-help {
               max-width: 82ch; margin: 0 0 .9rem; color: #52606d;
               font-size: .82rem; line-height: 1.5;
@@ -897,8 +970,10 @@ def create_app(
               <p>Invoice Processing</p>
             </div>
             <nav class="section-nav" id="section-nav">
-              <button data-tab="incoming" class="active">Incoming<span class="count" id="count-incoming">0</span></button>
-              <button data-tab="needs-review">Flagged Invoices<span class="count" id="count-needs-review">0</span></button>
+              <button data-tab="search" class="active">Search invoices</button>
+              <button data-tab="statements">Statements</button>
+              <button data-tab="incoming">Incoming<span class="count" id="count-incoming">0</span></button>
+              <button data-tab="needs-review">Flagged<span class="count" id="count-needs-review">0</span></button>
               <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
               <button data-tab="sage-registration">Sage Registration<span class="count" id="count-sage-registration">0</span></button>
               <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
@@ -918,7 +993,7 @@ def create_app(
             </div>
           </aside>
           <main>
-            <div class="tab-panel active" data-tab-panel="incoming">
+            <div class="tab-panel" data-tab-panel="incoming">
               <div class="layout">
                 <section class="card" aria-labelledby="document-title">
                   <div class="card-header">
@@ -982,32 +1057,36 @@ def create_app(
                       <label style="grid-column: 1 / -1">Email subject<input id="source-subject" disabled placeholder="Email subject"></label>
                     </div>
 
-                    <h3 class="section-title">Invoice identity (AI extraction preview — read-only)</h3>
+                    <h3 class="section-title">Invoice details (AI-extracted — review and correct before confirming)</h3>
                     <div class="grid">
                       <label>IRJ number
                         <input id="preview-irj" disabled placeholder="Assigned before final filing">
                       </label>
                       <label>Company being invoiced
-                        <input id="preview-company" disabled placeholder="Extracted company">
+                        <select id="preview-company">
+                          <option value="">Select company…</option>
+                        </select>
                       </label>
                       <label>Supplier
-                        <input id="preview-supplier" disabled placeholder="Extracted supplier">
+                        <select id="preview-supplier" disabled>
+                          <option value="">Select a company first…</option>
+                        </select>
                       </label>
                       <label>Supplier invoice number
-                        <input id="preview-supplier-invoice" disabled placeholder="Extracted invoice number">
+                        <input id="preview-supplier-invoice" placeholder="Extracted invoice number">
                       </label>
                       <label>Purchase Order number
-                        <input id="preview-po" disabled placeholder="PO number or not detected">
+                        <input id="preview-po" placeholder="Enter a PO number if one applies">
                       </label>
                       <label>Invoice date
-                        <input id="preview-invoice-date" disabled placeholder="Extracted invoice date">
+                        <input id="preview-invoice-date" type="date">
                       </label>
-                    </div>
-
-                    <h3 class="section-title">Invoice value (AI extraction preview — read-only)</h3>
-                    <div class="grid three">
-                      <label>Invoice value<input id="preview-value" disabled placeholder="0.00"></label>
-                      <label>Currency<input id="preview-currency" disabled placeholder="Currency"></label>
+                      <label>Invoice value
+                        <input id="preview-value" type="number" step="0.01" placeholder="0.00">
+                      </label>
+                      <label>Currency
+                        <input id="preview-currency" value="GBP" placeholder="Currency">
+                      </label>
                     </div>
 
                     <h3 class="section-title">AI extraction status</h3>
@@ -1026,38 +1105,13 @@ def create_app(
                       </label>
                     </div>
 
-                    <h3 class="section-title">Purchase Ledger confirmation (editable — enter or correct any field below, then confirm)</h3>
-                    <div class="grid">
-                      <label>Company
-                        <select id="confirm-company"><option value="">Select company…</option></select>
-                      </label>
-                      <label>Supplier
-                        <select id="confirm-supplier">
-                          <option value="">Select supplier…</option>
-                        </select>
-                      </label>
-                      <label>Supplier invoice number
-                        <input id="confirm-supplier-invoice" placeholder="Supplier's invoice number">
-                      </label>
-                      <label>Purchase Order number
-                        <input id="confirm-po" placeholder="Enter PO number if one applies, even if not shown above">
-                      </label>
-                      <label>Invoice date
-                        <input id="confirm-invoice-date" type="date">
-                      </label>
-                      <label>Invoice value
-                        <input id="confirm-invoice-value" type="number" step="0.01" placeholder="0.00">
-                      </label>
-                      <label>Currency
-                        <input id="confirm-currency" value="GBP">
-                      </label>
-                    </div>
                     <div class="notice" id="duplicate-warning" style="display: none; background: #fef2f2; border-color: #f5b5b5; color: #9b1c1c;">
                       <strong>⚠</strong>
                       <div id="duplicate-warning-text"></div>
                     </div>
                   </div>
                   <div class="actions">
+                    <button class="danger" id="delete-invoice-button">Delete invoice</button>
                     <button class="secondary" id="flag-review-button">Flag for review</button>
                     <button class="danger" id="override-duplicate-button" style="display: none">This is not a duplicate — route anyway</button>
                     <button class="danger" id="cancel-duplicate-button" style="display: none">Confirmed duplicate — cancel</button>
@@ -1068,9 +1122,54 @@ def create_app(
               </div>
             </div>
 
+            <div class="tab-panel active" data-tab-panel="search">
+              <section class="card">
+                <div class="card-header"><h2>Search invoices by IRJ number</h2></div>
+                <div class="content">
+                  <form class="admin-form" id="invoice-search-form">
+                    <input
+                      id="invoice-search-irj"
+                      placeholder="e.g. 000123"
+                      aria-label="IRJ number"
+                      inputmode="numeric"
+                      pattern="[0-9]{6}"
+                      minlength="6"
+                      maxlength="6"
+                      autocomplete="off"
+                      required
+                    >
+                    <button type="submit" class="primary">Search</button>
+                  </form>
+                  <div id="invoice-search-result" class="empty-state">
+                    Enter an IRJ number to find an invoice.
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="statements">
+              <section class="card">
+                <div class="card-header"><h2>Company statements</h2></div>
+                <div class="content">
+                  <p class="admin-help">
+                    Statements are read directly from each SharePoint
+                    <code>Statements/{Company}</code> folder.
+                  </p>
+                  <label>Company
+                    <select id="statement-company">
+                      <option value="">Select company…</option>
+                    </select>
+                  </label>
+                  <div id="statement-list" class="empty-state">
+                    Select a company to view its statements.
+                  </div>
+                </div>
+              </section>
+            </div>
+
             <div class="tab-panel" data-tab-panel="needs-review">
               <section class="card">
-                <div class="card-header"><h2>Flagged Invoices — Purchase Ledger Review</h2></div>
+                <div class="card-header"><h2>Flagged Documents — Purchase Ledger Review</h2></div>
                 <div class="content" id="needs-review-table"></div>
               </section>
             </div>
@@ -1191,6 +1290,11 @@ def create_app(
                         <option value="">No default company</option>
                       </select>
                       <input id="admin-supplier-contact" placeholder="Contact email (optional)">
+                      <input
+                        id="admin-supplier-invoice-pattern"
+                        placeholder="Invoice no. pattern, e.g. ########@@@"
+                        title="# = digit, @ = letter, * = letter or digit"
+                      >
                       <button type="submit" class="primary">Add supplier</button>
                     </form>
                     <div id="admin-suppliers-table"></div>
@@ -1262,7 +1366,7 @@ def create_app(
               "on-hold": ["Approval Query / On Hold"],
               "approved": ["Approved", "Foreign Payment / Awaiting Allocation"],
               "reconciliation": ["Paid / Awaiting Bank Reconciliation"],
-              "complete": ["Reconciled / Complete"],
+              "complete": ["Reconciled / Complete", "Statement Filed"],
               "rejected": ["Rejected", "Cancelled - Duplicate"],
             };
             // Which nav tabs each signed-in role may view. "admin" is a
@@ -1270,11 +1374,11 @@ def create_app(
             // shown to the admin role. Every other tab maps 1:1 onto
             // MANUAL_VS_AUTOMATED.md's manual decision steps.
             const ROLE_TABS = {
-              "admin": ["incoming", "needs-review", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
-              "purchase_ledger": ["incoming", "needs-review", "po-matching", "sage-registration", "on-hold", "approved", "reconciliation", "complete", "rejected"],
-              "approver1": ["approver1"],
-              "approver2": ["approver2"],
-              "purchasing": ["po-matching"],
+              "admin": ["search", "incoming", "statements", "needs-review", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
+              "purchase_ledger": ["search", "incoming", "statements", "needs-review", "po-matching", "sage-registration", "on-hold", "approved", "reconciliation", "complete", "rejected"],
+              "approver1": ["search", "statements", "approver1"],
+              "approver2": ["search", "statements", "approver2"],
+              "purchasing": ["search", "statements", "po-matching"],
             };
 
             const picker = document.getElementById("invoice-picker");
@@ -1287,13 +1391,65 @@ def create_app(
             const appRoot = document.getElementById("app-root");
             let invoices = [];
             let displayedInvoiceId = null;
-            let currentTab = "incoming";
+            const ACTIVE_TAB_STORAGE_KEY = "invoice-processor-active-tab";
+            const SCROLL_STORAGE_PREFIX = "invoice-processor-scroll-";
+            let currentTab = storedValue(ACTIVE_TAB_STORAGE_KEY) || "search";
             let lastActivityId = null;
             let currentUser = null;
+            let invoiceCompanies = [];
             let sharePointCompanyFolders = new Map();
             let adminCompanies = [];
             let adminSuppliers = [];
+            let adminMatrix = [];
+            let adminSupplierTerms = [];
+            let supplierRequestSequence = 0;
+            let invoiceRefreshSequence = 0;
+            let activityPollTimer = null;
+            let invoicePollTimer = null;
             const expandedInvoiceIds = new Set();
+
+            function storedValue(key) {
+              try {
+                return window.localStorage.getItem(key);
+              } catch (error) {
+                return null;
+              }
+            }
+
+            function storeValue(key, value) {
+              try {
+                window.localStorage.setItem(key, value);
+              } catch (error) {
+                // The app remains usable when browser storage is disabled.
+              }
+            }
+
+            function activateTab(tab) {
+              const button = document.querySelector(
+                `#section-nav button[data-tab="${tab}"]`
+              );
+              if (!button || button.style.display === "none") return false;
+              currentTab = tab;
+              storeValue(ACTIVE_TAB_STORAGE_KEY, tab);
+              document.querySelectorAll("#section-nav button").forEach(item => {
+                item.classList.toggle("active", item === button);
+              });
+              document.querySelectorAll(".tab-panel").forEach(panel => {
+                panel.classList.toggle("active", panel.dataset.tabPanel === tab);
+              });
+              const restoreScrollPosition = () => window.requestAnimationFrame(() => {
+                const savedPosition = Number(
+                  storedValue(`${SCROLL_STORAGE_PREFIX}${tab}`) || 0
+                );
+                window.scrollTo(0, Number.isFinite(savedPosition) ? savedPosition : 0);
+              });
+              if (tab === "statements") {
+                loadStatements().finally(restoreScrollPosition);
+              } else {
+                restoreScrollPosition();
+              }
+              return true;
+            }
 
             function setValue(id, value) {
               const el = document.getElementById(id);
@@ -1308,7 +1464,7 @@ def create_app(
               setTimeout(() => toast.remove(), 5000);
             }
 
-            function showInvoice(invoice) {
+            async function showInvoice(invoice) {
               documentBadge.textContent = invoice.original_filename;
               processingBadge.textContent = invoice.status;
               setValue("source-sender", invoice.sender_address || invoice.sender_name);
@@ -1323,13 +1479,6 @@ def create_app(
               document.getElementById("ai-confidence-percent").textContent =
                 confidence == null ? "—" : `${Math.round(Number(confidence) * 100)}%`;
               setValue("preview-irj", invoice.irj_number);
-              setValue("preview-company", invoice.company);
-              setValue("preview-supplier", invoice.supplier);
-              setValue("preview-supplier-invoice", invoice.supplier_invoice_number);
-              setValue("preview-po", invoice.po_number);
-              setValue("preview-invoice-date", invoice.invoice_date);
-              setValue("preview-value", invoice.invoice_value);
-              setValue("preview-currency", invoice.currency);
               setValue(
                 "review-warnings",
                 invoice.ai_review_warnings || invoice.review_reason
@@ -1340,6 +1489,7 @@ def create_app(
               const duplicateWarning = document.getElementById("duplicate-warning");
               const overrideButton = document.getElementById("override-duplicate-button");
               const cancelDuplicateButton = document.getElementById("cancel-duplicate-button");
+              const deleteInvoiceButton = document.getElementById("delete-invoice-button");
               const retryApprovalRouteButton = document.getElementById("retry-approval-route-button");
               if (invoice.duplicate_of_invoice_id) {
                 duplicateWarning.style.display = "grid";
@@ -1359,22 +1509,30 @@ def create_app(
                 invoice.sage_registered_at
                   ? ""
                   : "none";
+              deleteInvoiceButton.disabled = ![
+                "Awaiting AI Extraction",
+                "Needs Review",
+                "Awaiting PO Matching",
+                "PO Query / Matching Issue",
+                "Awaiting Sage Registration",
+              ].includes(invoice.status);
               if (displayedInvoiceId !== invoice.id) {
-                // Only (re)populate the editable confirm-* fields when the
+                // Only (re)populate editable AI fields when the
                 // displayed invoice actually changes. showInvoice() is also
                 // called on every periodic refresh (loadInvoices runs every
                 // 5s); without this guard it would keep stomping on
                 // whatever the user is actively typing into these fields
                 // with the invoice's last-saved (often blank) values.
-                setValue("confirm-company", invoice.company || "");
-                setValue("confirm-supplier", invoice.supplier);
-                setValue("confirm-supplier-invoice", invoice.supplier_invoice_number);
-                setValue("confirm-po", invoice.po_number);
-                setValue("confirm-invoice-date", invoice.invoice_date);
-                setValue("confirm-invoice-value", invoice.invoice_value);
-                setValue("confirm-currency", invoice.currency || "GBP");
-                pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
+                setValue("preview-company", invoice.company || "");
                 displayedInvoiceId = invoice.id;
+                await loadSuppliers(invoice.company || "", invoice.supplier || "");
+                if (displayedInvoiceId !== invoice.id) return;
+                setValue("preview-supplier-invoice", invoice.supplier_invoice_number);
+                setValue("preview-po", invoice.po_number);
+                setValue("preview-invoice-date", invoice.invoice_date);
+                setValue("preview-value", invoice.invoice_value);
+                setValue("preview-currency", invoice.currency || "GBP");
+                pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
               }
               pdfFrame.style.display = "block";
               pdfEmpty.style.display = "none";
@@ -1382,14 +1540,53 @@ def create_app(
 
             function incomingInvoices() {
               return invoices.filter(i =>
-                SECTION_STATUSES["incoming"].includes(i.status) ||
-                SECTION_STATUSES["needs-review"].includes(i.status)
+                i.document_type !== "statement" && (
+                  SECTION_STATUSES["incoming"].includes(i.status) ||
+                  SECTION_STATUSES["needs-review"].includes(i.status)
+                )
               );
             }
 
-            function refreshPicker() {
+            function clearInvoicePreview() {
+              picker.innerHTML = '<option value="">No invoices awaiting review</option>';
+              displayedInvoiceId = null;
+              documentBadge.textContent = "No invoice selected";
+              processingBadge.textContent = "Awaiting invoice";
+              [
+                "source-sender",
+                "source-received",
+                "source-subject",
+                "processing-status",
+                "ai-confidence",
+                "preview-irj",
+                "review-warnings",
+                "preview-company",
+                "preview-supplier-invoice",
+                "preview-po",
+                "preview-invoice-date",
+                "preview-value",
+              ].forEach(id => setValue(id, ""));
+              setValue("preview-currency", "GBP");
+              document.getElementById("ai-confidence-percent").textContent = "—";
+              document.getElementById("preview-supplier").innerHTML =
+                '<option value="">Select a company first…</option>';
+              document.getElementById("preview-supplier").disabled = true;
+              document.getElementById("duplicate-warning").style.display = "none";
+              document.getElementById("override-duplicate-button").style.display = "none";
+              document.getElementById("cancel-duplicate-button").style.display = "none";
+              document.getElementById("retry-approval-route-button").style.display = "none";
+              document.getElementById("delete-invoice-button").disabled = true;
+              pdfFrame.removeAttribute("src");
+              pdfFrame.style.display = "none";
+              pdfEmpty.style.display = "grid";
+            }
+
+            async function refreshPicker() {
               const candidates = incomingInvoices();
-              if (!candidates.length) return;
+              if (!candidates.length) {
+                clearInvoicePreview();
+                return;
+              }
               const selectedId = picker.value;
               picker.innerHTML = "";
               for (const invoice of candidates) {
@@ -1402,34 +1599,46 @@ def create_app(
                 invoice => String(invoice.id) === selectedId
               ) || candidates[0];
               picker.value = String(selected.id);
-              showInvoice(selected);
+              await showInvoice(selected);
             }
 
-            picker.addEventListener("change", () => {
+            picker.addEventListener("change", async () => {
               const selected = invoices.find(
                 invoice => String(invoice.id) === picker.value
               );
-              if (selected) showInvoice(selected);
+              if (selected) await showInvoice(selected);
             });
 
             async function loadInvoices() {
-              const response = await fetch("/api/invoices?limit=500");
-              if (!response.ok) {
+              const requestSequence = ++invoiceRefreshSequence;
+              try {
+                const response = await fetch(
+                  "/api/invoices?limit=500",
+                  { cache: "no-store" }
+                );
+                if (!response.ok) {
+                  document.getElementById("intake-notice").textContent =
+                    "Received invoices could not be loaded.";
+                  return;
+                }
+                const refreshedInvoices = await response.json();
+                if (requestSequence !== invoiceRefreshSequence) return;
+                invoices = refreshedInvoices;
+                renderAllSections();
+                updateCounts();
+                await refreshPicker();
+              } catch (error) {
                 document.getElementById("intake-notice").textContent =
-                  "Received invoices could not be loaded.";
-                return;
+                  "Received invoices could not be loaded. Retrying automatically.";
               }
-              invoices = await response.json();
-              refreshPicker();
-              renderAllSections();
-              updateCounts();
             }
 
             async function loadCompanies() {
               const response = await fetch("/api/companies");
               if (!response.ok) return;
               const companies = await response.json();
-              const select = document.getElementById("confirm-company");
+              invoiceCompanies = companies;
+              const select = document.getElementById("preview-company");
               select.innerHTML = '<option value="">Select company…</option>';
               for (const company of companies) {
                 const option = document.createElement("option");
@@ -1439,12 +1648,24 @@ def create_app(
               }
             }
 
-            async function loadSuppliers() {
-              const response = await fetch("/api/suppliers");
+            async function loadSuppliers(
+              company = document.getElementById("preview-company").value,
+              selectedSupplier = document.getElementById("preview-supplier").value
+            ) {
+              const requestSequence = ++supplierRequestSequence;
+              const select = document.getElementById("preview-supplier");
+              if (!company) {
+                select.innerHTML = '<option value="">Select a company first…</option>';
+                select.disabled = true;
+                return;
+              }
+              const response = await fetch(
+                `/api/suppliers?company=${encodeURIComponent(company)}`
+              );
               if (!response.ok) return;
               const suppliers = await response.json();
-              const select = document.getElementById("confirm-supplier");
-              const selected = select.value;
+              if (requestSequence !== supplierRequestSequence) return;
+              select.disabled = false;
               select.innerHTML = '<option value="">Select supplier…</option>';
               for (const supplier of suppliers) {
                 const option = document.createElement("option");
@@ -1452,14 +1673,23 @@ def create_app(
                 option.textContent = supplier.name;
                 select.appendChild(option);
               }
-              if (selected && !suppliers.some(supplier => supplier.name === selected)) {
+              if (
+                selectedSupplier &&
+                !suppliers.some(supplier => supplier.name === selectedSupplier)
+              ) {
                 const option = document.createElement("option");
-                option.value = selected;
-                option.textContent = `${selected} (not in supplier register)`;
+                option.value = selectedSupplier;
+                option.textContent =
+                  `${selectedSupplier} (not configured for this company)`;
                 select.appendChild(option);
               }
-              select.value = selected;
+              select.value = selectedSupplier;
             }
+
+            document.getElementById("preview-company").addEventListener(
+              "change",
+              event => loadSuppliers(event.target.value, "")
+            );
 
             function updateCounts() {
               for (const tab of Object.keys(SECTION_STATUSES)) {
@@ -1510,13 +1740,20 @@ def create_app(
                   <iframe
                     class="invoice-analysis-pdf"
                     src="/api/invoices/${invoice.id}/pdf"
-                    title="Invoice ${escapeHtml(invoice.irj_number || invoice.original_filename)} PDF"
+                    title="${invoice.document_type === "statement" ? "Statement" : "Invoice"} ${escapeHtml(invoice.irj_number || invoice.original_filename)} PDF"
                   ></iframe>
                   <section class="invoice-analysis-fields" aria-label="Invoice analysis">
-                    <h3>Extracted invoice analysis</h3>
+                    <h3>${invoice.document_type === "statement" ? "Statement classification" : "Extracted invoice analysis"}</h3>
                     <h4>Workflow</h4>
                     <dl class="invoice-analysis-list">
                       ${analysisField("Status", invoice.status)}
+                      ${analysisField("Document type", invoice.document_type || "invoice")}
+                      ${analysisField(
+                        "Classification confidence",
+                        invoice.document_classification_confidence == null
+                          ? null
+                          : `${Math.round(Number(invoice.document_classification_confidence) * 100)}%`
+                      )}
                       ${analysisField("IRJ number", invoice.irj_number)}
                       ${analysisField("Invoice type", invoice.invoice_type)}
                       ${analysisField("Overall confidence", overallConfidence)}
@@ -1559,7 +1796,7 @@ def create_app(
               if (!container) return;
               const rows = invoices.filter(i => statuses.includes(i.status));
               if (!rows.length) {
-                container.innerHTML = '<div class="empty-state">No invoices in this section.</div>';
+                container.innerHTML = '<div class="empty-state">No documents in this section.</div>';
                 return;
               }
               let html = '<table class="section-table"><thead><tr>';
@@ -1572,7 +1809,8 @@ def create_app(
                 for (const column of columns) {
                   html += `<td>${escapeHtml(column.value(invoice))}</td>`;
                 }
-                html += `<td class="row-actions">${actionsFn(invoice)}` +
+                html += `<td class="row-actions"><div class="row-action-buttons">` +
+                  `${actionsFn(invoice)}</div>` +
                   `<span class="invoice-expand-hint">${expanded ? "Hide" : "View"} PDF and extracted fields</span></td>`;
                 html += "</tr>";
                 if (expanded) {
@@ -1585,6 +1823,7 @@ def create_app(
               container.querySelectorAll("[data-action]").forEach(button => {
                 button.addEventListener("click", () => handleRowAction(button));
               });
+              populateStatementCompanySelects(container);
               container.querySelectorAll("[data-expand-invoice]").forEach(row => {
                 const toggle = event => {
                   if (event.target.closest("button, a, input, select, textarea")) return;
@@ -1604,6 +1843,7 @@ def create_app(
             }
 
             const BASE_COLUMNS = [
+              { label: "Type", value: i => i.document_type === "statement" ? "Statement" : "Invoice" },
               { label: "IRJ", value: i => i.irj_number || "—" },
               { label: "Company", value: i => i.company || "—" },
               { label: "Supplier", value: i => i.supplier || "—" },
@@ -1612,7 +1852,118 @@ def create_app(
             ];
 
             function pdfLinkButton(invoice) {
-              return `<a href="/api/invoices/${invoice.id}/pdf" target="_blank" rel="noopener">View PDF</a>`;
+              return `<a class="action-link" href="/api/invoices/${invoice.id}/pdf" ` +
+                `target="_blank" rel="noopener">View PDF</a>`;
+            }
+
+            document.getElementById("invoice-search-form").addEventListener(
+              "submit",
+              async event => {
+                event.preventDefault();
+                const query = document.getElementById("invoice-search-irj").value.trim();
+                const result = document.getElementById("invoice-search-result");
+                result.className = "empty-state";
+                result.textContent = "Searching…";
+                try {
+                  const response = await fetch(
+                    `/api/invoice-search?irj_number=${encodeURIComponent(query)}`
+                  );
+                  if (response.status === 404) {
+                    result.textContent = `No invoice was found for ${query}.`;
+                    return;
+                  }
+                  if (!response.ok) {
+                    const body = await response.json().catch(() => ({}));
+                    throw new Error(body.detail || "Invoice search failed.");
+                  }
+                  const invoice = await response.json();
+                  result.className = "";
+                  result.innerHTML =
+                    `<div class="actions">${pdfLinkButton(invoice)}</div>` +
+                    invoiceAnalysisHtml(invoice);
+                } catch (error) {
+                  result.textContent = error.message;
+                  showToast(error.message, true);
+                }
+              }
+            );
+
+            let statementLibrary = {};
+
+            function renderStatementList(company) {
+              const container = document.getElementById("statement-list");
+              if (!company) {
+                container.className = "empty-state";
+                container.textContent = "Select a company to view its statements.";
+                return;
+              }
+              const statements = statementLibrary[company] || [];
+              if (!statements.length) {
+                container.className = "empty-state";
+                container.textContent = `No PDF statements were found for ${company}.`;
+                return;
+              }
+              container.className = "";
+              container.innerHTML =
+                '<table class="section-table"><thead><tr>' +
+                "<th>Statement</th><th>Modified</th><th>Size</th><th>Action</th>" +
+                "</tr></thead><tbody>" +
+                statements.map(statement => `
+                  <tr>
+                    <td>${escapeHtml(statement.name)}</td>
+                    <td>${escapeHtml(statement.lastModifiedDateTime || statement.createdDateTime || "—")}</td>
+                    <td>${statement.size == null ? "—" : `${Math.ceil(Number(statement.size) / 1024)} KB`}</td>
+                    <td><a class="action-link" href="/api/statements/${encodeURIComponent(statement.id)}/pdf" target="_blank" rel="noopener">View PDF</a></td>
+                  </tr>
+                `).join("") +
+                "</tbody></table>";
+            }
+
+            async function loadStatements() {
+              const companySelect = document.getElementById("statement-company");
+              const container = document.getElementById("statement-list");
+              container.className = "empty-state";
+              container.textContent = "Loading statements from SharePoint…";
+              const response = await fetch("/api/statements");
+              if (!response.ok) {
+                const body = await response.json().catch(() => ({}));
+                container.textContent =
+                  body.detail || "Statements could not be loaded from SharePoint.";
+                return;
+              }
+              statementLibrary = await response.json();
+              const selected = companySelect.value;
+              companySelect.innerHTML = '<option value="">Select company…</option>';
+              for (const company of Object.keys(statementLibrary)) {
+                const option = document.createElement("option");
+                option.value = company;
+                option.textContent = company;
+                companySelect.appendChild(option);
+              }
+              companySelect.value = Object.hasOwn(statementLibrary, selected)
+                ? selected
+                : "";
+              renderStatementList(companySelect.value);
+            }
+
+            document.getElementById("statement-company").addEventListener(
+              "change",
+              event => renderStatementList(event.target.value)
+            );
+
+            function populateStatementCompanySelects(container) {
+              container.querySelectorAll("[data-statement-company]").forEach(select => {
+                const placeholder = document.createElement("option");
+                placeholder.value = "";
+                placeholder.textContent = "Select company…";
+                select.appendChild(placeholder);
+                for (const company of invoiceCompanies) {
+                  const option = document.createElement("option");
+                  option.value = company.name;
+                  option.textContent = company.name;
+                  select.appendChild(option);
+                }
+              });
             }
 
             function renderAllSections() {
@@ -1626,7 +1977,13 @@ def create_app(
                 ],
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="open-review" data-id="${invoice.id}" class="secondary">Open review</button>
+                  ${invoice.document_type === "statement" ? `
+                    <button data-action="mark-invoice" data-id="${invoice.id}" class="secondary">Treat as invoice</button>
+                  ` : `
+                    <button data-action="open-review" data-id="${invoice.id}" class="secondary">Open invoice review</button>
+                  `}
+                  <select data-statement-company="${invoice.id}" aria-label="Statement company"></select>
+                  <button data-action="file-statement" data-id="${invoice.id}">File as statement</button>
                   ${invoice.review_return_status ? `
                     <button data-action="accept-review" data-id="${invoice.id}">Accept</button>
                     <button data-action="reject-review" data-id="${invoice.id}" class="danger">Reject</button>
@@ -1822,6 +2179,10 @@ def create_app(
             async function handleRowAction(button) {
               const action = button.dataset.action;
               const id = button.dataset.id;
+              const originalText = button.textContent;
+              button.disabled = true;
+              button.setAttribute("aria-busy", "true");
+              button.textContent = "Working…";
               try {
                 if (action === "po-match") {
                   await postJson(`/api/invoices/${id}/po-match`, { matched: true, notes: null });
@@ -1831,6 +2192,17 @@ def create_app(
                   const invoice = invoices.find(item => String(item.id) === String(id));
                   if (invoice) showInvoice(invoice);
                   return;
+                } else if (action === "file-statement") {
+                  const company = button.closest("tr")
+                    ?.querySelector("[data-statement-company]")?.value;
+                  if (!company) {
+                    throw new Error("Select the statement company first.");
+                  }
+                  await postJson(`/api/invoices/${id}/file-statement`, { company });
+                  showToast(`Statement filed to Statements/${company}.`);
+                } else if (action === "mark-invoice") {
+                  await postJson(`/api/invoices/${id}/mark-as-invoice`, {});
+                  showToast("Document returned to invoice review.");
                 } else if (action === "accept-review") {
                   await postJson(`/api/invoices/${id}/review-decision`, {
                     accepted: true,
@@ -1920,6 +2292,12 @@ def create_app(
                 await loadInvoices();
               } catch (error) {
                 showToast(error.message, true);
+              } finally {
+                if (button.isConnected) {
+                  button.disabled = false;
+                  button.removeAttribute("aria-busy");
+                  button.textContent = originalText;
+                }
               }
             }
 
@@ -1930,6 +2308,26 @@ def create_app(
               if (!reason) return;
               try {
                 await postJson(`/api/invoices/${invoiceId}/flag-review`, { reason });
+                await loadInvoices();
+              } catch (error) {
+                showToast(error.message, true);
+              }
+            });
+
+            document.getElementById("delete-invoice-button").addEventListener("click", async () => {
+              const invoice = invoices.find(item => String(item.id) === picker.value);
+              if (!invoice) return;
+              if (!window.confirm(
+                `Permanently delete "${invoice.original_filename}" from the application ` +
+                "and SharePoint? This cannot be undone."
+              )) return;
+              try {
+                await sendJson(`/api/invoices/${invoice.id}`, "DELETE");
+                displayedInvoiceId = null;
+                pdfFrame.removeAttribute("src");
+                pdfFrame.style.display = "none";
+                pdfEmpty.style.display = "grid";
+                showToast("Invoice permanently deleted.");
                 await loadInvoices();
               } catch (error) {
                 showToast(error.message, true);
@@ -1973,8 +2371,8 @@ def create_app(
             async function submitConfirm(overrideDuplicate) {
               const invoiceId = picker.value;
               if (!invoiceId) return;
-              const company = document.getElementById("confirm-company").value;
-              const supplier = document.getElementById("confirm-supplier").value;
+              const company = document.getElementById("preview-company").value;
+              const supplier = document.getElementById("preview-supplier").value;
               if (!company || !supplier) {
                 showToast("Company and supplier are required.", true);
                 return;
@@ -1982,13 +2380,13 @@ def create_app(
               const body = {
                 company,
                 supplier,
-                supplier_invoice_number: document.getElementById("confirm-supplier-invoice").value || null,
-                purchase_order_number: document.getElementById("confirm-po").value || null,
-                invoice_date: document.getElementById("confirm-invoice-date").value || null,
-                invoice_value: document.getElementById("confirm-invoice-value").value
-                  ? Number(document.getElementById("confirm-invoice-value").value)
+                supplier_invoice_number: document.getElementById("preview-supplier-invoice").value || null,
+                purchase_order_number: document.getElementById("preview-po").value || null,
+                invoice_date: document.getElementById("preview-invoice-date").value || null,
+                invoice_value: document.getElementById("preview-value").value
+                  ? Number(document.getElementById("preview-value").value)
                   : null,
-                currency: document.getElementById("confirm-currency").value || "GBP",
+                currency: document.getElementById("preview-currency").value || "GBP",
                 override_duplicate: overrideDuplicate,
               };
               try {
@@ -2042,11 +2440,8 @@ def create_app(
             document.getElementById("section-nav").addEventListener("click", event => {
               const button = event.target.closest("button[data-tab]");
               if (!button) return;
-              currentTab = button.dataset.tab;
-              document.querySelectorAll("#section-nav button").forEach(b => b.classList.toggle("active", b === button));
-              document.querySelectorAll(".tab-panel").forEach(panel => {
-                panel.classList.toggle("active", panel.dataset.tabPanel === currentTab);
-              });
+              storeValue(`${SCROLL_STORAGE_PREFIX}${currentTab}`, String(window.scrollY));
+              activateTab(button.dataset.tab);
             });
 
             function applyRoleVisibility(role) {
@@ -2055,11 +2450,15 @@ def create_app(
                 const isAllowed = allowedTabs.includes(button.dataset.tab);
                 button.style.display = isAllowed ? "" : "none";
               });
-              if (!allowedTabs.includes(currentTab)) {
-                const fallback = document.querySelector(`#section-nav button[data-tab="${allowedTabs[0]}"]`);
-                if (fallback) fallback.click();
-              }
+              const desiredTab = allowedTabs.includes(currentTab)
+                ? currentTab
+                : allowedTabs[0];
+              activateTab(desiredTab);
             }
+
+            window.addEventListener("beforeunload", () => {
+              storeValue(`${SCROLL_STORAGE_PREFIX}${currentTab}`, String(window.scrollY));
+            });
 
             async function pollActivity() {
               try {
@@ -2158,6 +2557,85 @@ def create_app(
               }
             }
 
+            function companyGroupLabel(company) {
+              if (company === "*") return "All invoice companies";
+              return company || "Unassigned suppliers";
+            }
+
+            function renderCompanyGroupedTables(
+              container,
+              groups,
+              columns,
+              onDelete,
+              idKey = "id",
+              onEdit = null
+            ) {
+              container.replaceChildren();
+              container.classList.add("admin-company-groups");
+              const entries = [...groups.entries()].sort(([left], [right]) =>
+                companyGroupLabel(left).localeCompare(companyGroupLabel(right))
+              );
+              if (!entries.length) {
+                container.innerHTML = '<p class="empty">Nothing here yet.</p>';
+                return;
+              }
+              for (const [company, rows] of entries) {
+                const details = document.createElement("details");
+                details.className = "admin-company-group";
+                const summary = document.createElement("summary");
+                summary.textContent =
+                  `${companyGroupLabel(company)} (${rows.length})`;
+                const content = document.createElement("div");
+                content.className = "admin-company-group-content";
+                details.append(summary, content);
+                container.appendChild(details);
+                renderSimpleTable(
+                  content,
+                  columns,
+                  rows,
+                  onDelete,
+                  idKey,
+                  onEdit
+                );
+              }
+            }
+
+            function rowsGroupedByCompany(rows) {
+              const groups = new Map();
+              for (const row of rows) {
+                const company = row.company || "";
+                if (!groups.has(company)) groups.set(company, []);
+                groups.get(company).push(row);
+              }
+              return groups;
+            }
+
+            function suppliersGroupedByCompany(suppliers, matrix, supplierTerms) {
+              const associations = new Map(
+                suppliers.map(supplier => [supplier.name, new Set()])
+              );
+              for (const supplier of suppliers) {
+                if (supplier.default_company) {
+                  associations.get(supplier.name).add(supplier.default_company);
+                }
+              }
+              for (const record of [...matrix, ...supplierTerms]) {
+                if (associations.has(record.supplier)) {
+                  associations.get(record.supplier).add(record.company || "");
+                }
+              }
+              const groups = new Map();
+              for (const supplier of suppliers) {
+                const companies = associations.get(supplier.name);
+                if (!companies.size) companies.add("");
+                for (const company of companies) {
+                  if (!groups.has(company)) groups.set(company, []);
+                  groups.get(company).push(supplier);
+                }
+              }
+              return groups;
+            }
+
             function openAdminEditor(title, fields, onSave) {
               const dialog = document.getElementById("admin-edit-dialog");
               const form = document.getElementById("admin-edit-form");
@@ -2247,6 +2725,54 @@ def create_app(
               }
             }
 
+            function supplierBelongsToCompany(
+              supplier,
+              company,
+              matrix = adminMatrix,
+              supplierTerms = adminSupplierTerms
+            ) {
+              if (!company || company === "*") return true;
+              const supplierName = supplier.name.trim().toLocaleLowerCase();
+              const companyName = company.trim().toLocaleLowerCase();
+              if (
+                supplier.default_company?.trim().toLocaleLowerCase() === companyName
+              ) return true;
+              return [...matrix, ...supplierTerms].some(record =>
+                record.supplier.trim().toLocaleLowerCase() === supplierName &&
+                (
+                  record.company === "*" ||
+                  record.company.trim().toLocaleLowerCase() === companyName
+                )
+              );
+            }
+
+            function refreshAdminMatrixSupplierOptions(selectedSupplier = "") {
+              const company = document.getElementById("admin-matrix-company").value;
+              const suppliers = adminSuppliers.filter(supplier =>
+                supplierBelongsToCompany(supplier, company)
+              );
+              replaceSelectOptions(
+                document.getElementById("admin-matrix-supplier"),
+                [
+                  [
+                    "",
+                    company
+                      ? "Select supplier company…"
+                      : "Select an invoice company first…",
+                  ],
+                  ...suppliers.map(supplier => [supplier.name, supplier.name]),
+                ]
+              );
+              const select = document.getElementById("admin-matrix-supplier");
+              select.disabled = !company;
+              if (
+                selectedSupplier &&
+                suppliers.some(supplier => supplier.name === selectedSupplier)
+              ) {
+                select.value = selectedSupplier;
+              }
+            }
+
             function loadAdminReferenceOptions(companies, suppliers) {
               const companyOptions = companies.map(company => [
                 company.name,
@@ -2268,13 +2794,7 @@ def create_app(
                   ...companyOptions,
                 ]
               );
-              replaceSelectOptions(
-                document.getElementById("admin-matrix-supplier"),
-                [
-                  ["", "Select supplier company…"],
-                  ...suppliers.map(supplier => [supplier.name, supplier.name]),
-                ]
-              );
+              refreshAdminMatrixSupplierOptions();
             }
 
             async function loadSharePointFolderOptions() {
@@ -2329,6 +2849,8 @@ def create_app(
                 ]);
                 adminCompanies = companies;
                 adminSuppliers = suppliers;
+                adminMatrix = matrix;
+                adminSupplierTerms = supplierTerms;
                 loadAdminReferenceOptions(companies, suppliers);
                 renderSimpleTable(
                   document.getElementById("admin-companies-table"),
@@ -2409,15 +2931,16 @@ def create_app(
                     });
                   }
                 );
-                renderSimpleTable(
+                renderCompanyGroupedTables(
                   document.getElementById("admin-suppliers-table"),
+                  suppliersGroupedByCompany(suppliers, matrix, supplierTerms),
                   [
                     { label: "Name", value: s => s.name },
                     { label: "Aliases", value: s => (s.aliases || []).join(", ") },
                     { label: "Default company", value: s => s.default_company },
                     { label: "Contact", value: s => s.contact_email },
+                    { label: "Invoice no. pattern", value: s => s.invoice_number_pattern },
                   ],
-                  suppliers,
                   async name => {
                     await fetch(`/api/admin/suppliers/${encodeURIComponent(name)}`, { method: "DELETE" });
                     await loadAdminPanel();
@@ -2450,6 +2973,13 @@ def create_app(
                         value: supplier.contact_email,
                         nullWhenBlank: true,
                       },
+                      {
+                        key: "invoice_number_pattern",
+                        label: "Invoice number pattern (# digit, @ letter, * alphanumeric)",
+                        value: supplier.invoice_number_pattern,
+                        nullWhenBlank: true,
+                        fullWidth: true,
+                      },
                     ], async values => {
                       values.aliases = splitCommaList(values.aliases);
                       await putJson(
@@ -2461,17 +2991,16 @@ def create_app(
                     });
                   }
                 );
-                renderSimpleTable(
+                renderCompanyGroupedTables(
                   document.getElementById("admin-supplier-terms-table"),
+                  rowsGroupedByCompany(supplierTerms),
                   [
-                    { label: "Applies to", value: t => t.company === "*" ? "All invoice companies" : t.company },
                     { label: "Supplier company", value: t => t.supplier },
                     { label: "Account no.", value: t => t.supplier_account_number },
                     { label: "Payment method", value: t => t.default_payment_method },
                     { label: "Terms", value: t => t.payment_terms_notice },
                     { label: "Bank account", value: t => t.bank_account },
                   ],
-                  supplierTerms,
                   null,
                   "id",
                   terms => {
@@ -2529,10 +3058,10 @@ def create_app(
                     });
                   }
                 );
-                renderSimpleTable(
+                renderCompanyGroupedTables(
                   document.getElementById("admin-matrix-table"),
+                  rowsGroupedByCompany(matrix),
                   [
-                    { label: "Applies to", value: m => m.company === "*" ? "All invoice companies" : m.company },
                     { label: "Supplier company", value: m => m.supplier },
                     {
                       label: "Approver 1",
@@ -2549,7 +3078,6 @@ def create_app(
                         : "—",
                     },
                   ],
-                  matrix,
                   async id => {
                     await fetch(`/api/admin/approval-matrix/${id}`, { method: "DELETE" });
                     await loadAdminPanel();
@@ -2806,6 +3334,8 @@ def create_app(
                   aliases: splitCommaList(document.getElementById("admin-supplier-aliases").value),
                   default_company: document.getElementById("admin-supplier-default-company").value || null,
                   contact_email: document.getElementById("admin-supplier-contact").value || null,
+                  invoice_number_pattern:
+                    document.getElementById("admin-supplier-invoice-pattern").value || null,
                 });
                 event.target.reset();
                 await loadAdminPanel();
@@ -2814,6 +3344,11 @@ def create_app(
                 showToast(error.message, true);
               }
             });
+
+            document.getElementById("admin-matrix-company").addEventListener(
+              "change",
+              () => refreshAdminMatrixSupplierOptions()
+            );
 
             document.getElementById("admin-matrix-form").addEventListener("submit", async event => {
               event.preventDefault();
@@ -2868,6 +3403,10 @@ def create_app(
 
             document.getElementById("logout-button").addEventListener("click", async () => {
               await fetch("/api/auth/logout", { method: "POST" });
+              if (activityPollTimer !== null) window.clearInterval(activityPollTimer);
+              if (invoicePollTimer !== null) window.clearInterval(invoicePollTimer);
+              activityPollTimer = null;
+              invoicePollTimer = null;
               currentUser = null;
               appRoot.classList.add("hidden");
               loginScreen.classList.remove("hidden");
@@ -2915,9 +3454,18 @@ def create_app(
                 await Promise.all([loadAdminPanel(), loadSharePointFolderOptions()]);
               }
               await initActivityCursor();
-              setInterval(pollActivity, 3000);
-              setInterval(loadInvoices, 5000);
+              if (activityPollTimer !== null) window.clearInterval(activityPollTimer);
+              if (invoicePollTimer !== null) window.clearInterval(invoicePollTimer);
+              activityPollTimer = window.setInterval(pollActivity, 3000);
+              invoicePollTimer = window.setInterval(loadInvoices, 5000);
             }
+
+            document.addEventListener("visibilitychange", () => {
+              if (document.visibilityState === "visible" && currentUser) {
+                loadInvoices();
+                pollActivity();
+              }
+            });
 
             enterApp();
           </script>
@@ -2983,8 +3531,35 @@ def create_app(
         ]
 
     @app.get("/api/suppliers")
-    def suppliers(user: User = Depends(get_current_user)) -> list[dict[str, object]]:
-        return [asdict(profile) for profile in app.state.suppliers_store.list()]
+    def suppliers(
+        company: str | None = Query(None),
+        user: User = Depends(get_current_user),
+    ) -> list[dict[str, object]]:
+        profiles = app.state.suppliers_store.list()
+        if company:
+            company_key = company.strip().casefold()
+            configured_suppliers = {
+                entry.supplier.strip().casefold()
+                for entry in app.state.approval_matrix_store.list()
+                if entry.company == ALL_COMPANIES
+                or entry.company.strip().casefold() == company_key
+            }
+            configured_suppliers.update(
+                terms.supplier.strip().casefold()
+                for terms in app.state.supplier_terms_store.list()
+                if terms.company == ALL_COMPANIES
+                or terms.company.strip().casefold() == company_key
+            )
+            profiles = [
+                profile
+                for profile in profiles
+                if (
+                    profile.default_company is not None
+                    and profile.default_company.strip().casefold() == company_key
+                )
+                or profile.name.strip().casefold() in configured_suppliers
+            ]
+        return [asdict(profile) for profile in profiles]
 
     @app.get("/api/approval-matrix")
     def approval_matrix(user: User = Depends(get_current_user)) -> list[dict[str, object]]:
@@ -3084,7 +3659,9 @@ def create_app(
                     )
                 ),
                 extraction_runner=(
-                    lifecycle.run_extraction if ai_extraction_configured() else None
+                    lifecycle.run_extraction
+                    if ai_extraction_configured()
+                    else lifecycle.run_document_classification
                 ),
                 activity_feed=app.state.activity_feed,
             )
@@ -3142,6 +3719,8 @@ def create_app(
                     record = lifecycle.run_extraction(record.id)
                 except InvoiceExtractionUnavailableError:
                     record = app.state.invoice_store.get(record.id) or record
+            else:
+                record = lifecycle.run_document_classification(record.id)
         return asdict(record)
 
     @app.post("/api/invoices/{invoice_id}/register-sage")
@@ -3193,6 +3772,88 @@ def create_app(
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice was not found.")
         return asdict(invoice)
+
+    @app.delete("/api/invoices/{invoice_id}")
+    def delete_invoice(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            _lifecycle().delete_invoice(
+                invoice_id,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"id": invoice_id, "deleted": True}
+
+    @app.get("/api/invoice-search")
+    def search_invoice_by_irj(
+        irj_number: str = Query(..., min_length=1, max_length=32),
+        user: User = Depends(get_current_user),
+    ) -> dict[str, object]:
+        normalized = irj_number.strip()
+        if len(normalized) != 6 or not normalized.isdigit():
+            raise HTTPException(
+                status_code=422,
+                detail="An IRJ number must contain exactly six digits.",
+            )
+        invoice = app.state.invoice_store.get_by_irj_number(normalized)
+        if invoice is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No invoice was found for IRJ number '{normalized}'.",
+            )
+        return asdict(invoice)
+
+    @app.get("/api/statements")
+    def list_statements(
+        user: User = Depends(get_current_user),
+    ) -> dict[str, list[dict[str, object]]]:
+        client = _lifecycle().sharepoint_client
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="SharePoint is not configured or accessible.",
+            )
+        try:
+            return client.list_statement_library()
+        except SharePointError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+    @app.get("/api/statements/{item_id}/pdf")
+    def get_statement_pdf(
+        item_id: str,
+        user: User = Depends(get_current_user),
+    ) -> Response:
+        client = _lifecycle().sharepoint_client
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="SharePoint is not configured or accessible.",
+            )
+        try:
+            library = client.list_statement_library()
+            known_statement_ids = {
+                str(statement["id"])
+                for statements in library.values()
+                for statement in statements
+            }
+            if item_id not in known_statement_ids:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Statement PDF was not found.",
+                )
+            content = client.download_item(item_id)
+            validate_pdf(content)
+        except HTTPException:
+            raise
+        except (SharePointError, InvalidPdfError) as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Statement PDF could not be loaded: {error}",
+            ) from error
+        return Response(content=content, media_type="application/pdf")
 
     @app.get("/api/invoices/{invoice_id}/pdf")
     def get_invoice_pdf(
@@ -3372,6 +4033,36 @@ def create_app(
                 invoice_id,
                 accepted=request.accepted,
                 reason=request.reason,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/file-statement")
+    def file_supplier_statement(
+        invoice_id: int,
+        request: StatementFileRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().file_statement(
+                invoice_id,
+                company=request.company,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/mark-as-invoice")
+    def mark_document_as_invoice(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().mark_as_invoice(
+                invoice_id,
                 recorded_by=user.display_name,
             )
         except InvoiceLifecycleError as error:

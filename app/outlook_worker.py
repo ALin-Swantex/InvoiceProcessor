@@ -254,16 +254,18 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
         raise ValueError(
             "The Outlook worker supports INVOICE_STORE_BACKEND=sqlite or postgres."
         )
-    extraction_runner: Callable[[int], object] | None = None
     sharepoint_client = sharepoint_client_from_environment()
-    if ai_extraction_configured():
-        lifecycle = InvoiceLifecycle(
-            invoice_store,
-            irj_generator,
-            activity_feed,
-            sharepoint_client,
-        )
-        extraction_runner = lifecycle.run_extraction
+    lifecycle = InvoiceLifecycle(
+        invoice_store,
+        irj_generator,
+        activity_feed,
+        sharepoint_client,
+    )
+    extraction_runner: Callable[[int], object] = (
+        lifecycle.run_extraction
+        if ai_extraction_configured()
+        else lifecycle.run_document_classification
+    )
     incoming_monitor = SharePointIncomingMonitor(
         sharepoint_client,
         invoice_store,

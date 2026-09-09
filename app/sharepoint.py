@@ -145,6 +145,27 @@ class SharePointClient:
             ) from error
         return response.content
 
+    def delete_item(self, item_id: str) -> None:
+        """Permanently delete a DriveItem from the configured library."""
+        url = (
+            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
+            f"items/{quote(item_id, safe='')}"
+        )
+        response = self.http_client.delete(
+            url,
+            headers={"Authorization": "Bearer " + self.token_provider()},
+        )
+        if response.status_code == 404:
+            return
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            request_id = response.headers.get("request-id", "not provided")
+            raise SharePointError(
+                f"SharePoint invoice deletion failed with HTTP "
+                f"{response.status_code}; request ID: {request_id}."
+            ) from error
+
     def move_to_folder(
         self,
         source_item_id: str,
@@ -255,6 +276,100 @@ class SharePointClient:
             next_link = payload.get("@odata.nextLink")
             url = next_link if isinstance(next_link, str) else None
         return sorted(paths, key=str.casefold)
+
+    def list_statement_library(
+        self,
+        *,
+        statements_root: str = "Statements",
+        max_items: int = 5000,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return statement PDFs grouped by their direct company folder."""
+        if max_items < 1:
+            raise ValueError("max_items must be greater than zero.")
+        normalized_root = str(PurePosixPath(statements_root)).strip("/")
+        if not normalized_root:
+            raise ValueError("statements_root must not be empty.")
+
+        drive_prefix = (
+            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
+        )
+        library: dict[str, list[dict[str, Any]]] = {}
+        item_count = 0
+        url: str | None = f"{drive_prefix}/root/delta"
+        params: dict[str, str] | None = {
+            "$select": "id,name,size,file,folder,webUrl,createdDateTime,lastModifiedDateTime,parentReference,deleted",
+            "$top": "200",
+        }
+        while url:
+            response = self.http_client.get(
+                url,
+                params=params,
+                headers={"Authorization": "Bearer " + self.token_provider()},
+            )
+            params = None
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                request_id = response.headers.get("request-id", "not provided")
+                raise SharePointError(
+                    f"SharePoint statement library listing failed with HTTP "
+                    f"{response.status_code}; request ID: {request_id}."
+                ) from error
+            payload = response.json()
+            page = payload.get("value", [])
+            if not isinstance(page, list):
+                raise SharePointError(
+                    "SharePoint returned an invalid statement library response."
+                )
+            item_count += len(page)
+            if item_count > max_items:
+                raise SharePointError(
+                    f"SharePoint statement scan exceeded {max_items} items."
+                )
+            for item in page:
+                if not isinstance(item, dict) or "deleted" in item:
+                    continue
+                name = item.get("name")
+                parent = item.get("parentReference")
+                if not isinstance(name, str) or not isinstance(parent, dict):
+                    continue
+                parent_path = parent.get("path")
+                if not isinstance(parent_path, str) or "/root:" not in parent_path:
+                    continue
+                relative_parent = parent_path.partition("/root:")[2].strip("/")
+                item_path = str(PurePosixPath(relative_parent) / name)
+                parts = PurePosixPath(item_path).parts
+                if len(parts) == 2 and parts[0].casefold() == normalized_root.casefold():
+                    if isinstance(item.get("folder"), dict):
+                        library.setdefault(parts[1], [])
+                    continue
+                if (
+                    len(parts) == 3
+                    and parts[0].casefold() == normalized_root.casefold()
+                    and isinstance(item.get("file"), dict)
+                    and isinstance(item.get("id"), str)
+                    and name.lower().endswith(".pdf")
+                ):
+                    library.setdefault(parts[1], []).append(
+                        {
+                            "id": item.get("id"),
+                            "name": name,
+                            "size": item.get("size"),
+                            "webUrl": item.get("webUrl"),
+                            "createdDateTime": item.get("createdDateTime"),
+                            "lastModifiedDateTime": item.get("lastModifiedDateTime"),
+                        }
+                    )
+            next_link = payload.get("@odata.nextLink")
+            url = next_link if isinstance(next_link, str) else None
+
+        return {
+            company: sorted(
+                files,
+                key=lambda item: str(item.get("name", "")).casefold(),
+            )
+            for company, files in sorted(library.items(), key=lambda pair: pair[0].casefold())
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers

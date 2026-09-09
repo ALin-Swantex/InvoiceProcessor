@@ -39,23 +39,26 @@ class Field:
 
 
 class Poller:
-    def __init__(self, fields: dict[str, Field]) -> None:
+    def __init__(self, fields: dict[str, Field], content: str = "") -> None:
         self.fields = fields
+        self.content = content
 
     def result(self) -> object:
         return SimpleNamespace(
-            documents=[SimpleNamespace(fields=self.fields)]
+            documents=[SimpleNamespace(fields=self.fields)],
+            content=self.content,
         )
 
 
 class FakeClient:
-    def __init__(self, fields: dict[str, Field]) -> None:
+    def __init__(self, fields: dict[str, Field], content: str = "") -> None:
         self.fields = fields
+        self.content = content
         self.calls: list[tuple[str, bytes]] = []
 
     def begin_analyze_document(self, model_id: str, *, body: BinaryIO) -> Poller:
         self.calls.append((model_id, body.read()))
-        return Poller(self.fields)
+        return Poller(self.fields, self.content)
 
 
 def complete_fields() -> dict[str, Field]:
@@ -121,6 +124,98 @@ def test_missing_or_uncertain_critical_fields_require_review(
         "'supplier' confidence" in warning and "60%" in warning
         for warning in result.warnings
     )
+
+
+def test_recovers_untyped_invoice_total_and_currency_symbol(
+    tmp_path: Path,
+) -> None:
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(b"%PDF-1.7\ninvoice\n%%EOF")
+    fields = complete_fields()
+    fields["InvoiceTotal"] = Field(
+        "Invoice Total: £1,250.75",
+        confidence=0.91,
+    )
+
+    result = AzureInvoiceExtractor(
+        DocumentIntelligenceSettings("https://documents.example.test/"),
+        client=FakeClient(fields),
+    ).extract(pdf)
+
+    assert result.invoice_value == 1250.75
+    assert result.currency == "GBP"
+    assert not any("invoice value' is missing" in warning for warning in result.warnings)
+    assert not any("currency' is missing" in warning for warning in result.warnings)
+
+
+def test_recovers_labelled_invoice_fields_from_ocr_for_manual_review(
+    tmp_path: Path,
+) -> None:
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(b"%PDF-1.7\ninvoice\n%%EOF")
+    fields = complete_fields()
+    fields.pop("InvoiceId")
+    fields.pop("InvoiceTotal")
+
+    result = AzureInvoiceExtractor(
+        DocumentIntelligenceSettings("https://documents.example.test/"),
+        client=FakeClient(
+            fields,
+            content="Invoice No. INV-2048\nInvoice Total: GBP 2,450.60",
+        ),
+    ).extract(pdf)
+
+    assert result.supplier_invoice_number == "INV-2048"
+    assert result.invoice_value == 2450.60
+    assert result.currency == "GBP"
+    assert result.needs_review is True
+    assert any("recovered from OCR" in warning for warning in result.warnings)
+
+
+def test_uses_amount_due_as_flagged_total_fallback(tmp_path: Path) -> None:
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(b"%PDF-1.7\ninvoice\n%%EOF")
+    fields = complete_fields()
+    fields.pop("InvoiceTotal")
+    fields["AmountDue"] = Field(
+        CurrencyValue(99.50, "GBP"),
+        confidence=0.97,
+        attribute="value_currency",
+    )
+
+    result = AzureInvoiceExtractor(
+        DocumentIntelligenceSettings("https://documents.example.test/"),
+        client=FakeClient(fields),
+    ).extract(pdf)
+
+    assert result.invoice_value == 99.50
+    assert result.currency == "GBP"
+    assert result.needs_review is True
+    assert any("amount-due field" in warning for warning in result.warnings)
+
+
+def test_ocr_content_detects_supplier_statement_before_invoice_mapping(
+    tmp_path: Path,
+) -> None:
+    pdf = tmp_path / "statement.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nstatement\n%%EOF")
+    client = FakeClient(
+        {},
+        content=(
+            "STATEMENT OF ACCOUNT Opening balance "
+            "Invoice date Invoice number Debit Credit Closing balance"
+        ),
+    )
+
+    result = AzureInvoiceExtractor(
+        DocumentIntelligenceSettings("https://documents.example.test/"),
+        client=client,
+    ).extract(pdf)
+
+    assert result.document_type == "statement"
+    assert result.needs_review is True
+    assert result.document_classification_confidence is not None
+    assert result.document_classification_confidence >= 0.80
 
 
 def test_uncertain_present_po_number_requires_review(

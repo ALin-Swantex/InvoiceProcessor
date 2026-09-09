@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS irj_sequence (
 
 class IrjNumberGenerator:
     """Generates unique, sequential internal invoice reference numbers
-    (IRJ numbers), e.g. IRJ-000123.
+    (IRJ numbers), e.g. 000123.
 
     Uses the same SQLite database as invoice records so a single connection
     file can guarantee atomic, non-duplicated numbering across workers.
@@ -37,12 +37,14 @@ class IrjNumberGenerator:
                 "SELECT next_number FROM irj_sequence WHERE id = 1"
             ).fetchone()
             number = int(row["next_number"])
+            if number > 999999:
+                raise RuntimeError("The six-digit IRJ number range is exhausted.")
             connection.execute(
                 "UPDATE irj_sequence SET next_number = ? WHERE id = 1",
                 (number + 1,),
             )
             connection.commit()
-        return f"IRJ-{number:06d}"
+        return f"{number:06d}"
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)

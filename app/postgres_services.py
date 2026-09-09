@@ -36,7 +36,10 @@ class PostgresIrjNumberGenerator:
                 row = cursor.fetchone()
         if row is None:
             raise RuntimeError("PostgreSQL did not return an IRJ sequence number.")
-        return f"IRJ-{int(row['number']):06d}"
+        number = int(row["number"])
+        if number > 999999:
+            raise RuntimeError("The six-digit IRJ number range is exhausted.")
+        return f"{number:06d}"
 
 
 class PostgresActivityFeedStore:

@@ -1,3 +1,5 @@
+from typing import cast
+
 from fastapi.testclient import TestClient
 
 from app.activity_feed import ActivityFeedStore
@@ -7,7 +9,9 @@ from app.companies import CompanyStore
 from app.invoices import InvoiceStore
 from app.main import create_app
 from app.outlook_notifications import OutlookNotificationStore
+from app.sharepoint import SharePointClient
 from app.suppliers import SupplierStore
+from tests.pdf_helpers import VALID_PDF_BYTES
 
 
 def client_for(tmp_path) -> TestClient:
@@ -35,7 +39,10 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert "OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED" not in home.text
     assert '<aside class="sidebar">' in home.text
     assert 'data-tab="needs-review"' in home.text
-    assert "Flagged Invoices — Purchase Ledger Review" in home.text
+    assert home.text.index('data-tab="search"') < home.text.index('data-tab="incoming"')
+    assert home.text.index('data-tab="statements"') < home.text.index('data-tab="incoming"')
+    assert 'data-tab="statements"' in home.text
+    assert "Flagged Documents — Purchase Ledger Review" in home.text
     assert 'id="payment-method"' in home.text
     assert '<select id="admin-import-company" required>' in home.text
     assert "Supplier payment settings" in home.text
@@ -43,6 +50,8 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert "<summary>Companies</summary>" in home.text
     assert 'id="admin-company-root-folder" required disabled' in home.text
     assert '<select id="admin-supplier-default-company">' in home.text
+    assert 'id="admin-supplier-invoice-pattern"' in home.text
+    assert "# = digit, @ = letter, * = letter or digit" in home.text
     assert '<select id="admin-matrix-company" required>' in home.text
     assert '<select id="admin-matrix-supplier" required>' in home.text
     assert "All invoice companies" in home.text
@@ -56,10 +65,17 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert 'formData.set("replace_existing", "true")' in home.text
     assert '.join("\\n")' in home.text
     assert 'id="admin-company-folder-preview"' in home.text
-    assert "Invoice PDF" in home.text
+    assert "Statement classification" in home.text
     assert "IRJ number" in home.text
     assert "Company being invoiced" in home.text
-    assert '<select id="confirm-supplier">' in home.text
+    assert '<select id="preview-company">' in home.text
+    assert '<select id="preview-supplier" disabled>' in home.text
+    assert "Purchase Ledger confirmation (editable" not in home.text
+    assert "Invoice details (AI-extracted — review and correct before confirming)" in home.text
+    assert "function renderCompanyGroupedTables" in home.text
+    assert "function suppliersGroupedByCompany" in home.text
+    assert "function refreshAdminMatrixSupplierOptions" in home.text
+    assert "/api/suppliers?company=${encodeURIComponent(company)}" in home.text
     assert "Supplier invoice number" in home.text
     assert "Purchase Order number" in home.text
     assert "Invoice value" in home.text
@@ -67,9 +83,30 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert "PDF and extracted fields" in home.text
     assert "function invoiceAnalysisHtml" in home.text
     assert 'data-expand-invoice="${invoice.id}"' in home.text
+    assert 'class="row-action-buttons"' in home.text
+    assert 'class="action-link"' in home.text
+    assert 'button.setAttribute("aria-busy", "true")' in home.text
+    assert 'button.textContent = "Working…"' in home.text
     assert 'class="invoice-analysis-pdf"' in home.text
     assert "Extracted invoice analysis" in home.text
+    assert "File as statement" in home.text
+    assert "/api/invoices/${id}/file-statement" in home.text
+    assert "/api/invoices/${id}/mark-as-invoice" in home.text
+    assert "Search invoices by IRJ number" in home.text
+    assert "Statements/{Company}" in home.text
+    assert 'id="statement-company"' in home.text
+    assert 'fetch("/api/statements")' in home.text
+    assert 'const ACTIVE_TAB_STORAGE_KEY = "invoice-processor-active-tab"' in home.text
+    assert 'fetch(\n                  "/api/invoices?limit=500",\n                  { cache: "no-store" }' in home.text
+    assert "function clearInvoicePreview()" in home.text
+    assert 'document.addEventListener("visibilitychange"' in home.text
+    assert "window.clearInterval(invoicePollTimer)" in home.text
+    assert "function activateTab(tab)" in home.text
+    assert 'window.addEventListener("beforeunload"' in home.text
+    assert "/api/invoice-search?irj_number=${encodeURIComponent(query)}" in home.text
     assert "Purchase Ledger: confirm invoice" in home.text
+    assert '<button class="danger" id="delete-invoice-button">' in home.text
+    assert 'sendJson(`/api/invoices/${invoice.id}`, "DELETE")' in home.text
     assert "Manually add an invoice to Incoming Invoices" in home.text
     assert "Confirmation and automatic routing" not in home.text
     assert "Purchase Order number detected" not in home.text
@@ -93,6 +130,130 @@ def test_health_identifies_outlook_intake_mode(tmp_path) -> None:
     assert response.json() == {"status": "ok", "mode": "outlook-intake"}
 
 
+def test_supplier_list_is_filtered_by_selected_company(tmp_path) -> None:
+    client = client_for(tmp_path)
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    )
+    assert login.status_code == 200
+
+    response = client.get(
+        "/api/suppliers",
+        params={"company": "Northfield Manufacturing"},
+    )
+
+    assert response.status_code == 200
+    assert [supplier["name"] for supplier in response.json()] == ["Supplier Ltd"]
+
+
+def test_invoice_search_finds_normalized_irj_number(tmp_path) -> None:
+    client = client_for(tmp_path)
+    store = client.app.state.invoice_store
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(VALID_PDF_BYTES)
+    invoice = store.add_from_outlook(
+        message={"id": "message-1"},
+        attachment={"id": "attachment-1", "name": "invoice.pdf"},
+        stored_path=pdf,
+    )
+    store.update_fields(
+        invoice.id,
+        irj_number="000123",
+        company="Acme Trading Ltd",
+        status="Approved",
+    )
+    assert client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    ).status_code == 200
+
+    response = client.get("/api/invoice-search", params={"irj_number": "000123"})
+
+    assert response.status_code == 200
+    assert response.json()["id"] == invoice.id
+    assert response.json()["irj_number"] == "000123"
+
+
+def test_invoice_search_returns_not_found_for_unknown_irj(tmp_path) -> None:
+    client = client_for(tmp_path)
+    assert client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    ).status_code == 200
+
+    response = client.get(
+        "/api/invoice-search", params={"irj_number": "999999"}
+    )
+
+    assert response.status_code == 404
+
+
+def test_invoice_search_rejects_non_six_digit_reference(tmp_path) -> None:
+    client = client_for(tmp_path)
+    assert client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    ).status_code == 200
+
+    response = client.get(
+        "/api/invoice-search", params={"irj_number": "IRJ-000123"}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "An IRJ number must contain exactly six digits."
+    )
+
+
+def test_statement_library_is_read_from_sharepoint(tmp_path) -> None:
+    class FakeStatementClient:
+        def list_statement_library(self):
+            return {
+                "Acme Trading Ltd": [
+                    {
+                        "id": "statement-1",
+                        "name": "September.pdf",
+                        "size": len(VALID_PDF_BYTES),
+                        "webUrl": "https://sharepoint.example/statement-1",
+                        "createdDateTime": "2026-09-01T08:00:00Z",
+                        "lastModifiedDateTime": "2026-09-01T08:00:00Z",
+                    }
+                ]
+            }
+
+        def download_item(self, item_id: str) -> bytes:
+            assert item_id == "statement-1"
+            return VALID_PDF_BYTES
+
+    client = TestClient(
+        create_app(
+            invoice_store=InvoiceStore(tmp_path / "invoices.db"),
+            auth_store=AuthStore(tmp_path / "auth.db"),
+            companies_store=CompanyStore(tmp_path / "config.db"),
+            suppliers_store=SupplierStore(tmp_path / "config.db"),
+            approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+            activity_feed=ActivityFeedStore(tmp_path / "activity.db"),
+            notification_store=OutlookNotificationStore(
+                tmp_path / "notifications.db"
+            ),
+            sharepoint_client=cast(SharePointClient, FakeStatementClient()),
+        )
+    )
+    assert client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    ).status_code == 200
+
+    listing = client.get("/api/statements")
+    pdf = client.get("/api/statements/statement-1/pdf")
+
+    assert listing.status_code == 200
+    assert listing.json()["Acme Trading Ltd"][0]["name"] == "September.pdf"
+    assert pdf.status_code == 200
+    assert pdf.headers["content-type"] == "application/pdf"
+
+
 def test_confirmation_api_returns_po_routing_decision(tmp_path) -> None:
     client = client_for(tmp_path)
 
@@ -103,7 +264,7 @@ def test_confirmation_api_returns_po_routing_decision(tmp_path) -> None:
             "company": "Example Company",
             "company_folder": "/Companies/Example/Invoices",
             "original_filename": "invoice.pdf",
-            "irj_number": "IRJ-001245",
+            "irj_number": "001245",
             "purchase_order_number": "PO-7788",
             "po_matching_folder": "/Companies/Example/PO Matching",
             "purchase_ledger_recipient": "purchase-ledger@example.test",
@@ -125,10 +286,10 @@ def test_confirmation_api_returns_nominal_routing_decision(tmp_path) -> None:
             "company": "Example Company",
             "company_folder": "/Companies/Example/Invoices",
             "original_filename": "invoice.pdf",
-            "irj_number": "IRJ-001245",
+            "irj_number": "001245",
         },
     )
 
     assert response.status_code == 200
     assert response.json()["route"] == "nominal"
-    assert response.json()["destination_filename"] == "IRJ-001245_invoice.pdf"
+    assert response.json()["destination_filename"] == "001245_invoice.pdf"

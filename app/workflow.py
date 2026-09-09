@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 SAFE_REFERENCE = re.compile(r"[^A-Za-z0-9._-]+")
+IRJ_NUMBER = re.compile(r"^[0-9]{6}$")
 
 
 class RoutingValidationError(ValueError):
@@ -89,6 +90,10 @@ def _validate_common_fields(invoice: ConfirmedInvoice) -> None:
         )
     if Path(invoice.original_filename).suffix.lower() != ".pdf":
         raise RoutingValidationError("The confirmed invoice must be a PDF.")
+    if not IRJ_NUMBER.fullmatch(invoice.irj_number.strip()):
+        raise RoutingValidationError(
+            "The IRJ number must contain exactly six digits."
+        )
 
 
 def _prefixed_filename(irj_number: str, original_filename: str) -> str:
@@ -100,4 +105,3 @@ def _prefixed_filename(irj_number: str, original_filename: str) -> str:
     if filename.casefold().startswith(f"{safe_irj}_".casefold()):
         return filename
     return f"{safe_irj}_{filename}"
-

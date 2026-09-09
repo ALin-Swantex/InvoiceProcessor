@@ -24,10 +24,16 @@ from app.companies import get_company as _default_get_company
 from app.company_folders import (
     REJECTED_INVOICES_FOLDER,
     CompanyFolderStructure,
+    statement_company_folder,
+)
+from app.document_classification import (
+    DocumentClassification,
+    classify_pdf_document,
 )
 from app.duplicates import find_possible_duplicate
 from app.email_notifications import send_email_notification
 from app.invoices import InvoiceRecord, InvoiceStore
+from app.invoice_number_validation import invoice_number_warnings
 from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
@@ -76,6 +82,9 @@ class InvoiceLifecycle:
         approval_matrix_store: ApprovalMatrixStore | None = None,
         suppliers_store: SupplierStore | None = None,
         extraction_runner: Callable[[Path], ExtractionResult] = run_ai_extraction,
+        classification_runner: Callable[[Path], DocumentClassification] = (
+            classify_pdf_document
+        ),
     ) -> None:
         self.invoice_store = invoice_store
         self.irj_generator = irj_generator
@@ -85,6 +94,7 @@ class InvoiceLifecycle:
         self.approval_matrix_store = approval_matrix_store
         self.suppliers_store = suppliers_store
         self.extraction_runner = extraction_runner
+        self.classification_runner = classification_runner
 
     def _get_company(self, name: str):
         if self.companies_store is not None:
@@ -105,6 +115,17 @@ class InvoiceLifecycle:
     # Stage 1: AI extraction
     # ------------------------------------------------------------------
 
+    def run_document_classification(self, invoice_id: int) -> InvoiceRecord:
+        document = self._require_invoice(invoice_id)
+        if document.status != "Awaiting AI Extraction":
+            raise InvoiceLifecycleError(
+                "Document classification may only run before invoice extraction."
+            )
+        classification = self.classification_runner(Path(document.stored_path))
+        if classification.document_type == "statement":
+            return self._flag_detected_statement(document, classification)
+        return document
+
     def run_extraction(self, invoice_id: int) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
         if invoice.status != "Awaiting AI Extraction":
@@ -118,6 +139,13 @@ class InvoiceLifecycle:
         # PDF should flag the invoice for review, not raise an unhandled
         # error and stall the pipeline.
         try:
+            local_classification = self.classification_runner(
+                Path(invoice.stored_path)
+            )
+            if local_classification.document_type == "statement":
+                return self._flag_detected_statement(
+                    invoice, local_classification
+                )
             result = self.extraction_runner(Path(invoice.stored_path))
         except (
             DocumentIntelligenceConfigurationError,
@@ -150,9 +178,22 @@ class InvoiceLifecycle:
                 invoice_id=invoice_id,
             )
             return record
+        if result.document_type == "statement":
+            return self._flag_detected_statement(
+                invoice,
+                DocumentClassification(
+                    document_type="statement",
+                    confidence=result.document_classification_confidence or 0.0,
+                    reason=(
+                        result.document_classification_reason
+                        or "The PDF was detected as a supplier statement."
+                    ),
+                ),
+            )
         warnings = list(result.warnings)
         company = result.company
         supplier = result.supplier
+        supplier_profile = None
         if company:
             company_profile = self._get_company(company)
             if company_profile is None:
@@ -169,6 +210,17 @@ class InvoiceLifecycle:
                 )
             else:
                 supplier = supplier_profile.name
+        warnings.extend(
+            invoice_number_warnings(
+                result.supplier_invoice_number,
+                supplier=supplier,
+                pattern=(
+                    supplier_profile.invoice_number_pattern
+                    if supplier_profile is not None
+                    else None
+                ),
+            )
+        )
 
         if result.needs_review or warnings:
             warning_text = "\n".join(warnings)
@@ -184,6 +236,11 @@ class InvoiceLifecycle:
                 ai_confidence=result.confidence,
                 ai_field_confidences=result.field_confidences_json(),
                 ai_review_warnings=warning_text,
+                document_type="invoice",
+                document_classification_confidence=(
+                    result.document_classification_confidence
+                ),
+                document_classification_reason=result.document_classification_reason,
                 status="Needs Review",
                 review_return_status=None,
                 review_reason=warning_text or "Purchase Ledger must confirm invoice details.",
@@ -211,6 +268,11 @@ class InvoiceLifecycle:
             ai_confidence=result.confidence,
             ai_field_confidences=result.field_confidences_json(),
             ai_review_warnings=None,
+            document_type="invoice",
+            document_classification_confidence=(
+                result.document_classification_confidence
+            ),
+            document_classification_reason=result.document_classification_reason,
             status="Needs Review",
             review_return_status=None,
             review_reason="Awaiting Purchase Ledger confirmation.",
@@ -234,12 +296,29 @@ class InvoiceLifecycle:
         override_duplicate: bool = False,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
+        if invoice.document_type != "invoice":
+            raise InvoiceLifecycleError(
+                "A supplier statement cannot enter the invoice workflow. "
+                "File it to its company statement folder or mark it as an invoice."
+            )
         company_profile = self._get_company(company)
         if company_profile is None:
             raise InvoiceLifecycleError(
                 f"'{company}' is not a recognised company. Add it to app/companies.py "
                 "(or the production Companies SharePoint List) first."
             )
+        supplier_profile = self._get_supplier(supplier)
+        number_warnings = invoice_number_warnings(
+            supplier_invoice_number,
+            supplier=supplier,
+            pattern=(
+                supplier_profile.invoice_number_pattern
+                if supplier_profile is not None
+                else None
+            ),
+        )
+        if number_warnings:
+            raise InvoiceLifecycleError(" ".join(number_warnings))
 
         # Stage 6 (GENERAL_PROCESS.md): duplicate detection on
         # Company + Supplier + Supplier Invoice Number. A possible duplicate
@@ -795,6 +874,82 @@ class InvoiceLifecycle:
     # Manual review flag
     # ------------------------------------------------------------------
 
+    def file_statement(
+        self,
+        invoice_id: int,
+        *,
+        company: str,
+        recorded_by: str,
+    ) -> InvoiceRecord:
+        document = self._require_invoice(invoice_id)
+        if document.status != "Needs Review":
+            raise InvoiceLifecycleError(
+                "Only a flagged document can be filed as a supplier statement."
+            )
+        company_profile = self._get_company(company)
+        if company_profile is None:
+            raise InvoiceLifecycleError(
+                f"'{company}' is not a recognised company."
+            )
+        if self.sharepoint_client is None:
+            raise InvoiceLifecycleError(
+                "SharePoint must be configured before a statement can be filed."
+            )
+        destination = statement_company_folder(company_profile.name)
+        self._move_pdf_in_sharepoint(
+            document,
+            destination,
+            document.original_filename,
+        )
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            document_type="statement",
+            company=company_profile.name,
+            status="Statement Filed",
+            review_reason=None,
+            review_return_status=None,
+        )
+        self.activity_feed.add_event(
+            event_type="statement_filed",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Statement '{document.original_filename}' filed to "
+                f"{destination} by {recorded_by}."
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def mark_as_invoice(
+        self, invoice_id: int, *, recorded_by: str
+    ) -> InvoiceRecord:
+        document = self._require_invoice(invoice_id)
+        if (
+            document.status != "Needs Review"
+            or document.document_type != "statement"
+        ):
+            raise InvoiceLifecycleError(
+                "Only a flagged supplier statement can be reclassified as an invoice."
+            )
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            document_type="invoice",
+            status="Needs Review",
+            review_reason="Awaiting Purchase Ledger invoice confirmation.",
+            ai_review_warnings=None,
+            review_return_status=None,
+        )
+        self.activity_feed.add_event(
+            event_type="document_reclassified",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"'{document.original_filename}' was marked as an invoice "
+                f"by {recorded_by}."
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
     def flag_for_review(self, invoice_id: int, *, reason: str) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
         if invoice.status == "Needs Review":
@@ -1082,6 +1237,55 @@ class InvoiceLifecycle:
         )
         return record
 
+    def delete_invoice(self, invoice_id: int, *, recorded_by: str) -> None:
+        invoice = self._require_invoice(invoice_id)
+        deletable_statuses = {
+            "Awaiting AI Extraction",
+            "Needs Review",
+            "Awaiting PO Matching",
+            "PO Query / Matching Issue",
+            "Awaiting Sage Registration",
+        }
+        if invoice.status not in deletable_statuses:
+            raise InvoiceLifecycleError(
+                "Invoices can only be deleted before they enter approval or "
+                "payment processing."
+            )
+
+        if invoice.sharepoint_item_id:
+            if self.sharepoint_client is None:
+                raise InvoiceLifecycleError(
+                    "The SharePoint PDF cannot be deleted because SharePoint "
+                    "is not configured."
+                )
+            try:
+                self.sharepoint_client.delete_item(invoice.sharepoint_item_id)
+            except SharePointError as error:
+                raise InvoiceLifecycleError(str(error)) from error
+
+        pdf_path = Path(invoice.stored_path)
+        try:
+            if pdf_path.is_file() or pdf_path.is_symlink():
+                pdf_path.unlink()
+        except OSError as error:
+            raise InvoiceLifecycleError(
+                f"The local invoice PDF could not be deleted: {error}"
+            ) from error
+
+        try:
+            self.invoice_store.delete(invoice_id)
+        except KeyError as error:
+            raise InvoiceLifecycleError(str(error)) from error
+        self.activity_feed.add_event(
+            event_type="invoice_deleted",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"'{invoice.original_filename}' was permanently deleted by "
+                f"{recorded_by} before approval/payment processing."
+            ),
+            invoice_id=invoice_id,
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1091,6 +1295,35 @@ class InvoiceLifecycle:
         if invoice is None:
             raise InvoiceLifecycleError(f"Invoice {invoice_id} was not found.")
         return invoice
+
+    def _flag_detected_statement(
+        self,
+        document: InvoiceRecord,
+        classification: DocumentClassification,
+    ) -> InvoiceRecord:
+        record = self.invoice_store.update_fields(
+            document.id,
+            document_type="statement",
+            document_classification_confidence=classification.confidence,
+            document_classification_reason=classification.reason,
+            ai_review_warnings=classification.reason,
+            status="Needs Review",
+            review_return_status=None,
+            review_reason=(
+                "Detected as a supplier statement. Select the company and "
+                "file it to SharePoint after manual review."
+            ),
+        )
+        self.activity_feed.add_event(
+            event_type="statement_detected",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"'{document.original_filename}' was detected as a supplier "
+                "statement and needs manual filing."
+            ),
+            invoice_id=document.id,
+        )
+        return record
 
     def _move_pdf_in_sharepoint(
         self,

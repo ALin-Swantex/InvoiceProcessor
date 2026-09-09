@@ -10,7 +10,7 @@ from app.workflow import (
 def confirmed_invoice(
     *,
     original_filename: str = "supplier-invoice.pdf",
-    irj_number: str = "IRJ 001245",
+    irj_number: str = "001245",
     purchase_order_number: str | None = None,
     po_matching_folder: str | None = None,
     purchase_ledger_recipient: str | None = None,
@@ -41,9 +41,9 @@ def test_po_invoice_routes_to_matching_and_plans_notification() -> None:
     assert decision.destination_folder == "/Companies/Example/PO Matching"
     # SOFTWARE_SPEC.md section 5: the IRJ number must be visible against the
     # invoice in SharePoint throughout the whole process -- PO invoices are
-    # no exception, so the filename must be IRJ-prefixed just like nominal
+    # no exception, so the filename must be reference-prefixed just like nominal
     # invoices are below.
-    assert decision.destination_filename == "IRJ-001245_supplier-invoice.pdf"
+    assert decision.destination_filename == "001245_supplier-invoice.pdf"
     assert decision.notification_recipient == "purchase-ledger@example.test"
     assert "PO-7788" in str(decision.notification_reason)
 
@@ -54,19 +54,24 @@ def test_non_po_invoice_routes_to_company_and_prefixes_irj() -> None:
     assert decision.route == "nominal"
     assert decision.status == "Awaiting Nominal Processing"
     assert decision.destination_folder == "/Companies/Example/Invoices"
-    assert decision.destination_filename == "IRJ-001245_supplier-invoice.pdf"
+    assert decision.destination_filename == "001245_supplier-invoice.pdf"
     assert decision.notification_recipient is None
 
 
 def test_irj_prefix_is_idempotent() -> None:
     decision = route_confirmed_invoice(
         confirmed_invoice(
-            irj_number="IRJ-001245",
-            original_filename="IRJ-001245_supplier-invoice.pdf",
+            irj_number="001245",
+            original_filename="001245_supplier-invoice.pdf",
         )
     )
 
-    assert decision.destination_filename == "IRJ-001245_supplier-invoice.pdf"
+    assert decision.destination_filename == "001245_supplier-invoice.pdf"
+
+
+def test_irj_number_requires_exactly_six_digits() -> None:
+    with pytest.raises(RoutingValidationError, match="exactly six digits"):
+        route_confirmed_invoice(confirmed_invoice(irj_number="IRJ-001245"))
 
 
 def test_po_invoice_requires_notification_configuration() -> None:
