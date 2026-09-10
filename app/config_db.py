@@ -126,6 +126,10 @@ def connect(database_path: Path | None = None) -> sqlite3.Connection:
 def get_setting(key: str, default: str | None = None, *, database_path: Path | None = None) -> str | None:
     """Read an admin-tunable setting (e.g. the AI confidence threshold) from
     the process_configuration table. Falls back to `default` if unset."""
+    if database_path is None and _use_postgres_configuration():
+        from app.postgres_config import PostgresProcessConfigurationStore
+
+        return PostgresProcessConfigurationStore().get(key, default)
     with connect(database_path) as connection:
         row = connection.execute(
             "SELECT value FROM process_configuration WHERE key = ?", (key,)
@@ -134,6 +138,11 @@ def get_setting(key: str, default: str | None = None, *, database_path: Path | N
 
 
 def set_setting(key: str, value: str, *, database_path: Path | None = None) -> None:
+    if database_path is None and _use_postgres_configuration():
+        from app.postgres_config import PostgresProcessConfigurationStore
+
+        PostgresProcessConfigurationStore().set(key, value)
+        return
     with connect(database_path) as connection:
         connection.execute(
             """
@@ -143,3 +152,37 @@ def set_setting(key: str, value: str, *, database_path: Path | None = None) -> N
             (key, value),
         )
         connection.commit()
+
+
+class SQLiteProcessConfigurationStore:
+    def __init__(self, database_path: Path | None = None) -> None:
+        self.database_path = database_path
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        return get_setting(key, default, database_path=self.database_path)
+
+    def set(self, key: str, value: str) -> None:
+        set_setting(key, value, database_path=self.database_path)
+
+
+def configuration_backend(invoice_backend: str | None = None) -> str:
+    explicit_backend = os.environ.get("CONFIG_STORE_BACKEND")
+    if explicit_backend is not None:
+        backend = explicit_backend.strip().lower()
+    else:
+        selected_invoice_backend = (
+            invoice_backend
+            if invoice_backend is not None
+            else os.environ.get("INVOICE_STORE_BACKEND", "sqlite")
+        ).strip().lower()
+        backend = "postgres" if selected_invoice_backend == "postgres" else "sqlite"
+    if backend not in {"sqlite", "postgres"}:
+        raise ValueError(
+            f"Unknown CONFIG_STORE_BACKEND '{backend}'. "
+            "Expected 'sqlite' or 'postgres'."
+        )
+    return backend
+
+
+def _use_postgres_configuration() -> bool:
+    return configuration_backend() == "postgres"

@@ -138,9 +138,9 @@ pytest
 ## Integration boundary
 
 SharePoint is the canonical PDF store. The worker keeps a disposable local
-processing/preview cache. SQLite stores the notification queue and local admin
-configuration; invoice records, activity events, and IRJ numbering can use
-either SQLite or PostgreSQL.
+processing/preview cache. SQLite stores the notification queue; invoice records,
+activity events, IRJ numbering, companies, suppliers, approval routes, supplier
+payment settings, and process configuration can use either SQLite or PostgreSQL.
 
 ## Prepared Azure integrations
 
@@ -157,7 +157,8 @@ required. Assign the service principal the **Cognitive Services User** role on
 the resource.
 
 Set `INVOICE_STORE_BACKEND=postgres` to use Azure Database for PostgreSQL for
-invoice metadata, the activity feed, and atomic IRJ numbering. Configure
+invoice metadata, the activity feed, atomic IRJ numbering, and admin-maintained
+business configuration. Configure
 `AZURE_POSTGRES_HOST`, `AZURE_POSTGRES_DATABASE`, and `AZURE_POSTGRES_USER`.
 When `AZURE_POSTGRES_PASSWORD` is omitted, the application obtains an Entra
 token for PostgreSQL using the Invoice MCP credentials. Apply transactional
@@ -167,11 +168,9 @@ schema migrations with a DBA/deployment identity using
 `app/postgres_runtime_grants.sql.template` to grant the mapped Invoice MCP role
 the required DML permissions. SQLite remains the default for offline testing.
 
-The first PostgreSQL phase moves invoices, activity events, and IRJ numbering.
-Company, supplier, approval, user, and company-access tables are included in
-the authoritative schema but remain on the existing local stores until their
-PostgreSQL adapters and Entra web sign-in are activated. Row-level security is
-therefore intentionally not enabled yet.
+Users and sessions remain in the existing authentication store until Entra web
+sign-in is activated. Row-level security is therefore intentionally not enabled
+yet.
 
 ### Local PostgreSQL testing
 
@@ -196,18 +195,21 @@ DATABASE_URL=postgresql://invoice_processor:local-password@127.0.0.1:5432/invoic
 AZURE_POSTGRES_AUTO_MIGRATE=false
 ```
 
-Apply the schema once, then restart both the web application and worker:
+Apply the schema, import the existing SQLite configuration once, then restart
+both the web application and worker:
 
 ```bash
 python -m app.postgres_migrate
+python -m app.postgres_config_migrate --source runtime_data/config.db
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8765
 python -m app.outlook_worker
 ```
 
-The remaining admin configuration stores (companies, suppliers, approval
-matrix, supplier payment settings, and users) continue to use local SQLite
-during this phase. Switching the invoice backend does not upload test metadata
-to Azure PostgreSQL.
+The import is transactional and idempotent, so it can be rerun safely before
+retiring the SQLite configuration file. Set `CONFIG_STORE_BACKEND=sqlite` to
+retain SQLite configuration while using PostgreSQL invoices; otherwise the
+configuration backend follows `INVOICE_STORE_BACKEND`. Users continue to use
+the authentication store during this phase.
 
 ## Direct Microsoft Graph access
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -61,8 +62,21 @@ def test_missing_password_uses_entra_token_as_connection_password() -> None:
 
 
 def test_optional_dependencies_are_not_imported_by_module_import() -> None:
-    assert "psycopg" not in sys.modules
-    assert "azure.identity" not in sys.modules
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import app.postgres_settings; "
+                "assert 'psycopg' not in sys.modules; "
+                "assert 'azure.identity' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class FakeCursor:

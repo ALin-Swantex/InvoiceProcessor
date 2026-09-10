@@ -37,7 +37,10 @@ from app.company_folders import (
     discover_company_folder_structures,
 )
 from app.companies import CompanyProfile, CompanyStore
-from app.config_db import config_database_path, set_setting
+from app.config_db import (
+    SQLiteProcessConfigurationStore,
+    configuration_backend,
+)
 from app.environment import load_project_environment
 from app.invoice_lifecycle import (
     InvoiceExtractionUnavailableError,
@@ -366,18 +369,40 @@ def create_app(
     app.state.sharepoint_folder_paths = None
     app.state.sharepoint_company_structures = None
     app.state.auth_store = auth_store or auth_store_from_environment()
-    app.state.companies_store = companies_store or CompanyStore(
-        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
+    config_store_backend = configuration_backend(invoice_store_backend)
+    use_postgres_config = (
+        invoice_store is None
+        and config_store_backend == "postgres"
+        and companies_store is None
+        and suppliers_store is None
+        and approval_matrix_store is None
+        and supplier_terms_store is None
     )
-    app.state.suppliers_store = suppliers_store or SupplierStore(
-        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
-    )
-    app.state.approval_matrix_store = approval_matrix_store or ApprovalMatrixStore(
-        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
-    )
-    app.state.supplier_terms_store = supplier_terms_store or SupplierTermsStore(
-        Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
-    )
+    if use_postgres_config:
+        from app.postgres_config import postgres_config_stores
+
+        (
+            app.state.companies_store,
+            app.state.suppliers_store,
+            app.state.approval_matrix_store,
+            app.state.supplier_terms_store,
+            app.state.process_configuration_store,
+        ) = postgres_config_stores()
+    else:
+        config_path = Path(
+            os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db")
+        )
+        app.state.companies_store = companies_store or CompanyStore(config_path)
+        app.state.suppliers_store = suppliers_store or SupplierStore(config_path)
+        app.state.approval_matrix_store = (
+            approval_matrix_store or ApprovalMatrixStore(config_path)
+        )
+        app.state.supplier_terms_store = (
+            supplier_terms_store or SupplierTermsStore(config_path)
+        )
+        app.state.process_configuration_store = SQLiteProcessConfigurationStore(
+            config_path
+        )
     app.state.lifecycle = InvoiceLifecycle(
         app.state.invoice_store,
         app.state.irj_generator,
@@ -1352,6 +1377,19 @@ def create_app(
                     </form>
                   </div>
 
+                  <div class="admin-block" id="admin-metrics-placeholder">
+                    <h3>Metrics</h3>
+                    <p class="admin-help">
+                      Power BI reporting will appear here. Planned metrics include
+                      invoice volume and value, processing time by stage, AI
+                      confidence and manual-review rates, approval turnaround,
+                      payment performance, and reconciliation completion.
+                    </p>
+                    <button type="button" class="secondary" disabled>
+                      Power BI dashboard — coming soon
+                    </button>
+                  </div>
+
                   <div class="admin-block">
                     <h3>Users</h3>
                     <form class="admin-form" id="admin-user-form">
@@ -1424,6 +1462,7 @@ def create_app(
             let adminSupplierTerms = [];
             let supplierRequestSequence = 0;
             let invoiceRefreshSequence = 0;
+            let renderedInvoiceSnapshot = null;
             let activityPollTimer = null;
             let invoicePollTimer = null;
             const expandedInvoiceIds = new Set();
@@ -1643,6 +1682,9 @@ def create_app(
                 }
                 const refreshedInvoices = await response.json();
                 if (requestSequence !== invoiceRefreshSequence) return;
+                const refreshedSnapshot = JSON.stringify(refreshedInvoices);
+                if (refreshedSnapshot === renderedInvoiceSnapshot) return;
+                renderedInvoiceSnapshot = refreshedSnapshot;
                 invoices = refreshedInvoices;
                 renderAllSections();
                 updateCounts();
@@ -4428,7 +4470,11 @@ def create_app(
     def admin_get_ai_threshold(user: User = Depends(require_role(ROLE_ADMIN))) -> dict[str, float]:
         from app.ai_extraction import confidence_threshold
 
-        return {"threshold": confidence_threshold()}
+        return {
+            "threshold": confidence_threshold(
+                app.state.process_configuration_store.get
+            )
+        }
 
     @app.put("/api/admin/ai-threshold")
     def admin_set_ai_threshold(
@@ -4436,8 +4482,8 @@ def create_app(
     ) -> dict[str, float]:
         if not 0.0 <= request.threshold <= 1.0:
             raise HTTPException(status_code=422, detail="Threshold must be between 0.0 and 1.0.")
-        set_setting(
-            "ai_confidence_threshold", str(request.threshold), database_path=config_database_path()
+        app.state.process_configuration_store.set(
+            "ai_confidence_threshold", str(request.threshold)
         )
         return {"threshold": request.threshold}
 

@@ -222,6 +222,7 @@ def test_uncertain_present_po_number_requires_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CONFIG_DB_PATH", str(tmp_path / "config.db"))
+    monkeypatch.setenv("CONFIG_STORE_BACKEND", "sqlite")
     monkeypatch.setenv("AI_CONFIDENCE_THRESHOLD", "0.80")
     pdf = tmp_path / "invoice.pdf"
     pdf.write_bytes(b"%PDF-1.7\ninvoice\n%%EOF")
@@ -242,6 +243,7 @@ def test_admin_threshold_overrides_environment_default(
 ) -> None:
     config_path = tmp_path / "config.db"
     monkeypatch.setenv("CONFIG_DB_PATH", str(config_path))
+    monkeypatch.setenv("CONFIG_STORE_BACKEND", "sqlite")
     monkeypatch.setenv("AI_CONFIDENCE_THRESHOLD", "0.90")
     set_setting("ai_confidence_threshold", "0.70", database_path=config_path)
     pdf = tmp_path / "invoice.pdf"

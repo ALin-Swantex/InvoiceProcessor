@@ -46,6 +46,8 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert 'id="payment-method"' in home.text
     assert '<select id="admin-import-company" required>' in home.text
     assert "Supplier payment settings" in home.text
+    assert 'id="admin-metrics-placeholder"' in home.text
+    assert "Power BI dashboard — coming soon" in home.text
     assert '<details class="admin-block admin-collapsible">' in home.text
     assert "<summary>Companies</summary>" in home.text
     assert 'id="admin-company-root-folder" required disabled' in home.text
@@ -101,6 +103,8 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert "function clearInvoicePreview()" in home.text
     assert 'document.addEventListener("visibilitychange"' in home.text
     assert "window.clearInterval(invoicePollTimer)" in home.text
+    assert "let renderedInvoiceSnapshot = null;" in home.text
+    assert "if (refreshedSnapshot === renderedInvoiceSnapshot) return;" in home.text
     assert "function activateTab(tab)" in home.text
     assert 'window.addEventListener("beforeunload"' in home.text
     assert "/api/invoice-search?irj_number=${encodeURIComponent(query)}" in home.text
