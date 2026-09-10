@@ -391,10 +391,30 @@ def create_app(
         app.state.sharepoint_client is not None or not auto_configure_sharepoint
     )
 
+    def _sharepoint_startup_status() -> str:
+        # The previous message only reported whether a client had been injected
+        # directly, so a fully configured deployment still logged "not yet
+        # configured" simply because the client is attached lazily on first use.
+        if app.state.sharepoint_client is not None:
+            return "configured"
+        if not auto_configure_sharepoint:
+            return "disabled"
+        required = (
+            "SHAREPOINT_SITE_ID",
+            "SHAREPOINT_DRIVE_ID",
+            "OUTLOOK_MCP_TENANT_ID",
+            "OUTLOOK_MCP_CLIENT_ID",
+            "OUTLOOK_MCP_CLIENT_SECRET",
+        )
+        missing = [name for name in required if not os.environ.get(name, "").strip()]
+        if missing:
+            return f"not configured (missing {', '.join(missing)})"
+        return "configured from environment (client attaches on first use)"
+
     logger.info(
         "Invoice Processor starting: invoice store backend=%s, SharePoint filing=%s",
         invoice_store_backend,
-        "pre-configured" if app.state.sharepoint_client is not None else "not yet configured",
+        _sharepoint_startup_status(),
     )
 
     def _lifecycle() -> InvoiceLifecycle:
