@@ -11,7 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response as FastAPIResponse, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
@@ -30,6 +37,10 @@ from app.auth import (
     require_role,
 )
 from app.bulk_import import find_existing_supplier_imports, import_supplier_workbook
+from app.entra_auth import (
+    EntraAuthClient,
+    entra_auth_client_from_environment,
+)
 from app.company_folders import (
     INCOMING_INVOICES_FOLDER,
     REJECTED_INVOICES_FOLDER,
@@ -51,6 +62,7 @@ from app.pdf_validation import InvalidPdfError, validate_pdf
 from app.sharepoint_intake import SharePointIncomingMonitor
 from app.invoices import InvoiceStore
 from app.irj import IrjNumberGenerator
+from app.metrics import build_metrics
 from app.outlook_notifications import (
     OutlookNotificationStore,
     extract_message_id,
@@ -153,7 +165,7 @@ class PaymentRequest(BaseModel):
     payment_date: str
     supplier_account_number: str | None = None
     payment_reference: str
-    payment_method: str
+    payment_method: str | None = None
 
 
 class ReconciliationRequest(BaseModel):
@@ -166,7 +178,11 @@ class ResumeApprovalRequest(BaseModel):
 
 
 class SageRegistrationRequest(BaseModel):
-    sage_reference: str
+    irj_number: str
+
+
+class PaymentRouteRequest(BaseModel):
+    route: str
 
 
 class RejectInvoiceRequest(BaseModel):
@@ -248,6 +264,11 @@ class ThresholdUpdateRequest(BaseModel):
     threshold: float
 
 
+class IrjConfigurationUpdateRequest(BaseModel):
+    mode: str
+    current_irj: str | None = None
+
+
 class UserCreateRequest(BaseModel):
     username: str
     display_name: str
@@ -312,6 +333,8 @@ def create_app(
     suppliers_store: SupplierStore | None = None,
     approval_matrix_store: ApprovalMatrixStore | None = None,
     supplier_terms_store: SupplierTermsStore | None = None,
+    process_configuration_store: SQLiteProcessConfigurationStore | None = None,
+    entra_auth_client: EntraAuthClient | None = None,
     auto_configure_sharepoint: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="Invoice Intake Prototype", version="0.1.0")
@@ -369,6 +392,17 @@ def create_app(
     app.state.sharepoint_folder_paths = None
     app.state.sharepoint_company_structures = None
     app.state.auth_store = auth_store or auth_store_from_environment()
+    app.state.entra_auth_client = (
+        entra_auth_client
+        if entra_auth_client is not None
+        else entra_auth_client_from_environment()
+    )
+    local_login_setting = os.environ.get("AUTH_LOCAL_LOGIN_ENABLED", "").strip()
+    app.state.local_login_enabled = (
+        local_login_setting.casefold() in {"1", "true", "yes", "on"}
+        if local_login_setting
+        else app.state.entra_auth_client is None
+    )
     config_store_backend = configuration_backend(invoice_store_backend)
     use_postgres_config = (
         invoice_store is None
@@ -400,8 +434,9 @@ def create_app(
         app.state.supplier_terms_store = (
             supplier_terms_store or SupplierTermsStore(config_path)
         )
-        app.state.process_configuration_store = SQLiteProcessConfigurationStore(
-            config_path
+        app.state.process_configuration_store = (
+            process_configuration_store
+            or SQLiteProcessConfigurationStore(config_path)
         )
     app.state.lifecycle = InvoiceLifecycle(
         app.state.invoice_store,
@@ -411,6 +446,7 @@ def create_app(
         companies_store=app.state.companies_store,
         approval_matrix_store=app.state.approval_matrix_store,
         suppliers_store=app.state.suppliers_store,
+        configuration_getter=app.state.process_configuration_store.get,
     )
     app.state.sharepoint_attach_attempted = (
         app.state.sharepoint_client is not None or not auto_configure_sharepoint
@@ -761,6 +797,7 @@ def create_app(
             .dialog-content h2 { margin: 0 0 .35rem; font-size: 1.05rem; }
             .dialog-content p { margin: 0 0 1rem; color: #52606d; font-size: .82rem; }
             .dialog-content .actions { margin: 1rem -1rem -1rem; }
+            #sage-registration-error { color: #c53030; font-size: .8rem; min-height: 1em; margin-top: -.5rem; margin-bottom: .5rem; }
             .admin-edit-fields {
               display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
               gap: .75rem; margin-top: 1rem;
@@ -828,6 +865,30 @@ def create_app(
             .admin-block h3 {
               margin: 0 0 .45rem; color: #243b53; font-size: .98rem;
             }
+            .metrics-toolbar {
+              display: flex; align-items: end; gap: .75rem; margin: .75rem 0;
+            }
+            .metrics-toolbar label { max-width: 220px; }
+            .metrics-grid {
+              display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+              gap: .8rem; margin-top: .8rem;
+            }
+            .metric-panel {
+              min-width: 0; padding: .85rem; border: 1px solid #d9e2ec;
+              border-radius: 8px; background: white;
+            }
+            .metric-panel.wide { grid-column: 1 / -1; }
+            .metric-panel h4 { margin: 0 0 .65rem; color: #243b53; }
+            .metric-bars { display: grid; gap: .35rem; }
+            .metric-bar-row {
+              display: grid; grid-template-columns: minmax(85px, 1fr) 3fr 35px;
+              align-items: center; gap: .5rem; font-size: .78rem;
+            }
+            .metric-bar-track {
+              height: 9px; overflow: hidden; border-radius: 999px; background: #e8eef5;
+            }
+            .metric-bar-fill { height: 100%; border-radius: inherit; background: #2878bd; }
+            .metric-summary { font-size: 1.35rem; font-weight: 700; color: #102a43; }
             details.admin-collapsible { padding: 0; }
             details.admin-collapsible > summary {
               display: flex; align-items: center; justify-content: space-between;
@@ -959,9 +1020,17 @@ def create_app(
               <h1>Swantex</h1>
               <p>Sign in with your staff account to continue.</p>
               <div id="login-error"></div>
-              <label>Username<input id="login-username" autocomplete="username" required></label>
-              <label>Password<input id="login-password" type="password" autocomplete="current-password" required></label>
-              <button type="submit" class="primary" style="width: 100%">Sign in</button>
+              <a
+                id="microsoft-login-button"
+                class="primary hidden"
+                href="/api/auth/microsoft/login"
+                style="display: block; padding: .7rem; text-align: center; text-decoration: none"
+              >Sign in with Microsoft 365</a>
+              <div id="local-login-fields">
+                <label>Username<input id="login-username" autocomplete="username"></label>
+                <label>Password<input id="login-password" type="password" autocomplete="current-password"></label>
+                <button type="submit" class="primary" style="width: 100%">Local sign in</button>
+              </div>
             </form>
           </div>
 
@@ -974,7 +1043,7 @@ def create_app(
                   <input id="payment-date" type="date" required>
                 </label>
                 <label>Payment method
-                  <select id="payment-method" required></select>
+                  <input id="payment-method" disabled>
                 </label>
                 <label>Supplier account
                   <select id="payment-supplier-account"></select>
@@ -992,6 +1061,31 @@ def create_app(
               <div class="actions">
                 <button type="button" class="secondary" id="payment-cancel">Cancel</button>
                 <button type="submit" class="primary">Record payment</button>
+              </div>
+            </form>
+          </dialog>
+
+          <dialog id="sage-registration-dialog">
+            <form id="sage-registration-form" class="dialog-content">
+              <h2>Confirm Sage registration</h2>
+              <p id="sage-registration-context"></p>
+              <div class="grid">
+                <label style="grid-column: 1 / -1">IRJ number (six digits)
+                  <input
+                    id="sage-registration-irj"
+                    inputmode="numeric"
+                    pattern="[0-9]{6}"
+                    maxlength="6"
+                    minlength="6"
+                    autocomplete="off"
+                    required
+                  >
+                </label>
+              </div>
+              <div id="sage-registration-error" class="error"></div>
+              <div class="actions">
+                <button type="button" class="secondary" id="sage-registration-cancel">Cancel</button>
+                <button type="submit" class="primary">Confirm registration</button>
               </div>
             </form>
           </dialog>
@@ -1025,6 +1119,9 @@ def create_app(
               <button data-tab="approver2">Approver 2<span class="count" id="count-approver2">0</span></button>
               <button data-tab="on-hold">On Hold / Query<span class="count" id="count-on-hold">0</span></button>
               <button data-tab="approved">Approved<span class="count" id="count-approved">0</span></button>
+              <button data-tab="payment-bacs">BACS<span class="count" id="count-payment-bacs">0</span></button>
+              <button data-tab="payment-bankline">Bankline<span class="count" id="count-payment-bankline">0</span></button>
+              <button data-tab="payment-foreign-poa">Foreign POA<span class="count" id="count-payment-foreign-poa">0</span></button>
               <button data-tab="reconciliation">Bank Reconciliation<span class="count" id="count-reconciliation">0</span></button>
               <button data-tab="complete">Complete / Filed<span class="count" id="count-complete">0</span></button>
               <button data-tab="rejected">Rejected<span class="count" id="count-rejected">0</span></button>
@@ -1066,11 +1163,6 @@ def create_app(
                         <option value="">No processed Outlook PDFs</option>
                       </select>
                     </label>
-                    <div class="notice">
-                      <strong>i</strong>
-                      <div id="intake-notice">Outlook email and PDF data will be loaded here. Invoice extraction is not connected yet.</div>
-                    </div>
-
                     <details class="manual-upload">
                       <summary>Manually add an invoice to Incoming Invoices</summary>
                       <p class="manual-upload-hint">
@@ -1169,24 +1261,28 @@ def create_app(
 
             <div class="tab-panel active" data-tab-panel="search">
               <section class="card">
-                <div class="card-header"><h2>Search invoices by IRJ number</h2></div>
+                <div class="card-header"><h2>Search invoices</h2></div>
                 <div class="content">
                   <form class="admin-form" id="invoice-search-form">
+                    <select id="invoice-search-company" aria-label="Invoice company">
+                      <option value="">All companies</option>
+                    </select>
+                    <select id="invoice-search-supplier" aria-label="Supplier">
+                      <option value="">All suppliers</option>
+                    </select>
                     <input
                       id="invoice-search-irj"
-                      placeholder="e.g. 000123"
+                      placeholder="IRJ number (optional)"
                       aria-label="IRJ number"
                       inputmode="numeric"
                       pattern="[0-9]{6}"
-                      minlength="6"
                       maxlength="6"
                       autocomplete="off"
-                      required
                     >
                     <button type="submit" class="primary">Search</button>
                   </form>
                   <div id="invoice-search-result" class="empty-state">
-                    Enter an IRJ number to find an invoice.
+                    Select a company or supplier, or enter an IRJ number.
                   </div>
                 </div>
               </section>
@@ -1261,6 +1357,27 @@ def create_app(
               </section>
             </div>
 
+            <div class="tab-panel" data-tab-panel="payment-bacs">
+              <section class="card">
+                <div class="card-header"><h2>Approved for Payment — BACS</h2></div>
+                <div class="content" id="payment-bacs-table"></div>
+              </section>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="payment-bankline">
+              <section class="card">
+                <div class="card-header"><h2>Approved for Payment — Bankline</h2></div>
+                <div class="content" id="payment-bankline-table"></div>
+              </section>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="payment-foreign-poa">
+              <section class="card">
+                <div class="card-header"><h2>Approved for Payment — Foreign POA</h2></div>
+                <div class="content" id="payment-foreign-poa-table"></div>
+              </section>
+            </div>
+
             <div class="tab-panel" data-tab-panel="reconciliation">
               <section class="card">
                 <div class="card-header"><h2>Bank Reconciliation</h2></div>
@@ -1285,6 +1402,35 @@ def create_app(
             <div class="tab-panel" data-tab-panel="admin">
               <section class="card">
                 <div class="content" id="admin-panel">
+                  <details class="admin-block admin-collapsible" id="admin-bi-metrics">
+                    <summary>Power BI metrics</summary>
+                    <div class="admin-collapsible-content">
+                      <div class="metrics-toolbar">
+                        <label>Invoice volume interval
+                          <select id="metrics-granularity">
+                            <option value="day">Daily — last 30 days</option>
+                            <option value="week">Weekly — last 12 weeks</option>
+                            <option value="month" selected>Monthly — last 12 months</option>
+                          </select>
+                        </label>
+                      </div>
+                      <div id="metrics-dashboard" class="empty-state">
+                        Open this section to load metrics.
+                      </div>
+                    </div>
+                  </details>
+
+                  <details class="admin-block admin-collapsible">
+                    <summary>IRJ numbering by company</summary>
+                    <div class="admin-collapsible-content">
+                      <p class="admin-help">
+                        Automatic companies continue from the latest paper IRJ.
+                        Manual companies require a six-digit IRJ during Sage registration.
+                      </p>
+                      <div id="admin-irj-settings"></div>
+                    </div>
+                  </details>
+
                   <div class="admin-block">
                     <h3>Bulk import supplier master data</h3>
                     <p class="admin-help">
@@ -1305,11 +1451,11 @@ def create_app(
                     <div id="admin-import-result"></div>
                   </div>
 
-                  <details class="admin-block admin-collapsible">
+                  <details class="admin-block admin-collapsible" id="admin-companies-config">
                     <summary>Companies</summary>
                     <div class="admin-collapsible-content">
                       <p id="admin-sharepoint-folder-status" class="admin-help">
-                        Loading SharePoint folders…
+                        Open this section to load SharePoint folders.
                       </p>
                       <form class="admin-form" id="admin-company-form">
                         <input id="admin-company-name" placeholder="Company name" required>
@@ -1377,20 +1523,7 @@ def create_app(
                     </form>
                   </div>
 
-                  <div class="admin-block" id="admin-metrics-placeholder">
-                    <h3>Metrics</h3>
-                    <p class="admin-help">
-                      Power BI reporting will appear here. Planned metrics include
-                      invoice volume and value, processing time by stage, AI
-                      confidence and manual-review rates, approval turnaround,
-                      payment performance, and reconciliation completion.
-                    </p>
-                    <button type="button" class="secondary" disabled>
-                      Power BI dashboard — coming soon
-                    </button>
-                  </div>
-
-                  <div class="admin-block">
+                  <div class="admin-block" id="local-user-management">
                     <h3>Users</h3>
                     <form class="admin-form" id="admin-user-form">
                       <input id="admin-user-username" placeholder="Username" required>
@@ -1408,6 +1541,14 @@ def create_app(
                     </form>
                     <div id="admin-users-table"></div>
                   </div>
+                  <div class="admin-block hidden" id="entra-user-management">
+                    <h3>Microsoft 365 roles</h3>
+                    <p>
+                      User access is managed in Microsoft Entra under
+                      Enterprise applications → Invoice Processor → Users and groups.
+                      Assign exactly one Invoice Processor app role to each user or group.
+                    </p>
+                  </div>
                 </div>
               </section>
             </div>
@@ -1422,7 +1563,10 @@ def create_app(
               "approver1": ["Awaiting Approval 1"],
               "approver2": ["Awaiting Approval 2"],
               "on-hold": ["Approval Query / On Hold"],
-              "approved": ["Approved", "Foreign Payment / Awaiting Allocation"],
+              "approved": ["Approved"],
+              "payment-bacs": ["Approved for Payment - BACS"],
+              "payment-bankline": ["Approved for Payment - Bankline"],
+              "payment-foreign-poa": ["Approved for Payment - Foreign POA", "Foreign Payment / Awaiting Allocation"],
               "reconciliation": ["Paid / Awaiting Bank Reconciliation"],
               "complete": ["Reconciled / Complete", "Statement Filed"],
               "rejected": ["Rejected", "Cancelled - Duplicate"],
@@ -1432,8 +1576,8 @@ def create_app(
             // shown to the admin role. Every other tab maps 1:1 onto
             // MANUAL_VS_AUTOMATED.md's manual decision steps.
             const ROLE_TABS = {
-              "admin": ["search", "incoming", "statements", "needs-review", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "reconciliation", "complete", "rejected", "admin"],
-              "purchase_ledger": ["search", "incoming", "statements", "needs-review", "po-matching", "sage-registration", "on-hold", "approved", "reconciliation", "complete", "rejected"],
+              "admin": ["search", "incoming", "statements", "needs-review", "po-matching", "sage-registration", "approver1", "approver2", "on-hold", "approved", "payment-bacs", "payment-bankline", "payment-foreign-poa", "reconciliation", "complete", "rejected", "admin"],
+              "purchase_ledger": ["search", "incoming", "statements", "needs-review", "po-matching", "sage-registration", "on-hold", "approved", "payment-bacs", "payment-bankline", "payment-foreign-poa", "reconciliation", "complete", "rejected"],
               "approver1": ["search", "statements", "approver1"],
               "approver2": ["search", "statements", "approver2"],
               "purchasing": ["search", "statements", "po-matching"],
@@ -1454,17 +1598,22 @@ def create_app(
             let currentTab = storedValue(ACTIVE_TAB_STORAGE_KEY) || "search";
             let lastActivityId = null;
             let currentUser = null;
+            let authConfig = { microsoft_enabled: false, local_enabled: true };
             let invoiceCompanies = [];
             let sharePointCompanyFolders = new Map();
             let adminCompanies = [];
             let adminSuppliers = [];
             let adminMatrix = [];
             let adminSupplierTerms = [];
+            let irjConfigurations = new Map();
             let supplierRequestSequence = 0;
             let invoiceRefreshSequence = 0;
             let renderedInvoiceSnapshot = null;
             let activityPollTimer = null;
             let invoicePollTimer = null;
+            let metricsRefreshTimer = null;
+            let activityEventSource = null;
+            let openedFlaggedInvoiceId = null;
             const expandedInvoiceIds = new Set();
 
             function storedValue(key) {
@@ -1542,9 +1691,6 @@ def create_app(
                 "review-warnings",
                 invoice.ai_review_warnings || invoice.review_reason
               );
-              document.getElementById("intake-notice").textContent =
-                invoice.review_reason ||
-                "This PDF and its email metadata were retrieved from Outlook. AI extraction has not run yet.";
               const duplicateWarning = document.getElementById("duplicate-warning");
               const overrideButton = document.getElementById("override-duplicate-button");
               const cancelDuplicateButton = document.getElementById("cancel-duplicate-button");
@@ -1597,12 +1743,14 @@ def create_app(
               pdfEmpty.style.display = "none";
             }
 
+            function isFlaggedInvoice(invoice) {
+              return invoice.status === "Needs Review";
+            }
+
             function incomingInvoices() {
               return invoices.filter(i =>
-                i.document_type !== "statement" && (
-                  SECTION_STATUSES["incoming"].includes(i.status) ||
-                  SECTION_STATUSES["needs-review"].includes(i.status)
-                )
+                i.document_type !== "statement" &&
+                SECTION_STATUSES["incoming"].includes(i.status)
               );
             }
 
@@ -1642,6 +1790,17 @@ def create_app(
 
             async function refreshPicker() {
               const candidates = incomingInvoices();
+              const openedFlaggedInvoice = invoices.find(
+                invoice =>
+                  String(invoice.id) === String(openedFlaggedInvoiceId) &&
+                  isFlaggedInvoice(invoice) &&
+                  invoice.document_type === "invoice"
+              );
+              if (openedFlaggedInvoice) {
+                candidates.unshift(openedFlaggedInvoice);
+              } else {
+                openedFlaggedInvoiceId = null;
+              }
               if (!candidates.length) {
                 clearInvoicePreview();
                 return;
@@ -1651,10 +1810,14 @@ def create_app(
               for (const invoice of candidates) {
                 const option = document.createElement("option");
                 option.value = invoice.id;
-                option.textContent = `${invoice.original_filename} — ${invoice.subject || "No subject"}`;
+                option.textContent =
+                  `${openedFlaggedInvoice === invoice ? "[Flagged] " : ""}` +
+                  `${invoice.original_filename} — ${invoice.subject || "No subject"}`;
                 picker.appendChild(option);
               }
               const selected = candidates.find(
+                invoice => String(invoice.id) === String(openedFlaggedInvoiceId)
+              ) || candidates.find(
                 invoice => String(invoice.id) === selectedId
               ) || candidates[0];
               picker.value = String(selected.id);
@@ -1676,8 +1839,7 @@ def create_app(
                   { cache: "no-store" }
                 );
                 if (!response.ok) {
-                  document.getElementById("intake-notice").textContent =
-                    "Received invoices could not be loaded.";
+                  showToast("Received invoices could not be loaded.", true);
                   return;
                 }
                 const refreshedInvoices = await response.json();
@@ -1690,8 +1852,10 @@ def create_app(
                 updateCounts();
                 await refreshPicker();
               } catch (error) {
-                document.getElementById("intake-notice").textContent =
-                  "Received invoices could not be loaded. Retrying automatically.";
+                showToast(
+                  "Received invoices could not be loaded. Retrying automatically.",
+                  true
+                );
               }
             }
 
@@ -1702,13 +1866,40 @@ def create_app(
               invoiceCompanies = companies;
               const select = document.getElementById("preview-company");
               select.innerHTML = '<option value="">Select company…</option>';
+              const searchSelect = document.getElementById("invoice-search-company");
+              searchSelect.innerHTML = '<option value="">All companies</option>';
               for (const company of companies) {
                 const option = document.createElement("option");
                 option.value = company.name;
                 option.textContent = company.name;
                 select.appendChild(option);
+                const searchOption = option.cloneNode(true);
+                searchSelect.appendChild(searchOption);
               }
             }
+
+            async function loadSearchSuppliers(company = "") {
+              const select = document.getElementById("invoice-search-supplier");
+              const response = await fetch(
+                company
+                  ? `/api/suppliers?company=${encodeURIComponent(company)}`
+                  : "/api/suppliers"
+              );
+              if (!response.ok) return;
+              const suppliers = await response.json();
+              select.innerHTML = '<option value="">All suppliers</option>';
+              for (const supplier of suppliers) {
+                const option = document.createElement("option");
+                option.value = supplier.name;
+                option.textContent = supplier.name;
+                select.appendChild(option);
+              }
+            }
+
+            document.getElementById("invoice-search-company").addEventListener(
+              "change",
+              event => loadSearchSuppliers(event.target.value)
+            );
 
             async function loadSuppliers(
               company = document.getElementById("preview-company").value,
@@ -1755,7 +1946,9 @@ def create_app(
 
             function updateCounts() {
               for (const tab of Object.keys(SECTION_STATUSES)) {
-                const count = invoices.filter(i => SECTION_STATUSES[tab].includes(i.status)).length;
+                const count = tab === "incoming"
+                  ? incomingInvoices().length
+                  : invoices.filter(i => SECTION_STATUSES[tab].includes(i.status)).length;
                 const el = document.getElementById(`count-${tab}`);
                 if (el) el.textContent = String(count);
               }
@@ -1837,10 +2030,9 @@ def create_app(
                       ${analysisField("Received", invoice.received_at)}
                       ${analysisField("Subject", invoice.subject)}
                     </dl>
-                    ${invoice.sage_reference || invoice.approver1_name ? `
+                    ${invoice.approver1_name ? `
                       <h4>Processing</h4>
                       <dl class="invoice-analysis-list">
-                        ${analysisField("Sage reference", invoice.sage_reference)}
                         ${analysisField("Approver 1", invoice.approver1_name)}
                         ${analysisField("Approver 1 decision", invoice.approver1_decision)}
                         ${analysisField("Approver 2", invoice.approver2_name)}
@@ -1853,10 +2045,18 @@ def create_app(
               `;
             }
 
-            function renderSectionTable(containerId, statuses, columns, actionsFn) {
+            function renderSectionTable(
+              containerId,
+              statuses,
+              columns,
+              actionsFn,
+              rowFilter = () => true
+            ) {
               const container = document.getElementById(containerId);
               if (!container) return;
-              const rows = invoices.filter(i => statuses.includes(i.status));
+              const rows = invoices.filter(
+                i => statuses.includes(i.status) && rowFilter(i)
+              );
               if (!rows.length) {
                 container.innerHTML = '<div class="empty-state">No documents in this section.</div>';
                 return;
@@ -1923,26 +2123,39 @@ def create_app(
               async event => {
                 event.preventDefault();
                 const query = document.getElementById("invoice-search-irj").value.trim();
+                const company = document.getElementById("invoice-search-company").value;
+                const supplier = document.getElementById("invoice-search-supplier").value;
                 const result = document.getElementById("invoice-search-result");
                 result.className = "empty-state";
                 result.textContent = "Searching…";
                 try {
-                  const response = await fetch(
-                    `/api/invoice-search?irj_number=${encodeURIComponent(query)}`
-                  );
-                  if (response.status === 404) {
-                    result.textContent = `No invoice was found for ${query}.`;
-                    return;
+                  if (!query && !company && !supplier) {
+                    throw new Error("Select a company or supplier, or enter an IRJ number.");
                   }
+                  if (query && (query.length !== 6 || !/^\\d+$/.test(query))) {
+                    throw new Error("An IRJ number must contain exactly six digits.");
+                  }
+                  const params = new URLSearchParams();
+                  if (query) params.set("irj_number", query);
+                  if (company) params.set("company", company);
+                  if (supplier) params.set("supplier", supplier);
+                  const response = await fetch(
+                    `/api/invoice-search/filter?${params}`
+                  );
                   if (!response.ok) {
                     const body = await response.json().catch(() => ({}));
                     throw new Error(body.detail || "Invoice search failed.");
                   }
-                  const invoice = await response.json();
+                  const matches = await response.json();
+                  if (!matches.length) {
+                    result.textContent = "No matching invoices were found.";
+                    return;
+                  }
                   result.className = "";
-                  result.innerHTML =
-                    `<div class="actions">${pdfLinkButton(invoice)}</div>` +
-                    invoiceAnalysisHtml(invoice);
+                  result.innerHTML = matches.map(invoice =>
+                    `<div class="metric-panel"><div class="actions">${pdfLinkButton(invoice)}</div>` +
+                    `${invoiceAnalysisHtml(invoice)}</div>`
+                  ).join("");
                 } catch (error) {
                   result.textContent = error.message;
                   showToast(error.message, true);
@@ -2028,6 +2241,99 @@ def create_app(
               });
             }
 
+            function formatMetricMoney(value, currency) {
+              try {
+                return new Intl.NumberFormat("en-GB", {
+                  style: "currency",
+                  currency: currency || "GBP",
+                }).format(Number(value));
+              } catch (error) {
+                return `${currency || "GBP"} ${Number(value).toFixed(2)}`;
+              }
+            }
+
+            function metricValueTable(rows, firstHeading) {
+              if (!rows.length) return '<div class="empty-state">No matching invoices.</div>';
+              return '<table class="section-table"><thead><tr>' +
+                `<th>${escapeHtml(firstHeading)}</th><th>Invoices</th><th>Value</th>` +
+                '</tr></thead><tbody>' +
+                rows.map(row => `<tr><td>${escapeHtml(row.name)}</td>` +
+                  `<td>${escapeHtml(row.count)}</td>` +
+                  `<td>${escapeHtml(formatMetricMoney(row.value, row.currency))}</td></tr>`
+                ).join("") + '</tbody></table>';
+            }
+
+            function dueDateTable(rows) {
+              if (!rows.length) return '<div class="empty-state">None.</div>';
+              return '<table class="section-table"><thead><tr>' +
+                '<th>IRJ</th><th>Company</th><th>Supplier</th><th>Due</th><th>Value</th>' +
+                '</tr></thead><tbody>' +
+                rows.map(row => `<tr><td>${escapeHtml(row.irj_number || "—")}</td>` +
+                  `<td>${escapeHtml(row.company)}</td><td>${escapeHtml(row.supplier)}</td>` +
+                  `<td>${escapeHtml(row.due_date)}</td>` +
+                  `<td>${escapeHtml(row.value == null ? "—" : formatMetricMoney(row.value, row.currency))}</td></tr>`
+                ).join("") + '</tbody></table>';
+            }
+
+            async function loadMetrics() {
+              const dashboard = document.getElementById("metrics-dashboard");
+              const granularity = document.getElementById("metrics-granularity").value;
+              dashboard.className = "empty-state";
+              dashboard.textContent = "Loading metrics…";
+              try {
+                const response = await fetch(
+                  `/api/admin/metrics?granularity=${encodeURIComponent(granularity)}`
+                );
+                if (!response.ok) {
+                  const body = await response.json().catch(() => ({}));
+                  throw new Error(body.detail || "Metrics could not be loaded.");
+                }
+                const metrics = await response.json();
+                const maximum = Math.max(1, ...metrics.volume.map(row => row.count));
+                const totalVolume = metrics.volume.reduce((sum, row) => sum + row.count, 0);
+                dashboard.className = "metrics-grid";
+                dashboard.innerHTML = `
+                  <section class="metric-panel wide">
+                    <h4>Invoice volume <span class="metric-summary">${totalVolume}</span></h4>
+                    <div class="metric-bars">
+                      ${metrics.volume.map(row => `
+                        <div class="metric-bar-row">
+                          <span>${escapeHtml(row.period)}</span>
+                          <div class="metric-bar-track"><div class="metric-bar-fill"
+                            style="width: ${Math.round((row.count / maximum) * 100)}%"></div></div>
+                          <strong>${escapeHtml(row.count)}</strong>
+                        </div>
+                      `).join("")}
+                    </div>
+                  </section>
+                  <section class="metric-panel">
+                    <h4>Overdue invoices (${metrics.due_dates.overdue.length})</h4>
+                    ${dueDateTable(metrics.due_dates.overdue)}
+                  </section>
+                  <section class="metric-panel">
+                    <h4>Due within 7 days (${metrics.due_dates.approaching.length})</h4>
+                    ${dueDateTable(metrics.due_dates.approaching)}
+                  </section>
+                  <section class="metric-panel wide">
+                    <h4>Total pending invoice value by company</h4>
+                    ${metricValueTable(metrics.pending_by_company, "Company")}
+                  </section>
+                  <section class="metric-panel wide">
+                    <h4>Spend by supplier and company</h4>
+                    ${metricValueTable(metrics.spend_by_supplier_company, "Company — Supplier")}
+                  </section>
+                  ${metrics.due_dates.unavailable_count ? `
+                    <p class="admin-help">${metrics.due_dates.unavailable_count} pending invoice(s)
+                    have no calculable due date because the invoice date or deterministic payment
+                    terms are unavailable.</p>
+                  ` : ""}
+                `;
+              } catch (error) {
+                dashboard.className = "empty-state";
+                dashboard.textContent = error.message;
+              }
+            }
+
             function renderAllSections() {
               renderSectionTable(
                 "needs-review-table",
@@ -2048,9 +2354,12 @@ def create_app(
                   <button data-action="file-statement" data-id="${invoice.id}">File as statement</button>
                   ${invoice.review_return_status ? `
                     <button data-action="accept-review" data-id="${invoice.id}">Accept</button>
-                    <button data-action="reject-review" data-id="${invoice.id}" class="danger">Reject</button>
                   ` : ""}
-                `
+                  ${invoice.document_type === "invoice" ? `
+                    <button data-action="reject-flagged" data-id="${invoice.id}" class="danger">Reject</button>
+                  ` : ""}
+                `,
+                isFlaggedInvoice
               );
               renderSectionTable(
                 "po-matching-table",
@@ -2071,7 +2380,7 @@ def create_app(
                 BASE_COLUMNS,
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="register-sage" data-id="${invoice.id}">Confirm Sage registration</button>
+                  <button data-action="register-sage" data-id="${invoice.id}" data-irj="${escapeHtml(invoice.irj_number || "")}">Confirm Sage registration / IRJ</button>
                 `
               );
               renderSectionTable(
@@ -2109,18 +2418,31 @@ def create_app(
                 "approved-table",
                 SECTION_STATUSES["approved"],
                 BASE_COLUMNS,
-                invoice => invoice.status === "Foreign Payment / Awaiting Allocation"
-                  ? `
-                    ${pdfLinkButton(invoice)}
-                    <button data-action="allocate-foreign" data-id="${invoice.id}">Mark allocated</button>
-                    <button data-action="revert-foreign" data-id="${invoice.id}" class="secondary">Not foreign — return</button>
-                  `
-                  : `
-                    ${pdfLinkButton(invoice)}
-                    <button data-action="pay" data-id="${invoice.id}">Record domestic payment</button>
-                    <button data-action="route-foreign" data-id="${invoice.id}" class="secondary">Foreign payment</button>
-                  `
+                invoice => `
+                  ${pdfLinkButton(invoice)}
+                  <button data-action="select-payment-route" data-route="bacs" data-id="${invoice.id}">BACS</button>
+                  <button data-action="select-payment-route" data-route="bankline" data-id="${invoice.id}">Bankline</button>
+                  <button data-action="select-payment-route" data-route="foreign_poa" data-id="${invoice.id}">Foreign POA</button>
+                `
               );
+              for (const [containerId, section] of [
+                ["payment-bacs-table", "payment-bacs"],
+                ["payment-bankline-table", "payment-bankline"],
+                ["payment-foreign-poa-table", "payment-foreign-poa"],
+              ]) {
+                renderSectionTable(
+                  containerId,
+                  SECTION_STATUSES[section],
+                  [
+                    ...BASE_COLUMNS,
+                    { label: "Payment route", value: i => i.payment_method || "—" },
+                  ],
+                  invoice => `
+                    ${pdfLinkButton(invoice)}
+                    <button data-action="pay" data-id="${invoice.id}">Record payment</button>
+                  `
+                );
+              }
               renderSectionTable(
                 "reconciliation-table",
                 SECTION_STATUSES["reconciliation"],
@@ -2139,7 +2461,8 @@ def create_app(
                 SECTION_STATUSES["complete"],
                 [
                   ...BASE_COLUMNS,
-                  { label: "Completed", value: i => i.reconciliation_date || i.foreign_allocation_date || "—" },
+                  { label: "Marked reconciled", value: i => i.reconciled_at ? i.reconciled_at.slice(0, 10) : "—" },
+                  { label: "Appeared on bank statement", value: i => i.reconciliation_date || "—" },
                   { label: "Completed by", value: i => i.reconciled_by || i.foreign_allocated_by || "—" },
                 ],
                 invoice => pdfLinkButton(invoice)
@@ -2183,7 +2506,6 @@ def create_app(
               const form = document.getElementById("payment-form");
               const method = document.getElementById("payment-method");
               const account = document.getElementById("payment-supplier-account");
-              const standardMethods = ["BACS", "Direct Debit", "CHAPS", "Card", "Cheque", "Other"];
               const profiles = terms.profiles || [];
               account.innerHTML = profiles.length
                 ? profiles.map(profile =>
@@ -2196,14 +2518,7 @@ def create_app(
               account.disabled = !profiles.length;
               const applyProfile = () => {
                 const profile = profiles.find(item => item.supplier_account_number === account.value) || profiles[0] || {};
-                const methods = [...standardMethods];
-                if (profile.default_payment_method && !methods.includes(profile.default_payment_method)) {
-                  methods.unshift(profile.default_payment_method);
-                }
-                method.innerHTML = methods
-                  .map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`)
-                  .join("");
-                method.value = profile.default_payment_method || "BACS";
+                method.value = invoice.payment_method || "";
                 document.getElementById("payment-terms").value = profile.payment_terms_notice || "";
                 document.getElementById("payment-bank-account").value = profile.bank_account || "";
               };
@@ -2238,6 +2553,46 @@ def create_app(
               });
             }
 
+            async function collectSageRegistration(invoice) {
+              const dialog = document.getElementById("sage-registration-dialog");
+              const form = document.getElementById("sage-registration-form");
+              const irjInput = document.getElementById("sage-registration-irj");
+              const errorEl = document.getElementById("sage-registration-error");
+              document.getElementById("sage-registration-context").textContent =
+                `${invoice.supplier || "Supplier"} — ${invoice.original_filename}`;
+              irjInput.value = invoice.irj_number || "";
+              const irjSetting = irjConfigurations.get(invoice.company);
+              const isManual = irjSetting ? irjSetting.mode === "manual" : false;
+              irjInput.readOnly = !isManual && Boolean(invoice.irj_number);
+              irjInput.title = isManual
+                ? "Enter the IRJ from the paper records."
+                : "This IRJ was allocated automatically.";
+              errorEl.textContent = "";
+
+              return new Promise(resolve => {
+                let settled = false;
+                const finish = value => {
+                  if (settled) return;
+                  settled = true;
+                  resolve(value);
+                };
+                form.onsubmit = event => {
+                  event.preventDefault();
+                  const irjNumber = irjInput.value.trim();
+                  if (!/^\\d{6}$/.test(irjNumber)) {
+                    errorEl.textContent = "Enter exactly six digits.";
+                    return;
+                  }
+                  dialog.close();
+                  finish(irjNumber);
+                };
+                document.getElementById("sage-registration-cancel").onclick = () => dialog.close();
+                dialog.onclose = () => finish(null);
+                dialog.showModal();
+                irjInput.focus();
+              });
+            }
+
             async function handleRowAction(button) {
               const action = button.dataset.action;
               const id = button.dataset.id;
@@ -2249,10 +2604,9 @@ def create_app(
                 if (action === "po-match") {
                   await postJson(`/api/invoices/${id}/po-match`, { matched: true, notes: null });
                 } else if (action === "open-review") {
+                  openedFlaggedInvoiceId = id;
                   document.querySelector('#section-nav button[data-tab="incoming"]').click();
-                  picker.value = String(id);
-                  const invoice = invoices.find(item => String(item.id) === String(id));
-                  if (invoice) showInvoice(invoice);
+                  await refreshPicker();
                   return;
                 } else if (action === "file-statement") {
                   const company = button.closest("tr")
@@ -2270,13 +2624,10 @@ def create_app(
                     accepted: true,
                     reason: null,
                   });
-                } else if (action === "reject-review") {
+                } else if (action === "reject-flagged") {
                   const reason = window.prompt("Reason for rejecting this invoice:");
                   if (!reason) return;
-                  await postJson(`/api/invoices/${id}/review-decision`, {
-                    accepted: false,
-                    reason,
-                  });
+                  await postJson(`/api/invoices/${id}/reject-flagged`, { reason });
                 } else if (action === "po-query") {
                   const notes = window.prompt("Describe the PO matching issue:");
                   if (notes === null) return;
@@ -2295,10 +2646,12 @@ def create_app(
                   if (!reason) return;
                   await postJson(`/api/invoices/${id}/reject`, { reason });
                 } else if (action === "register-sage") {
-                  const sageReference = window.prompt("Sage registration reference:");
-                  if (!sageReference) return;
+                  const invoice = invoices.find(item => String(item.id) === String(id));
+                  if (!invoice) throw new Error("Invoice could not be found.");
+                  const irjNumber = await collectSageRegistration(invoice);
+                  if (!irjNumber) return;
                   await postJson(`/api/invoices/${id}/register-sage`, {
-                    sage_reference: sageReference,
+                    irj_number: irjNumber,
                   });
                 } else if (action === "approve" || action === "reject") {
                   const comments = window.prompt(
@@ -2321,29 +2674,18 @@ def create_app(
                 } else if (action === "resume") {
                   const notes = window.prompt("Resolution notes for resuming approval (optional):");
                   await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
+                } else if (action === "select-payment-route") {
+                  await postJson(`/api/invoices/${id}/payment-route`, {
+                    route: button.dataset.route,
+                  });
                 } else if (action === "pay") {
                   const invoice = invoices.find(item => String(item.id) === String(id));
                   if (!invoice) throw new Error("Invoice could not be found.");
                   const payment = await collectDomesticPayment(invoice);
                   if (!payment) return;
                   await postJson(`/api/invoices/${id}/pay`, payment);
-                } else if (action === "route-foreign") {
-                  if (!window.confirm("Confirm this is a foreign payment requiring allocation?")) return;
-                  await postJson(`/api/invoices/${id}/route-foreign-payment`, {});
-                } else if (action === "revert-foreign") {
-                  if (!window.confirm("Return this invoice to the domestic payment route?")) return;
-                  await postJson(`/api/invoices/${id}/revert-foreign-payment`, {});
-                } else if (action === "allocate-foreign") {
-                  const allocationDate = window.prompt("Allocation date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
-                  if (!allocationDate) return;
-                  const allocationReference = window.prompt("Foreign payment allocation reference:");
-                  if (!allocationReference) return;
-                  await postJson(`/api/invoices/${id}/allocate-foreign-payment`, {
-                    allocation_date: allocationDate,
-                    allocation_reference: allocationReference,
-                  });
                 } else if (action === "reconcile") {
-                  const reconciliationDate = window.prompt("Reconciliation date (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
+                  const reconciliationDate = window.prompt("Date shown on bank statement (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
                   if (!reconciliationDate) return;
                   const notes = window.prompt("Reconciliation notes (optional):");
                   await postJson(`/api/invoices/${id}/reconcile`, {
@@ -2418,10 +2760,10 @@ def create_app(
 
             document.getElementById("retry-approval-route-button").addEventListener("click", async () => {
               const invoice = invoices.find(item => String(item.id) === picker.value);
-              if (!invoice || !invoice.sage_reference) return;
+              if (!invoice || !invoice.irj_number) return;
               try {
                 await postJson(`/api/invoices/${invoice.id}/register-sage`, {
-                  sage_reference: invoice.sage_reference,
+                  irj_number: invoice.irj_number,
                 });
                 showToast("Approver route checked again.");
                 await loadInvoices();
@@ -2431,7 +2773,7 @@ def create_app(
             });
 
             async function submitConfirm(overrideDuplicate) {
-              const invoiceId = picker.value;
+              const invoiceId = displayedInvoiceId;
               if (!invoiceId) return;
               const company = document.getElementById("preview-company").value;
               const supplier = document.getElementById("preview-supplier").value;
@@ -2453,6 +2795,7 @@ def create_app(
               };
               try {
                 await postJson(`/api/invoices/${invoiceId}/confirm`, body);
+                openedFlaggedInvoiceId = null;
                 showToast("Invoice routed successfully.");
                 await loadInvoices();
               } catch (error) {
@@ -2486,11 +2829,22 @@ def create_app(
                   throw new Error(detail.detail || `Upload failed (${response.status}).`);
                 }
                 const record = await response.json();
+                const destination = record.status === "Needs Review"
+                  ? "Flagged"
+                  : record.status === "Awaiting AI Extraction"
+                    ? "Incoming Invoices"
+                    : record.status;
                 statusEl.className = "success";
-                statusEl.textContent = `Added to Incoming Invoices as '${record.original_filename}'.`;
+                statusEl.textContent = `Uploaded '${record.original_filename}' to ${destination}.`;
                 event.target.reset();
-                showToast("Invoice manually added to Incoming Invoices.");
+                showToast(`Invoice manually added to ${destination}.`);
+                if (record.status === "Needs Review") {
+                  openedFlaggedInvoiceId = record.id;
+                }
                 await loadInvoices();
+                if (record.status === "Needs Review") {
+                  activateTab("needs-review");
+                }
               } catch (error) {
                 statusEl.className = "error";
                 statusEl.textContent = error.message;
@@ -2551,6 +2905,25 @@ def create_app(
               if (!response.ok) { lastActivityId = 0; return; }
               const events = await response.json();
               lastActivityId = events.length ? events[events.length - 1].id : 0;
+            }
+
+            function connectLiveUpdates() {
+              if (activityEventSource !== null) activityEventSource.close();
+              activityEventSource = new EventSource(
+                `/api/activity/stream?since_id=${lastActivityId || 0}`
+              );
+              activityEventSource.addEventListener("invoice-update", async () => {
+                await pollActivity();
+                if (
+                  currentUser?.role === "admin" &&
+                  document.getElementById("admin-bi-metrics").open
+                ) {
+                  if (metricsRefreshTimer !== null) {
+                    window.clearTimeout(metricsRefreshTimer);
+                  }
+                  metricsRefreshTimer = window.setTimeout(loadMetrics, 3000);
+                }
+              });
             }
 
             // ---------------------------------------------------------
@@ -2901,13 +3274,16 @@ def create_app(
 
             async function loadAdminPanel() {
               try {
-                const [companies, suppliers, matrix, supplierTerms, threshold, users] = await Promise.all([
+                const [companies, suppliers, matrix, supplierTerms, threshold, users, irjSettings] = await Promise.all([
                   fetch("/api/admin/companies").then(r => r.json()),
                   fetch("/api/admin/suppliers").then(r => r.json()),
                   fetch("/api/admin/approval-matrix").then(r => r.json()),
                   fetch("/api/admin/supplier-terms").then(r => r.json()),
                   fetch("/api/admin/ai-threshold").then(r => r.json()),
-                  fetch("/api/admin/users").then(r => r.json()),
+                  authConfig.local_enabled
+                    ? fetch("/api/admin/users").then(r => r.json())
+                    : Promise.resolve([]),
+                  fetch("/api/irj-configurations").then(r => r.json()),
                 ]);
                 adminCompanies = companies;
                 adminSuppliers = suppliers;
@@ -2939,6 +3315,13 @@ def create_app(
                     await fetch(`/api/admin/companies/${encodeURIComponent(name)}`, { method: "DELETE" });
                     await loadAdminPanel();
                     await loadCompanies();
+                    const irjResponse = await fetch("/api/irj-configurations");
+                    if (irjResponse.ok) {
+                      const settings = await irjResponse.json();
+                      irjConfigurations = new Map(
+                        settings.map(setting => [setting.company, setting])
+                      );
+                    }
                   },
                   "name",
                   company => {
@@ -3206,6 +3589,69 @@ def create_app(
                   }
                 );
                 document.getElementById("admin-threshold-value").value = threshold.threshold ?? 0.8;
+                irjConfigurations = new Map(
+                  irjSettings.map(setting => [setting.company, setting])
+                );
+                document.getElementById("admin-irj-settings").innerHTML =
+                  '<table class="section-table"><thead><tr>' +
+                  '<th>Company</th><th>Mode</th><th>Latest paper IRJ</th><th></th>' +
+                  '</tr></thead><tbody>' +
+                  irjSettings.map(setting => `
+                    <tr>
+                      <td>${escapeHtml(setting.company)}</td>
+                      <td>
+                        <select data-irj-mode="${escapeHtml(setting.company)}">
+                          <option value="automatic" ${setting.mode === "automatic" ? "selected" : ""}>Automatic</option>
+                          <option value="manual" ${setting.mode === "manual" ? "selected" : ""}>Manual at Sage</option>
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          data-irj-current="${escapeHtml(setting.company)}"
+                          inputmode="numeric"
+                          pattern="[0-9]{6}"
+                          maxlength="6"
+                          value="${escapeHtml(setting.current_irj || "")}"
+                          placeholder="e.g. 004321"
+                          ${setting.mode === "manual" ? "disabled" : ""}
+                        >
+                      </td>
+                      <td><button data-save-irj="${escapeHtml(setting.company)}">Save</button></td>
+                    </tr>
+                  `).join("") + '</tbody></table>';
+                document.querySelectorAll("[data-irj-mode]").forEach(select => {
+                  select.addEventListener("change", () => {
+                    document.querySelector(
+                      `[data-irj-current="${CSS.escape(select.dataset.irjMode)}"]`
+                    ).disabled = select.value === "manual";
+                  });
+                });
+                document.querySelectorAll("[data-save-irj]").forEach(button => {
+                  button.addEventListener("click", async () => {
+                    const company = button.dataset.saveIrj;
+                    const mode = document.querySelector(
+                      `[data-irj-mode="${CSS.escape(company)}"]`
+                    ).value;
+                    const currentInput = document.querySelector(
+                      `[data-irj-current="${CSS.escape(company)}"]`
+                    );
+                    const currentIrj = currentInput.value.trim();
+                    if (mode === "automatic" && currentIrj && !/^\\d{6}$/.test(currentIrj)) {
+                      showToast("Latest paper IRJ must contain exactly six digits.", true);
+                      return;
+                    }
+                    try {
+                      await putJson(
+                        `/api/admin/irj-configurations/${encodeURIComponent(company)}`,
+                        { mode, current_irj: currentIrj || null }
+                      );
+                      showToast(`${company} IRJ settings saved.`);
+                      await loadAdminPanel();
+                    } catch (error) {
+                      showToast(error.message, true);
+                    }
+                  });
+                });
                 renderSimpleTable(
                   document.getElementById("admin-users-table"),
                   [
@@ -3464,11 +3910,17 @@ def create_app(
             });
 
             document.getElementById("logout-button").addEventListener("click", async () => {
+              if (authConfig.microsoft_enabled && !authConfig.local_enabled) {
+                window.location.href = "/api/auth/microsoft/logout";
+                return;
+              }
               await fetch("/api/auth/logout", { method: "POST" });
               if (activityPollTimer !== null) window.clearInterval(activityPollTimer);
               if (invoicePollTimer !== null) window.clearInterval(invoicePollTimer);
+              if (activityEventSource !== null) activityEventSource.close();
               activityPollTimer = null;
               invoicePollTimer = null;
+              activityEventSource = null;
               currentUser = null;
               appRoot.classList.add("hidden");
               loginScreen.classList.remove("hidden");
@@ -3476,6 +3928,7 @@ def create_app(
 
             document.getElementById("login-form").addEventListener("submit", async event => {
               event.preventDefault();
+              if (!authConfig.local_enabled) return;
               const errorEl = document.getElementById("login-error");
               errorEl.textContent = "";
               const username = document.getElementById("login-username").value;
@@ -3496,6 +3949,28 @@ def create_app(
               }
             });
 
+            async function loadAuthConfig() {
+              const response = await fetch("/api/auth/config");
+              if (!response.ok) return;
+              authConfig = await response.json();
+              const microsoftButton = document.getElementById("microsoft-login-button");
+              const localFields = document.getElementById("local-login-fields");
+              microsoftButton.classList.toggle(
+                "hidden", !authConfig.microsoft_enabled
+              );
+              localFields.classList.toggle("hidden", !authConfig.local_enabled);
+              document.getElementById("login-username").required =
+                authConfig.local_enabled;
+              document.getElementById("login-password").required =
+                authConfig.local_enabled;
+              document.getElementById("local-user-management").classList.toggle(
+                "hidden", !authConfig.local_enabled
+              );
+              document.getElementById("entra-user-management").classList.toggle(
+                "hidden", !authConfig.microsoft_enabled
+              );
+            }
+
             async function enterApp() {
               const response = await fetch("/api/auth/me");
               if (!response.ok) {
@@ -3509,17 +3984,21 @@ def create_app(
               document.getElementById("user-chip-label").textContent =
                 `${currentUser.display_name} (${currentUser.role})`;
               applyRoleVisibility(currentUser.role);
-              await loadCompanies();
+              await Promise.all([
+                loadCompanies(),
+                loadSearchSuppliers(),
+                loadInvoices(),
+              ]);
               await loadSuppliers();
-              await loadInvoices();
               if (currentUser.role === "admin") {
-                await Promise.all([loadAdminPanel(), loadSharePointFolderOptions()]);
+                await loadAdminPanel();
               }
               await initActivityCursor();
               if (activityPollTimer !== null) window.clearInterval(activityPollTimer);
               if (invoicePollTimer !== null) window.clearInterval(invoicePollTimer);
-              activityPollTimer = window.setInterval(pollActivity, 3000);
-              invoicePollTimer = window.setInterval(loadInvoices, 5000);
+              connectLiveUpdates();
+              activityPollTimer = window.setInterval(pollActivity, 30000);
+              invoicePollTimer = window.setInterval(loadInvoices, 120000);
             }
 
             document.addEventListener("visibilitychange", () => {
@@ -3529,36 +4008,133 @@ def create_app(
               }
             });
 
-            enterApp();
+            document.getElementById("admin-bi-metrics").addEventListener(
+              "toggle",
+              event => {
+                if (event.target.open) loadMetrics();
+              }
+            );
+
+            document.getElementById("admin-companies-config").addEventListener(
+              "toggle",
+              event => {
+                if (event.target.open && sharePointCompanyFolders.size === 0) {
+                  loadSharePointFolderOptions();
+                }
+              }
+            );
+            document.getElementById("metrics-granularity").addEventListener(
+              "change",
+              loadMetrics
+            );
+
+            window.addEventListener("beforeunload", () => {
+              if (activityEventSource !== null) activityEventSource.close();
+            });
+
+            loadAuthConfig().then(enterApp);
           </script>
         </body>
         </html>
         """
 
     # ------------------------------------------------------------------
-    # Authentication (see app/auth.py — local placeholder for Entra ID SSO)
+    # Authentication
     # ------------------------------------------------------------------
+
+    def _set_session_cookie(response: FastAPIResponse, token: str) -> None:
+        secure_setting = os.environ.get("AUTH_COOKIE_SECURE", "").strip()
+        secure = (
+            secure_setting.casefold() in {"1", "true", "yes", "on"}
+            if secure_setting
+            else bool(app.state.entra_auth_client)
+        )
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            token,
+            httponly=True,
+            secure=secure,
+            samesite="lax",
+            max_age=12 * 60 * 60,
+        )
+
+    @app.get("/api/auth/config")
+    def auth_config() -> dict[str, bool]:
+        return {
+            "microsoft_enabled": app.state.entra_auth_client is not None,
+            "local_enabled": app.state.local_login_enabled,
+        }
 
     @app.post("/api/auth/login")
     def login(request: LoginRequest, response: FastAPIResponse) -> dict[str, object]:
+        if not app.state.local_login_enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="Local password sign-in is disabled.",
+            )
         try:
             user = app.state.auth_store.authenticate(request.username, request.password)
         except AuthError as error:
             raise HTTPException(status_code=401, detail=str(error)) from error
         token = app.state.auth_store.create_session(user.username)
-        response.set_cookie(
-            SESSION_COOKIE_NAME,
-            token,
-            httponly=True,
-            samesite="lax",
-            max_age=12 * 60 * 60,
-        )
+        _set_session_cookie(response, token)
         return {
             "username": user.username,
             "display_name": user.display_name,
             "email": user.email,
             "role": user.role,
         }
+
+    @app.get("/api/auth/microsoft/login")
+    def microsoft_login() -> RedirectResponse:
+        client = app.state.entra_auth_client
+        if client is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Microsoft 365 sign-in is not configured.",
+            )
+        try:
+            flow = client.initiate_flow()
+            app.state.auth_store.save_oauth_flow(str(flow["state"]), flow)
+        except AuthError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return RedirectResponse(str(flow["auth_uri"]), status_code=302)
+
+    @app.get("/api/auth/microsoft/callback")
+    def microsoft_callback(request: Request) -> RedirectResponse:
+        client = app.state.entra_auth_client
+        if client is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Microsoft 365 sign-in is not configured.",
+            )
+        state = request.query_params.get("state", "")
+        flow = app.state.auth_store.pop_oauth_flow(state)
+        if flow is None:
+            raise HTTPException(
+                status_code=400,
+                detail="The Microsoft sign-in request expired or is invalid.",
+            )
+        try:
+            user = client.complete_flow(flow, request.query_params)
+        except AuthError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+        token = app.state.auth_store.create_federated_session(user)
+        response = RedirectResponse("/", status_code=302)
+        _set_session_cookie(response, token)
+        return response
+
+    @app.get("/api/auth/microsoft/logout")
+    def microsoft_logout(request: Request) -> RedirectResponse:
+        client = app.state.entra_auth_client
+        if client is None:
+            return RedirectResponse("/", status_code=302)
+        token = request.cookies.get(SESSION_COOKIE_NAME)
+        if token:
+            app.state.auth_store.delete_session(token)
+        response = RedirectResponse(client.logout_url(), status_code=302)
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
 
     @app.post("/api/auth/logout")
     def logout(request: Request, response: FastAPIResponse) -> dict[str, str]:
@@ -3580,6 +4156,31 @@ def create_app(
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "mode": "outlook-intake"}
+
+    def _irj_configuration(company: CompanyProfile) -> dict[str, object]:
+        default_mode = (
+            "manual"
+            if company.name.strip().casefold() in {"swan", "cel"}
+            else "automatic"
+        )
+        mode = app.state.process_configuration_store.get(
+            f"irj_mode:{company.name.strip().casefold()}",
+            default_mode,
+        )
+        return {
+            "company": company.name,
+            "mode": mode,
+            "current_irj": app.state.irj_generator.current(company.name),
+        }
+
+    @app.get("/api/irj-configurations")
+    def irj_configurations(
+        user: User = Depends(get_current_user),
+    ) -> list[dict[str, object]]:
+        return [
+            _irj_configuration(company)
+            for company in app.state.companies_store.list()
+        ]
 
     @app.get("/api/companies")
     def companies(user: User = Depends(get_current_user)) -> list[dict[str, str]]:
@@ -3653,6 +4254,41 @@ def create_app(
         since_id: int = Query(0, ge=0), user: User = Depends(get_current_user)
     ) -> list[dict[str, object]]:
         return [asdict(event) for event in app.state.activity_feed.list_since(since_id)]
+
+    @app.get("/api/activity/stream")
+    async def activity_stream(
+        request: Request,
+        since_id: int = Query(0, ge=0),
+        user: User = Depends(get_current_user),
+    ) -> StreamingResponse:
+        del user
+
+        async def events():
+            cursor = since_id
+            heartbeat_ticks = 0
+            while not await request.is_disconnected():
+                latest = await asyncio.to_thread(
+                    app.state.activity_feed.latest_id
+                )
+                if latest > cursor:
+                    cursor = latest
+                    yield f"event: invoice-update\ndata: {cursor}\n\n"
+                    heartbeat_ticks = 0
+                else:
+                    heartbeat_ticks += 1
+                    if heartbeat_ticks >= 30:
+                        yield ": keep-alive\n\n"
+                        heartbeat_ticks = 0
+                await asyncio.sleep(2)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/api/invoices")
     def list_invoices(
@@ -3794,7 +4430,23 @@ def create_app(
         try:
             record = _lifecycle().register_in_sage(
                 invoice_id,
-                sage_reference=request.sage_reference,
+                irj_number=request.irj_number,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/payment-route")
+    def choose_payment_route(
+        invoice_id: int,
+        request: PaymentRouteRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().route_for_payment(
+                invoice_id,
+                route=request.route,
                 recorded_by=user.display_name,
             )
         except InvoiceLifecycleError as error:
@@ -3867,6 +4519,45 @@ def create_app(
                 detail=f"No invoice was found for IRJ number '{normalized}'.",
             )
         return asdict(invoice)
+
+    @app.get("/api/invoice-search/filter")
+    def filter_invoices(
+        irj_number: str | None = Query(None, max_length=32),
+        company: str | None = Query(None, max_length=255),
+        supplier: str | None = Query(None, max_length=255),
+        user: User = Depends(get_current_user),
+    ) -> list[dict[str, object]]:
+        normalized_irj = irj_number.strip() if irj_number else None
+        normalized_company = company.strip().casefold() if company else None
+        normalized_supplier = supplier.strip().casefold() if supplier else None
+        if normalized_irj and (
+            len(normalized_irj) != 6 or not normalized_irj.isdigit()
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="An IRJ number must contain exactly six digits.",
+            )
+        if not normalized_irj and not normalized_company and not normalized_supplier:
+            raise HTTPException(
+                status_code=422,
+                detail="Provide an IRJ number, company, or supplier.",
+            )
+        matches = []
+        for invoice in app.state.invoice_store.list_all():
+            if normalized_irj and invoice.irj_number != normalized_irj:
+                continue
+            if normalized_company and (
+                not invoice.company
+                or invoice.company.strip().casefold() != normalized_company
+            ):
+                continue
+            if normalized_supplier and (
+                not invoice.supplier
+                or invoice.supplier.strip().casefold() != normalized_supplier
+            ):
+                continue
+            matches.append(asdict(invoice))
+        return matches
 
     @app.get("/api/statements")
     def list_statements(
@@ -4101,6 +4792,22 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)
 
+    @app.post("/api/invoices/{invoice_id}/reject-flagged")
+    def reject_flagged_invoice(
+        invoice_id: int,
+        request: RejectInvoiceRequest,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().reject_flagged_invoice(
+                invoice_id,
+                reason=request.reason,
+                recorded_by=user.display_name,
+            )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
     @app.post("/api/invoices/{invoice_id}/file-statement")
     def file_supplier_statement(
         invoice_id: int,
@@ -4208,6 +4915,22 @@ def create_app(
             },
         }
 
+    def _available_company_folder_structures() -> dict[str, CompanyFolderStructure]:
+        client = _lifecycle().sharepoint_client
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="SharePoint is not configured or accessible.",
+            )
+        try:
+            folders = client.list_folder_paths()
+        except SharePointError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        return {
+            structure.root: structure
+            for structure in discover_company_folder_structures(folders)
+        }
+
     @app.post("/api/admin/companies")
     def admin_create_company(
         request: CompanyRequest, user: User = Depends(require_role(ROLE_ADMIN))
@@ -4216,8 +4939,7 @@ def create_app(
         root = request_fields.pop("sharepoint_root_folder")
         structure: CompanyFolderStructure | None = None
         if root:
-            structures = app.state.sharepoint_company_structures
-            structure = structures.get(root) if structures is not None else None
+            structure = _available_company_folder_structures().get(root)
             if structure is None:
                 raise HTTPException(
                     status_code=400,
@@ -4246,8 +4968,7 @@ def create_app(
         fields = request.model_dump(exclude_unset=True)
         root = fields.get("sharepoint_root_folder")
         if isinstance(root, str):
-            structures = app.state.sharepoint_company_structures
-            structure = structures.get(root) if structures is not None else None
+            structure = _available_company_folder_structures().get(root)
             if structure is None:
                 raise HTTPException(
                     status_code=400,
@@ -4395,6 +5116,18 @@ def create_app(
     ) -> list[dict[str, object]]:
         return [asdict(terms) for terms in app.state.supplier_terms_store.list()]
 
+    @app.get("/api/admin/metrics")
+    def admin_metrics(
+        granularity: str = Query("month", pattern="^(day|week|month)$"),
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        del user
+        return build_metrics(
+            app.state.invoice_store.list_all(),
+            app.state.supplier_terms_store.list(),
+            granularity=granularity,
+        )
+
     @app.put("/api/admin/supplier-terms/{terms_id}")
     def admin_update_supplier_terms(
         terms_id: int,
@@ -4486,6 +5219,54 @@ def create_app(
             "ai_confidence_threshold", str(request.threshold)
         )
         return {"threshold": request.threshold}
+
+    @app.put("/api/admin/irj-configurations/{company_name}")
+    def admin_set_irj_configuration(
+        company_name: str,
+        request: IrjConfigurationUpdateRequest,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        company = app.state.companies_store.get(company_name)
+        if company is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Company '{company_name}' was not found.",
+            )
+        mode = request.mode.strip().casefold()
+        if mode not in {"automatic", "manual"}:
+            raise HTTPException(
+                status_code=422,
+                detail="IRJ mode must be 'automatic' or 'manual'.",
+            )
+        if request.current_irj is not None:
+            current_irj = request.current_irj.strip()
+            if len(current_irj) != 6 or not current_irj.isdigit():
+                raise HTTPException(
+                    status_code=422,
+                    detail="The latest paper IRJ must contain exactly six digits.",
+                )
+            assigned = [
+                int(invoice.irj_number)
+                for invoice in app.state.invoice_store.list_all()
+                if invoice.company
+                and invoice.company.casefold() == company.name.casefold()
+                and invoice.irj_number
+                and invoice.irj_number.isdigit()
+            ]
+            if assigned and int(current_irj) < max(assigned):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"The latest paper IRJ cannot be below the highest "
+                        f"digitally assigned IRJ ({max(assigned):06d})."
+                    ),
+                )
+            app.state.irj_generator.set_current(company.name, current_irj)
+        app.state.process_configuration_store.set(
+            f"irj_mode:{company.name.strip().casefold()}",
+            mode,
+        )
+        return _irj_configuration(company)
 
     @app.get("/api/admin/users")
     def admin_list_users(

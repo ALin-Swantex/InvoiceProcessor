@@ -148,4 +148,79 @@ def postgres_connection_factory(
     settings: PostgresSettings | None = None,
 ) -> ConnectionFactory:
     resolved = settings or PostgresSettings.from_env()
+    if resolved.password is not None:
+        pool = _postgres_pool(
+            resolved,
+            _pool_size("POSTGRES_POOL_MIN_SIZE", 1),
+            _pool_size("POSTGRES_POOL_MAX_SIZE", 10),
+            _pool_timeout(),
+            _pool_max_idle(),
+        )
+        return pool.connection  # type: ignore[no-any-return]
     return lambda: connect_postgres(resolved)
+
+
+@lru_cache(maxsize=4)
+def _postgres_pool(
+    settings: PostgresSettings,
+    min_size: int,
+    max_size: int,
+    timeout: float,
+    max_idle: float,
+) -> object:
+    if min_size > max_size:
+        raise ValueError(
+            "POSTGRES_POOL_MIN_SIZE must not exceed POSTGRES_POOL_MAX_SIZE."
+        )
+    pool_module = importlib.import_module("psycopg_pool")
+    rows = importlib.import_module("psycopg.rows")
+    return pool_module.ConnectionPool(
+        kwargs={
+            **settings.connection_kwargs(),
+            "row_factory": rows.dict_row,
+        },
+        min_size=min_size,
+        max_size=max_size,
+        timeout=timeout,
+        max_idle=max_idle,
+        check=pool_module.ConnectionPool.check_connection,
+        open=True,
+    )
+
+
+def _pool_size(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer.") from error
+    if value < 1:
+        raise ValueError(f"{name} must be greater than zero.")
+    return value
+
+
+def _pool_timeout() -> float:
+    try:
+        value = float(os.environ.get("POSTGRES_POOL_TIMEOUT_SECONDS", "30"))
+    except ValueError as error:
+        raise ValueError(
+            "POSTGRES_POOL_TIMEOUT_SECONDS must be a number."
+        ) from error
+    if value <= 0:
+        raise ValueError(
+            "POSTGRES_POOL_TIMEOUT_SECONDS must be greater than zero."
+        )
+    return value
+
+
+def _pool_max_idle() -> float:
+    try:
+        value = float(os.environ.get("POSTGRES_POOL_MAX_IDLE_SECONDS", "300"))
+    except ValueError as error:
+        raise ValueError(
+            "POSTGRES_POOL_MAX_IDLE_SECONDS must be a number."
+        ) from error
+    if value <= 0:
+        raise ValueError(
+            "POSTGRES_POOL_MAX_IDLE_SECONDS must be greater than zero."
+        )
+    return value

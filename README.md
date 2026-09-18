@@ -89,6 +89,19 @@ Reconciled/
 Company configuration stores the selected root and derives every workflow
 destination from it. The application never creates or renames this structure.
 
+## IRJ numbering
+
+IRJ numbering is configured per company in the Admin panel:
+
+- `SWAN` and `CEL` default to **Manual at Sage**. Purchase Ledger must enter
+  the six-digit IRJ during Sage registration.
+- Other companies default to **Automatic**. Each company has an independent
+  sequence.
+- For an automatic company, enter the latest IRJ already used on paper. The
+  first digitally allocated number is the following number.
+- IRJs must be unique within a company, but the same six-digit IRJ can exist
+  for different companies.
+
 Run `python -m app.outlook_worker` alongside the web application. The worker
 handles both queued Outlook messages and SharePoint Incoming monitoring.
 `SHAREPOINT_INCOMING_POLL_SECONDS` controls the scan interval. Local files under
@@ -117,6 +130,47 @@ python -m app.outlook_worker
 
 Open <http://127.0.0.1:8000>. A public HTTPS URL pointing to port 8000 is
 required for Microsoft Graph webhook delivery.
+
+## Microsoft 365 sign-in and roles
+
+The application supports Microsoft Entra ID Authorization Code login. For
+production, use a dedicated single-tenant app registration:
+
+1. In **Microsoft Entra admin center → App registrations**, create or open the
+   Invoice Processor registration.
+2. Under **Authentication**, add a **Web** redirect URI matching
+   `AUTH_ENTRA_REDIRECT_URI`, for example:
+   `https://invoice.example.com/api/auth/microsoft/callback`.
+3. Under **Certificates & secrets**, create a client secret and store it in
+   `AUTH_ENTRA_CLIENT_SECRET` (prefer Azure Key Vault in production).
+4. In the app manifest, define these application roles with
+   `allowedMemberTypes` set to `["User"]` and a unique generated GUID for each
+   `id`:
+
+   | Display name | App-role value | Program role |
+   |---|---|---|
+   | Invoice Processor Admin | `InvoiceProcessor.Admin` | `admin` |
+   | Purchase Ledger | `InvoiceProcessor.PurchaseLedger` | `purchase_ledger` |
+   | Approver 1 | `InvoiceProcessor.Approver1` | `approver1` |
+   | Approver 2 | `InvoiceProcessor.Approver2` | `approver2` |
+   | Purchasing | `InvoiceProcessor.Purchasing` | `purchasing` |
+
+5. Open **Enterprise applications → Invoice Processor → Properties** and set
+   **Assignment required?** to **Yes**.
+6. Open **Users and groups → Add user/group**, select a user or security group,
+   and assign exactly one Invoice Processor role. A user with no recognized
+   role, or more than one recognized role, is denied access.
+7. Configure `AUTH_ENTRA_TENANT_ID`, `AUTH_ENTRA_CLIENT_ID`,
+   `AUTH_ENTRA_CLIENT_SECRET`, and `AUTH_ENTRA_REDIRECT_URI`. Set
+   `AUTH_LOCAL_LOGIN_ENABLED=false` and `AUTH_COOKIE_SECURE=true`.
+
+Assigning roles to Entra security groups requires Microsoft Entra ID licensing
+that supports group-based application assignment. Direct user assignment works
+without that group-assignment capability.
+
+Local username/password login remains available for development when Entra is
+not configured. It is automatically disabled when Entra is configured unless
+`AUTH_LOCAL_LOGIN_ENABLED=true` is explicitly set.
 
 ## Run tests
 
@@ -171,6 +225,17 @@ the required DML permissions. SQLite remains the default for offline testing.
 Users and sessions remain in the existing authentication store until Entra web
 sign-in is activated. Row-level security is therefore intentionally not enabled
 yet.
+
+Password-authenticated PostgreSQL deployments use a shared connection pool
+instead of opening a new TLS connection for every store operation. The defaults
+are one warm connection and a maximum of ten connections; override
+`POSTGRES_POOL_MIN_SIZE`, `POSTGRES_POOL_MAX_SIZE`, and
+`POSTGRES_POOL_TIMEOUT_SECONDS` only to match the hosting plan's connection
+limits. Idle connections are retired after
+`POSTGRES_POOL_MAX_IDLE_SECONDS` (five minutes by default), and connections
+are checked before reuse. Entra-token database authentication continues to
+create connections on demand so an expired access token is never retained by
+a long-lived pool.
 
 ### Local PostgreSQL testing
 

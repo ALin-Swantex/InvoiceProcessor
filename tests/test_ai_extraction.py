@@ -14,10 +14,12 @@ from app.ai_extraction import (
     DocumentIntelligenceConfigurationError,
     DocumentIntelligenceSettings,
 )
+from app.companies import CompanyStore
 from app.config_db import set_setting
 from app.invoice_lifecycle import InvoiceLifecycle
 from app.invoices import InvoiceStore
 from app.irj import IrjNumberGenerator
+from app.suppliers import SupplierStore
 
 
 @dataclass
@@ -78,6 +80,8 @@ def complete_fields() -> dict[str, Field]:
 def test_maps_prebuilt_invoice_fields_and_confidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("CONFIG_DB_PATH", str(tmp_path / "config.db"))
+    monkeypatch.setenv("CONFIG_STORE_BACKEND", "sqlite")
     monkeypatch.setenv("AI_CONFIDENCE_THRESHOLD", "0.80")
     pdf = tmp_path / "invoice.pdf"
     pdf.write_bytes(b"%PDF-1.7\ninvoice\n%%EOF")
@@ -105,6 +109,8 @@ def test_maps_prebuilt_invoice_fields_and_confidence(
 def test_missing_or_uncertain_critical_fields_require_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("CONFIG_DB_PATH", str(tmp_path / "config.db"))
+    monkeypatch.setenv("CONFIG_STORE_BACKEND", "sqlite")
     monkeypatch.setenv("AI_CONFIDENCE_THRESHOLD", "0.80")
     pdf = tmp_path / "invoice.pdf"
     pdf.write_bytes(b"%PDF-1.7\ninvoice\n%%EOF")
@@ -291,6 +297,125 @@ def test_lifecycle_persists_partial_extraction_and_warnings(tmp_path: Path) -> N
     assert extracted.supplier_invoice_number is None
     assert extracted.ai_confidence == 0.0
     assert "supplier invoice number" in str(extracted.ai_review_warnings)
+
+
+@pytest.mark.parametrize(
+    ("has_po_number", "expected_folder", "expected_type"),
+    [
+        (
+            False,
+            "Invoices/Acme Trading Ltd/Nominal Invoices/On hold",
+            "nominal",
+        ),
+        (
+            True,
+            "Invoices/Acme Trading Ltd/PO Invoices/On hold",
+            "po",
+        ),
+    ],
+)
+def test_flagged_extraction_moves_to_company_on_hold_folder(
+    tmp_path: Path,
+    has_po_number: bool,
+    expected_folder: str,
+    expected_type: str,
+) -> None:
+    class FakeSharePointClient:
+        def __init__(self) -> None:
+            self.moves: list[tuple[str, str, str]] = []
+
+        def move_to_folder(
+            self, item_id: str, folder: str, filename: str
+        ) -> dict[str, object]:
+            self.moves.append((item_id, folder, filename))
+            return {
+                "id": item_id,
+                "name": filename,
+                "webUrl": f"https://sharepoint.example/{folder}/{filename}",
+            }
+
+        @staticmethod
+        def get_item_web_url(item: dict[str, object]) -> str:
+            return str(item["webUrl"])
+
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(b"%PDF-1.7\ninvoice\n%%EOF")
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    record = invoices.add_from_outlook(
+        message={"id": "message-1"},
+        attachment={"id": "attachment-1", "name": "invoice.pdf"},
+        stored_path=pdf,
+    )
+    invoices.update_fields(record.id, sharepoint_item_id="drive-item-1")
+    fields = complete_fields()
+    if not has_po_number:
+        fields.pop("PurchaseOrder")
+    extractor = AzureInvoiceExtractor(
+        DocumentIntelligenceSettings("https://documents.example.test/"),
+        client=FakeClient(fields),
+    )
+    sharepoint = FakeSharePointClient()
+    lifecycle = InvoiceLifecycle(
+        invoices,
+        IrjNumberGenerator(tmp_path / "invoices.db"),
+        ActivityFeedStore(tmp_path / "activity.db"),
+        sharepoint,  # type: ignore[arg-type]
+        companies_store=CompanyStore(tmp_path / "config.db"),
+        suppliers_store=SupplierStore(tmp_path / "config.db"),
+        extraction_runner=extractor.extract,
+    )
+
+    extracted = lifecycle.run_extraction(record.id)
+
+    assert extracted.status == "Needs Review"
+    assert extracted.invoice_type == expected_type
+    assert sharepoint.moves == [
+        ("drive-item-1", expected_folder, "invoice.pdf")
+    ]
+
+
+def test_extraction_immediately_flags_matching_supplier_invoice_number(
+    tmp_path: Path,
+) -> None:
+    first_pdf = tmp_path / "original.pdf"
+    first_pdf.write_bytes(b"%PDF-1.7\noriginal invoice\n%%EOF")
+    second_pdf = tmp_path / "rescanned.pdf"
+    second_pdf.write_bytes(b"%PDF-1.7\nrescanned invoice\n%%EOF")
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    original = invoices.add_from_outlook(
+        message={"id": "message-1"},
+        attachment={"id": "attachment-1", "name": "original.pdf"},
+        stored_path=first_pdf,
+    )
+    invoices.update_fields(
+        original.id,
+        company="Acme Trading Ltd",
+        supplier="Supplier Ltd",
+        supplier_invoice_number="INV-1001",
+        status="Awaiting Sage Registration",
+    )
+    resent = invoices.add_from_outlook(
+        message={"id": "message-2"},
+        attachment={"id": "attachment-2", "name": "rescanned.pdf"},
+        stored_path=second_pdf,
+    )
+    extractor = AzureInvoiceExtractor(
+        DocumentIntelligenceSettings("https://documents.example.test/"),
+        client=FakeClient(complete_fields()),
+    )
+    lifecycle = InvoiceLifecycle(
+        invoices,
+        IrjNumberGenerator(tmp_path / "invoices.db"),
+        ActivityFeedStore(tmp_path / "activity.db"),
+        None,
+        extraction_runner=extractor.extract,
+    )
+
+    duplicate = lifecycle.run_extraction(resent.id)
+
+    assert duplicate.status == "Needs Review"
+    assert duplicate.duplicate_of_invoice_id == original.id
+    assert "matched on supplier invoice number" in str(duplicate.review_reason)
 
 
 def test_document_intelligence_requires_https_endpoint() -> None:

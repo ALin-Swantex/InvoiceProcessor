@@ -258,6 +258,66 @@ def test_move_resolves_existing_folders_without_unsupported_graph_filter() -> No
     assert requested_paths[-1] == "/v1.0/drives/drive/items/pdf-1"
 
 
+def test_repeated_moves_reuse_resolved_sharepoint_folder_ids() -> None:
+    requested_paths: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
+        children = {
+            "/v1.0/drives/drive/root/children": {
+                "value": [{"id": "invoices", "name": "Invoices", "folder": {}}]
+            },
+            "/v1.0/drives/drive/items/invoices/children": {
+                "value": [{"id": "gifted", "name": "GIFTED", "folder": {}}]
+            },
+            "/v1.0/drives/drive/items/gifted/children": {
+                "value": [
+                    {
+                        "id": "nominal",
+                        "name": "Nominal Invoices",
+                        "folder": {},
+                    }
+                ]
+            },
+        }
+        return httpx.Response(200, json=children[request.url.path])
+
+    client = _client(httpx.MockTransport(respond))
+    client.move_to_folder(
+        "pdf-1",
+        "Invoices/GIFTED/Nominal Invoices",
+        "000001-first.pdf",
+    )
+    first_move_request_count = len(requested_paths)
+    client.move_to_folder(
+        "pdf-2",
+        "Invoices/GIFTED/Nominal Invoices",
+        "000002-second.pdf",
+    )
+
+    assert first_move_request_count == 4
+    assert requested_paths[first_move_request_count:] == [
+        "/v1.0/drives/drive/items/pdf-2"
+    ]
+
+
+def test_statement_library_inventory_is_cached() -> None:
+    request_count = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={"value": []})
+
+    client = _client(httpx.MockTransport(respond))
+
+    assert client.list_statement_library() == {}
+    assert client.list_statement_library() == {}
+    assert request_count == 1
+
+
 def test_lists_and_downloads_incoming_pdfs_with_bearer_token() -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer token"

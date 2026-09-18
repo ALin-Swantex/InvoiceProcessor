@@ -74,6 +74,21 @@ def test_irj_number_requires_exactly_six_digits() -> None:
         route_confirmed_invoice(confirmed_invoice(irj_number="IRJ-001245"))
 
 
+def test_deferred_irj_routes_without_filename_prefix() -> None:
+    decision = route_confirmed_invoice(
+        ConfirmedInvoice(
+            invoice_id="invoice-123",
+            company="SWAN",
+            company_folder="/Companies/SWAN/Nominal Invoices",
+            original_filename="supplier-invoice.pdf",
+            irj_number=None,
+            defer_irj=True,
+        )
+    )
+
+    assert decision.destination_filename == "supplier-invoice.pdf"
+
+
 def test_po_invoice_requires_notification_configuration() -> None:
     with pytest.raises(RoutingValidationError, match="notification recipient"):
         route_confirmed_invoice(

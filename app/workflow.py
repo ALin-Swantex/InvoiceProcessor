@@ -19,7 +19,8 @@ class ConfirmedInvoice:
     company: str
     company_folder: str
     original_filename: str
-    irj_number: str
+    irj_number: str | None
+    defer_irj: bool = False
     purchase_order_number: str | None = None
     po_matching_folder: str | None = None
     purchase_ledger_recipient: str | None = None
@@ -53,8 +54,12 @@ def route_confirmed_invoice(invoice: ConfirmedInvoice) -> RoutingDecision:
             route="purchase_order",
             status="Awaiting PO Matching",
             destination_folder=str(invoice.po_matching_folder),
-            destination_filename=_prefixed_filename(
-                invoice.irj_number, invoice.original_filename
+            destination_filename=(
+                invoice.original_filename
+                if invoice.defer_irj
+                else _prefixed_filename(
+                    str(invoice.irj_number), invoice.original_filename
+                )
             ),
             notification_recipient=str(invoice.purchase_ledger_recipient),
             notification_reason=(
@@ -67,8 +72,12 @@ def route_confirmed_invoice(invoice: ConfirmedInvoice) -> RoutingDecision:
         route="nominal",
         status="Awaiting Nominal Processing",
         destination_folder=invoice.company_folder,
-        destination_filename=_prefixed_filename(
-            invoice.irj_number, invoice.original_filename
+        destination_filename=(
+            invoice.original_filename
+            if invoice.defer_irj
+            else _prefixed_filename(
+                str(invoice.irj_number), invoice.original_filename
+            )
         ),
         notification_recipient=None,
         notification_reason=None,
@@ -81,7 +90,6 @@ def _validate_common_fields(invoice: ConfirmedInvoice) -> None:
         "company": invoice.company,
         "company folder": invoice.company_folder,
         "original filename": invoice.original_filename,
-        "IRJ number": invoice.irj_number,
     }
     missing = [name for name, value in required.items() if not value.strip()]
     if missing:
@@ -90,7 +98,10 @@ def _validate_common_fields(invoice: ConfirmedInvoice) -> None:
         )
     if Path(invoice.original_filename).suffix.lower() != ".pdf":
         raise RoutingValidationError("The confirmed invoice must be a PDF.")
-    if not IRJ_NUMBER.fullmatch(invoice.irj_number.strip()):
+    if not invoice.defer_irj and (
+        not invoice.irj_number
+        or not IRJ_NUMBER.fullmatch(invoice.irj_number.strip())
+    ):
         raise RoutingValidationError(
             "The IRJ number must contain exactly six digits."
         )

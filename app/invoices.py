@@ -70,6 +70,7 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "reconciliation_date": "TEXT",
     "reconciliation_notes": "TEXT",
     "reconciled_by": "TEXT",
+    "reconciled_at": "TEXT",
     "rejection_reason": "TEXT",
     "review_reason": "TEXT",
     "review_return_status": "TEXT",
@@ -144,6 +145,7 @@ class InvoiceRecord:
     reconciliation_date: str | None = None
     reconciliation_notes: str | None = None
     reconciled_by: str | None = None
+    reconciled_at: str | None = None
     rejection_reason: str | None = None
     review_reason: str | None = None
     review_return_status: str | None = None
@@ -263,6 +265,13 @@ class InvoiceStore:
             ).fetchall()
         return [InvoiceRecord(**dict(row)) for row in rows]
 
+    def list_all(self) -> list[InvoiceRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM invoices ORDER BY created_at DESC"
+            ).fetchall()
+        return [InvoiceRecord(**dict(row)) for row in rows]
+
     def list_by_status(self, statuses: list[str], limit: int = 200) -> list[InvoiceRecord]:
         if not statuses:
             return []
@@ -286,16 +295,29 @@ class InvoiceStore:
             ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
 
-    def get_by_irj_number(self, irj_number: str) -> InvoiceRecord | None:
+    def get_by_irj_number(
+        self, irj_number: str, company: str | None = None
+    ) -> InvoiceRecord | None:
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM invoices
-                WHERE upper(trim(irj_number)) = upper(trim(?))
-                LIMIT 1
-                """,
-                (irj_number,),
-            ).fetchone()
+            if company is None:
+                row = connection.execute(
+                    """
+                    SELECT * FROM invoices
+                    WHERE upper(trim(irj_number)) = upper(trim(?))
+                    ORDER BY id LIMIT 1
+                    """,
+                    (irj_number,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT * FROM invoices
+                    WHERE upper(trim(irj_number)) = upper(trim(?))
+                      AND company = ? COLLATE NOCASE
+                    ORDER BY id LIMIT 1
+                    """,
+                    (irj_number, company),
+                ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
 
     def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
@@ -367,6 +389,40 @@ class InvoiceStore:
             connection.commit()
             if cursor.rowcount != 1:
                 raise KeyError(f"Invoice {invoice_id} was not found.")
+            row = connection.execute(
+                "SELECT * FROM invoices WHERE id = ?", (invoice_id,)
+            ).fetchone()
+        return InvoiceRecord(**dict(row))
+
+    def update_fields_if_status(
+        self,
+        invoice_id: int,
+        expected_status: str,
+        **fields: object,
+    ) -> InvoiceRecord | None:
+        """Atomically update an invoice only while it remains in the expected state."""
+        allowed = set(InvoiceRecord.__dataclass_fields__) - {"id"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"Unknown invoice fields: {', '.join(sorted(unknown))}.")
+        if not fields:
+            record = self.get(invoice_id)
+            return record if record is not None and record.status == expected_status else None
+
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        values = list(fields.values())
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE invoices
+                SET {assignments}
+                WHERE id = ? AND status = ?
+                """,
+                (*values, invoice_id, expected_status),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                return None
             row = connection.execute(
                 "SELECT * FROM invoices WHERE id = ?", (invoice_id,)
             ).fetchone()

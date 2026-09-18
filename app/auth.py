@@ -5,6 +5,7 @@ import hmac
 import os
 import secrets
 import sqlite3
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,28 +53,28 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS federated_sessions (
+    token TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    email TEXT,
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_flows (
+    state TEXT PRIMARY KEY,
+    flow_json TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
 """
 
-# ---------------------------------------------------------------------------
-# PLACEHOLDER — IDENTITY PROVIDER
-# ---------------------------------------------------------------------------
-# This module is a local username/password stand-in for real staff login.
-# The specification and PROJECT_HANDOFF.md call for signing in with existing
-# Microsoft 365 accounts through Microsoft Entra ID (no separate application
-# passwords). To swap this module for real SSO:
-#
-#   1. Register an Entra ID app (OUTLOOK_MCP_CLIENT_ID / _SECRET / _TENANT_ID
-#      in .env are already reserved for Graph access and can be reused or a
-#      dedicated web-app registration can be added).
-#   2. Add AUTH_ENTRA_CLIENT_ID / AUTH_ENTRA_CLIENT_SECRET / AUTH_ENTRA_TENANT_ID
-#      placeholders (see .env.example) and implement an MSAL Authorization
-#      Code flow in place of authenticate_user() / login below.
-#   3. Map Entra ID group membership (or app roles) onto ROLE_* above instead
-#      of the local `role` column.
-#
-# Until that integration exists, the seeded accounts below let every role be
-# exercised end-to-end. **Change these passwords before any real deployment.**
-# ---------------------------------------------------------------------------
+# Local users remain available for development and automated tests. Production
+# deployments should configure Microsoft Entra login and leave
+# AUTH_LOCAL_LOGIN_ENABLED=false. Entra sessions use the same role guards but
+# do not create local password-bearing user records.
 
 SEED_USERS: list[tuple[str, str, str, str, str]] = [
     # username, display name, email, role, placeholder password
@@ -122,8 +123,7 @@ class AuthError(ValueError):
 
 
 class AuthStore:
-    """SQLite-backed local users + sessions. See the PLACEHOLDER note above
-    for how this should be replaced with Entra ID SSO in production."""
+    """SQLite-backed sessions plus development-only local users."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -280,6 +280,64 @@ class AuthStore:
             connection.commit()
         return token
 
+    def create_federated_session(self, user: User) -> str:
+        if user.role not in ALL_ROLES:
+            raise AuthError(f"Unknown role '{user.role}'.")
+        token = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        expires_at = now + SESSION_LIFETIME
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO federated_sessions (
+                    token, username, display_name, email, role,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    user.username,
+                    user.display_name,
+                    user.email,
+                    user.role,
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                ),
+            )
+            connection.commit()
+        return token
+
+    def save_oauth_flow(self, state: str, flow: dict[str, object]) -> None:
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO oauth_flows (
+                    state, flow_json, expires_at
+                ) VALUES (?, ?, ?)
+                """,
+                (state, json.dumps(flow), expires_at.isoformat()),
+            )
+            connection.commit()
+
+    def pop_oauth_flow(self, state: str) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT flow_json, expires_at FROM oauth_flows WHERE state = ?",
+                (state,),
+            ).fetchone()
+            connection.execute(
+                "DELETE FROM oauth_flows WHERE state = ?", (state,)
+            )
+            connection.commit()
+        if row is None:
+            return None
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at < datetime.now(timezone.utc):
+            return None
+        flow = json.loads(row["flow_json"])
+        return flow if isinstance(flow, dict) else None
+
     def get_user_by_session(self, token: str) -> User | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -294,7 +352,17 @@ class AuthStore:
                 (token,),
             ).fetchone()
         if row is None:
-            return None
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT username, display_name, email, role, expires_at
+                    FROM federated_sessions
+                    WHERE token = ?
+                    """,
+                    (token,),
+                ).fetchone()
+            if row is None:
+                return None
         expires_at = datetime.fromisoformat(row["expires_at"])
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
@@ -311,6 +379,9 @@ class AuthStore:
     def delete_session(self, token: str) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            connection.execute(
+                "DELETE FROM federated_sessions WHERE token = ?", (token,)
+            )
             connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -320,9 +391,7 @@ class AuthStore:
 
 
 def _hash_password(password: str, salt: str) -> str:
-    # PBKDF2-HMAC-SHA256 is adequate for this local placeholder identity
-    # store. Replace entirely with Entra ID SSO (see module docstring)
-    # before handling real invoices/staff credentials.
+    # PBKDF2-HMAC-SHA256 is used only by the optional local-development login.
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
 
 

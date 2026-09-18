@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -81,6 +82,7 @@ class InvoiceLifecycle:
         companies_store: CompanyStore | None = None,
         approval_matrix_store: ApprovalMatrixStore | None = None,
         suppliers_store: SupplierStore | None = None,
+        configuration_getter: Callable[[str, str | None], str | None] | None = None,
         extraction_runner: Callable[[Path], ExtractionResult] = run_ai_extraction,
         classification_runner: Callable[[Path], DocumentClassification] = (
             classify_pdf_document
@@ -93,6 +95,7 @@ class InvoiceLifecycle:
         self.companies_store = companies_store
         self.approval_matrix_store = approval_matrix_store
         self.suppliers_store = suppliers_store
+        self.configuration_getter = configuration_getter
         self.extraction_runner = extraction_runner
         self.classification_runner = classification_runner
 
@@ -193,6 +196,7 @@ class InvoiceLifecycle:
         warnings = list(result.warnings)
         company = result.company
         supplier = result.supplier
+        company_profile = None
         supplier_profile = None
         if company:
             company_profile = self._get_company(company)
@@ -221,6 +225,38 @@ class InvoiceLifecycle:
                 ),
             )
         )
+        duplicate = None
+        if company and supplier and result.supplier_invoice_number:
+            duplicate = find_possible_duplicate(
+                self.invoice_store,
+                exclude_invoice_id=invoice_id,
+                company=company,
+                supplier=supplier,
+                supplier_invoice_number=result.supplier_invoice_number,
+            )
+            if duplicate is not None:
+                warnings.append(
+                    f"Possible duplicate of invoice #{duplicate.invoice_id} "
+                    f"(IRJ {duplicate.irj_number or 'not yet assigned'}, "
+                    f"status {duplicate.status}), matched on "
+                    f"{duplicate.match_basis}."
+                )
+
+        invoice_type = "po" if result.purchase_order_number else "nominal"
+        if company_profile is not None:
+            structure = CompanyFolderStructure.from_root(
+                company_profile.sharepoint_root_folder
+            )
+            review_folder = (
+                structure.po_on_hold
+                if invoice_type == "po"
+                else structure.nominal_on_hold
+            )
+            self._move_pdf_in_sharepoint(
+                invoice,
+                review_folder,
+                self._filed_filename(invoice),
+            )
 
         if result.needs_review or warnings:
             warning_text = "\n".join(warnings)
@@ -230,6 +266,7 @@ class InvoiceLifecycle:
                 supplier=supplier,
                 supplier_invoice_number=result.supplier_invoice_number,
                 po_number=result.purchase_order_number,
+                invoice_type=invoice_type,
                 invoice_date=result.invoice_date,
                 invoice_value=result.invoice_value,
                 currency=result.currency,
@@ -242,15 +279,27 @@ class InvoiceLifecycle:
                 ),
                 document_classification_reason=result.document_classification_reason,
                 status="Needs Review",
+                duplicate_of_invoice_id=(
+                    duplicate.invoice_id if duplicate is not None else None
+                ),
                 review_return_status=None,
                 review_reason=warning_text or "Purchase Ledger must confirm invoice details.",
             )
             self.activity_feed.add_event(
-                event_type="needs_review",
+                event_type=(
+                    "possible_duplicate" if duplicate is not None else "needs_review"
+                ),
                 target_role=ROLE_PURCHASE_LEDGER,
                 message=(
-                    f"Invoice {invoice.original_filename} needs manual "
-                    "confirmation before filing."
+                    (
+                        f"Invoice {invoice.original_filename} looks like a possible "
+                        f"duplicate of invoice #{duplicate.invoice_id}."
+                    )
+                    if duplicate is not None
+                    else (
+                        f"Invoice {invoice.original_filename} needs manual "
+                        "confirmation before filing."
+                    )
                 ),
                 invoice_id=invoice_id,
             )
@@ -262,6 +311,7 @@ class InvoiceLifecycle:
             supplier=supplier,
             supplier_invoice_number=result.supplier_invoice_number,
             po_number=result.purchase_order_number,
+            invoice_type=invoice_type,
             invoice_date=result.invoice_date,
             invoice_value=result.invoice_value,
             currency=result.currency,
@@ -274,6 +324,7 @@ class InvoiceLifecycle:
             ),
             document_classification_reason=result.document_classification_reason,
             status="Needs Review",
+            duplicate_of_invoice_id=None,
             review_return_status=None,
             review_reason="Awaiting Purchase Ledger confirmation.",
         )
@@ -368,7 +419,14 @@ class InvoiceLifecycle:
                 )
                 return record
 
-        irj_number = invoice.irj_number or self.irj_generator.generate()
+        manual_irj = self._uses_manual_irj(company_profile.name)
+        irj_number = (
+            invoice.irj_number
+            if invoice.irj_number
+            else None
+            if manual_irj
+            else self.irj_generator.generate(company_profile.name)
+        )
         try:
             decision = route_confirmed_invoice(
                 ConfirmedInvoice(
@@ -377,9 +435,13 @@ class InvoiceLifecycle:
                     company_folder=company_profile.company_folder,
                     original_filename=invoice.original_filename,
                     irj_number=irj_number,
+                    defer_irj=manual_irj,
                     purchase_order_number=purchase_order_number,
                     po_matching_folder=company_profile.po_matching_folder,
-                    purchase_ledger_recipient="purchase-ledger@example.test",
+                    purchase_ledger_recipient=os.environ.get(
+                        "PURCHASE_LEDGER_NOTIFICATION_EMAIL",
+                        "purchase-ledger@example.test",
+                    ),
                 )
             )
         except RoutingValidationError as error:
@@ -408,11 +470,23 @@ class InvoiceLifecycle:
                 status=decision.status,
                 review_reason=None,
             )
+            send_email_notification(
+                recipient=str(decision.notification_recipient),
+                subject=(
+                    f"New invoice ({invoice.original_filename}) waiting for "
+                    "PO matching"
+                ),
+                body=(
+                    f"New invoice ({invoice.original_filename}) is waiting for "
+                    f"PO matching. IRJ: {irj_number or 'assigned at Sage registration'}. PO: "
+                    f"{purchase_order_number}."
+                ),
+            )
             self.activity_feed.add_event(
                 event_type="po_awaiting_match",
                 target_role=ROLE_PURCHASE_LEDGER,
                 message=(
-                    f"Invoice {irj_number} ({supplier}) is awaiting PO matching "
+                    f"Invoice {irj_number or invoice.original_filename} ({supplier}) is awaiting PO matching "
                     f"against PO {purchase_order_number}."
                 ),
                 invoice_id=invoice_id,
@@ -489,7 +563,9 @@ class InvoiceLifecycle:
         )
         record = self.invoice_store.update_fields(
             invoice_id,
-            status="PO Query / Matching Issue",
+            status="Needs Review",
+            review_return_status="Awaiting PO Matching",
+            review_reason=notes or "PO matching issue requires review.",
             po_query_notes=notes,
             po_query_category=query_category,
             po_query_contact=purchasing_contact,
@@ -509,7 +585,7 @@ class InvoiceLifecycle:
         self,
         invoice_id: int,
         *,
-        sage_reference: str,
+        irj_number: str,
         recorded_by: str,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
@@ -524,15 +600,36 @@ class InvoiceLifecycle:
                 f"Invoice {invoice_id} is not awaiting Sage registration "
                 f"(status: {invoice.status})."
             )
-        if not sage_reference.strip():
-            raise InvoiceLifecycleError("A Sage registration reference is required.")
+        normalized_irj = irj_number.strip()
+        if len(normalized_irj) != 6 or not normalized_irj.isdigit():
+            raise InvoiceLifecycleError(
+                "The IRJ number must contain exactly six digits."
+            )
+        existing = self.invoice_store.get_by_irj_number(
+            normalized_irj, str(invoice.company)
+        )
+        if existing is not None and existing.id != invoice_id:
+            raise InvoiceLifecycleError(
+                f"IRJ number {normalized_irj} is already assigned to invoice "
+                f"{existing.id}."
+            )
+        if (
+            not self._uses_manual_irj(str(invoice.company))
+            and invoice.irj_number
+            and normalized_irj != invoice.irj_number
+        ):
+            raise InvoiceLifecycleError(
+                f"IRJ {invoice.irj_number} was allocated automatically for "
+                f"{invoice.company} and cannot be changed."
+            )
 
         now = datetime.now(timezone.utc).isoformat()
         if not retrying_missing_route:
             invoice = self.invoice_store.update_fields(
                 invoice_id,
+                irj_number=normalized_irj,
                 sage_registered_at=now,
-                sage_reference=sage_reference.strip(),
+                sage_reference=None,
                 sage_registered_by=recorded_by,
             )
 
@@ -594,10 +691,13 @@ class InvoiceLifecycle:
         )
         send_email_notification(
             recipient=entry.approver1.email,
-            subject=f"Invoice {invoice.irj_number} awaiting your approval",
+            subject=(
+                f"New invoice ({invoice.original_filename}) waiting for approval"
+            ),
             body=(
-                f"Invoice {invoice.irj_number} from {invoice.supplier} requires "
-                "your approval."
+                f"New invoice ({invoice.original_filename}) is waiting for your "
+                f"approval. IRJ: {invoice.irj_number}. Supplier: "
+                f"{invoice.supplier}."
             ),
         )
         self.activity_feed.add_event(
@@ -610,6 +710,19 @@ class InvoiceLifecycle:
             invoice_id=invoice_id,
         )
         return record
+
+    def _uses_manual_irj(self, company: str) -> bool:
+        default = (
+            "manual"
+            if company.strip().casefold() in {"swan", "cel"}
+            else "automatic"
+        )
+        if self.configuration_getter is None:
+            return default == "manual"
+        mode = self.configuration_getter(
+            f"irj_mode:{company.strip().casefold()}", default
+        )
+        return str(mode).strip().casefold() == "manual"
 
     def reject_invoice(
         self, invoice_id: int, *, reason: str, recorded_by: str
@@ -627,7 +740,7 @@ class InvoiceLifecycle:
         self._move_pdf_in_sharepoint(
             invoice,
             REJECTED_INVOICES_FOLDER,
-            self._filed_filename(invoice),
+            self._rejected_filename(invoice),
         )
         record = self.invoice_store.update_fields(
             invoice_id,
@@ -663,7 +776,7 @@ class InvoiceLifecycle:
         self._move_pdf_in_sharepoint(
             invoice,
             REJECTED_INVOICES_FOLDER,
-            self._filed_filename(invoice),
+            self._rejected_filename(invoice),
         )
         record = self.invoice_store.update_fields(
             invoice_id,
@@ -705,8 +818,54 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError(
                 f"Invoice {invoice_id} is not {expected_status} (status: {invoice.status})."
             )
+        if decision == "on_hold" and not comments:
+            raise InvoiceLifecycleError(
+                "A comment explaining the hold is required."
+            )
 
         now = datetime.now(timezone.utc).isoformat()
+        processing_status = f"Processing Approval {level}"
+        claimed = self.invoice_store.update_fields_if_status(
+            invoice_id,
+            expected_status,
+            status=processing_status,
+        )
+        if claimed is None:
+            current = self._require_invoice(invoice_id)
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} is not {expected_status} "
+                f"(status: {current.status})."
+            )
+        invoice = claimed
+
+        def commit_decision(**fields: object) -> InvoiceRecord:
+            record = self.invoice_store.update_fields_if_status(
+                invoice_id,
+                processing_status,
+                **fields,
+            )
+            if record is None:
+                current = self._require_invoice(invoice_id)
+                raise InvoiceLifecycleError(
+                    f"Invoice {invoice_id} approval could not be completed "
+                    f"(status: {current.status})."
+                )
+            return record
+
+        def move_pdf(destination_folder: str, destination_filename: str) -> None:
+            try:
+                self._move_pdf_in_sharepoint(
+                    invoice,
+                    destination_folder,
+                    destination_filename,
+                )
+            except InvoiceLifecycleError:
+                self.invoice_store.update_fields_if_status(
+                    invoice_id,
+                    processing_status,
+                    status=expected_status,
+                )
+                raise
 
         if decision == "on_hold":
             # SOFTWARE_SPEC.md section 8: approvers can place an invoice on
@@ -715,22 +874,17 @@ class InvoiceLifecycle:
             # delayed without having to chase the approver separately. The
             # invoice never proceeds automatically from here -- Purchase
             # Ledger must call resume_approval once the issue is resolved.
-            if not comments:
-                raise InvoiceLifecycleError(
-                    "A comment explaining the hold is required."
-                )
             fields = {
                 "status": "Approval Query / On Hold",
                 "hold_level": level,
                 "hold_reason": comments,
                 f"approver{level}_comments": comments,
             }
-            self._move_pdf_in_sharepoint(
-                invoice,
+            move_pdf(
                 self._company_folders(invoice).nominal_on_hold,
                 self._filed_filename(invoice),
             )
-            record = self.invoice_store.update_fields(invoice_id, **fields)
+            record = commit_decision(**fields)
             self.activity_feed.add_event(
                 event_type="approval_on_hold",
                 target_role=ROLE_PURCHASE_LEDGER,
@@ -750,12 +904,11 @@ class InvoiceLifecycle:
                 "status": "Rejected",
                 "rejection_reason": comments,
             }
-            self._move_pdf_in_sharepoint(
-                invoice,
+            move_pdf(
                 REJECTED_INVOICES_FOLDER,
-                self._filed_filename(invoice),
+                self._rejected_filename(invoice),
             )
-            record = self.invoice_store.update_fields(invoice_id, **fields)
+            record = commit_decision(**fields)
             self.activity_feed.add_event(
                 event_type="rejected",
                 target_role=ROLE_PURCHASE_LEDGER,
@@ -771,16 +924,22 @@ class InvoiceLifecycle:
                 "approver1_comments": comments,
                 "status": "Awaiting Approval 2",
             }
-            self._move_pdf_in_sharepoint(
-                invoice,
+            move_pdf(
                 self._company_folders(invoice).nominal_approver_2,
                 self._filed_filename(invoice),
             )
-            record = self.invoice_store.update_fields(invoice_id, **fields)
+            record = commit_decision(**fields)
             send_email_notification(
                 recipient=str(invoice.approver2_email),
-                subject=f"Invoice {invoice.irj_number} awaiting your approval",
-                body=f"Invoice {invoice.irj_number} requires your approval.",
+                subject=(
+                    f"New invoice ({invoice.original_filename}) waiting for "
+                    "approval"
+                ),
+                body=(
+                    f"New invoice ({invoice.original_filename}) is waiting for "
+                    f"your approval. IRJ: {invoice.irj_number}. Supplier: "
+                    f"{invoice.supplier}."
+                ),
             )
             self.activity_feed.add_event(
                 event_type="approval_pending",
@@ -799,12 +958,11 @@ class InvoiceLifecycle:
             f"approver{level}_comments": comments,
             "status": "Approved",
         }
-        self._move_pdf_in_sharepoint(
-            invoice,
+        move_pdf(
             self._company_folders(invoice).approved_for_payment,
             self._filed_filename(invoice),
         )
-        record = self.invoice_store.update_fields(invoice_id, **fields)
+        record = commit_decision(**fields)
         # SOFTWARE_SPEC.md section 9: "Once fully approved... The Purchase
         # Ledger team should receive an email notification where
         # appropriate." Purchase Ledger isn't the one clicking approve here
@@ -813,8 +971,11 @@ class InvoiceLifecycle:
         # actual email, not just an activity feed entry they'd have to go
         # looking for.
         send_email_notification(
-            recipient="purchase-ledger@example.test",
-            subject=f"Invoice {invoice.irj_number} fully approved",
+            recipient=os.environ.get(
+                "PURCHASE_LEDGER_NOTIFICATION_EMAIL",
+                "purchase-ledger@example.test",
+            ),
+            subject=f"Invoice ({invoice.original_filename}) fully approved",
             body=(
                 f"Invoice {invoice.irj_number} ({invoice.supplier}) has completed "
                 "all required nominal approvals and is ready for payment."
@@ -988,6 +1149,12 @@ class InvoiceLifecycle:
             )
         return_status = invoice.review_return_status
         if accepted:
+            if return_status == "Awaiting PO Matching":
+                self._move_pdf_in_sharepoint(
+                    invoice,
+                    self._company_folders(invoice).po_match,
+                    self._filed_filename(invoice),
+                )
             record = self.invoice_store.update_fields(
                 invoice_id,
                 status=return_status,
@@ -1010,7 +1177,7 @@ class InvoiceLifecycle:
         self._move_pdf_in_sharepoint(
             invoice,
             REJECTED_INVOICES_FOLDER,
-            self._filed_filename(invoice),
+            self._rejected_filename(invoice),
         )
         record = self.invoice_store.update_fields(
             invoice_id,
@@ -1025,6 +1192,103 @@ class InvoiceLifecycle:
             message=(
                 f"Invoice {invoice.irj_number or invoice.original_filename} "
                 f"rejected during review by {recorded_by}: {reason.strip()}"
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def reject_flagged_invoice(
+        self, invoice_id: int, *, reason: str, recorded_by: str
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Needs Review" or invoice.document_type != "invoice":
+            raise InvoiceLifecycleError(
+                "Only a flagged invoice can be rejected from this section."
+            )
+        if not reason.strip():
+            raise InvoiceLifecycleError("A rejection reason is required.")
+        self._move_pdf_in_sharepoint(
+            invoice,
+            REJECTED_INVOICES_FOLDER,
+            self._rejected_filename(invoice),
+        )
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Rejected",
+            rejection_reason=reason.strip(),
+            review_reason=None,
+            review_return_status=None,
+        )
+        self.activity_feed.add_event(
+            event_type="rejected",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Flagged invoice {invoice.irj_number or invoice.original_filename} "
+                f"rejected by {recorded_by}: {reason.strip()}"
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    def route_for_payment(
+        self, invoice_id: int, *, route: str, recorded_by: str
+    ) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status != "Approved":
+            raise InvoiceLifecycleError(
+                f"Only Approved invoices can be routed for payment "
+                f"(status: {invoice.status})."
+            )
+        routes = {
+            "bacs": (
+                "Approved for Payment - BACS",
+                "BACS",
+                self._company_folders(invoice).approved_bacs,
+            ),
+            "bankline": (
+                "Approved for Payment - Bankline",
+                "Bankline",
+                self._company_folders(invoice).approved_bankline,
+            ),
+            "foreign_poa": (
+                "Approved for Payment - Foreign POA",
+                "Foreign POA",
+                self._company_folders(invoice).approved_foreign_poa,
+            ),
+        }
+        if route not in routes:
+            raise InvoiceLifecycleError(
+                "Payment route must be BACS, Bankline, or Foreign POA."
+            )
+        status, payment_method, destination = routes[route]
+        self._move_pdf_in_sharepoint(
+            invoice,
+            destination,
+            self._filed_filename(invoice),
+        )
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status=status,
+            payment_method=payment_method,
+            is_foreign_payment=1 if route == "foreign_poa" else 0,
+            payment_route_decided_at=datetime.now(timezone.utc).isoformat(),
+            payment_route_decided_by=recorded_by,
+            payment_date=None,
+            payment_reference=None,
+            paid_by=None,
+            reconciliation_date=None,
+            reconciliation_notes=None,
+            reconciled_by=None,
+            foreign_allocation_date=None,
+            foreign_allocation_reference=None,
+            foreign_allocated_by=None,
+        )
+        self.activity_feed.add_event(
+            event_type="payment_route_selected",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Invoice {invoice.irj_number} routed to {payment_method} "
+                f"by {recorded_by}."
             ),
             invoice_id=invoice_id,
         )
@@ -1045,12 +1309,17 @@ class InvoiceLifecycle:
         recorded_by: str | None = None,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
-        if invoice.status != "Approved":
+        payable_statuses = {
+            "Approved for Payment - BACS": "BACS",
+            "Approved for Payment - Bankline": "Bankline",
+            "Approved for Payment - Foreign POA": "Foreign POA",
+            "Foreign Payment / Awaiting Allocation": "Foreign POA",
+        }
+        if invoice.status not in payable_statuses:
             raise InvoiceLifecycleError(
-                f"Only Approved invoices can be marked as paid (status: {invoice.status})."
+                f"Only an invoice in a payment section can be marked as paid "
+                f"(status: {invoice.status})."
             )
-        if not payment_method or not payment_method.strip():
-            raise InvoiceLifecycleError("A payment method is required.")
         if not payment_reference or not payment_reference.strip():
             raise InvoiceLifecycleError("A payment reference is required.")
         if not payment_date.strip():
@@ -1069,14 +1338,8 @@ class InvoiceLifecycle:
             payment_date=payment_date,
             supplier_account_number=supplier_account_number,
             payment_reference=payment_reference,
-            payment_method=payment_method.strip(),
+            payment_method=payable_statuses[invoice.status],
             paid_by=recorded_by,
-            is_foreign_payment=0,
-            payment_route_decided_at=now,
-            payment_route_decided_by=recorded_by,
-            foreign_allocation_date=None,
-            foreign_allocation_reference=None,
-            foreign_allocated_by=None,
         )
         self.activity_feed.add_event(
             event_type="paid",
@@ -1089,41 +1352,9 @@ class InvoiceLifecycle:
     def route_as_foreign_payment(
         self, invoice_id: int, *, recorded_by: str
     ) -> InvoiceRecord:
-        invoice = self._require_invoice(invoice_id)
-        if invoice.status != "Approved":
-            raise InvoiceLifecycleError(
-                f"Only Approved invoices can be marked as foreign payments "
-                f"(status: {invoice.status})."
-            )
-        self._move_pdf_in_sharepoint(
-            invoice,
-            self._company_folders(invoice).approved_foreign_poa,
-            self._filed_filename(invoice),
+        return self.route_for_payment(
+            invoice_id, route="foreign_poa", recorded_by=recorded_by
         )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status="Foreign Payment / Awaiting Allocation",
-            is_foreign_payment=1,
-            payment_route_decided_at=datetime.now(timezone.utc).isoformat(),
-            payment_route_decided_by=recorded_by,
-            payment_date=None,
-            payment_reference=None,
-            payment_method=None,
-            paid_by=None,
-            reconciliation_date=None,
-            reconciliation_notes=None,
-            reconciled_by=None,
-        )
-        self.activity_feed.add_event(
-            event_type="foreign_payment_pending",
-            target_role=ROLE_PURCHASE_LEDGER,
-            message=(
-                f"Invoice {invoice.irj_number} marked as a foreign payment by "
-                f"{recorded_by}; awaiting allocation."
-            ),
-            invoice_id=invoice_id,
-        )
-        return record
 
     def mark_foreign_allocated(
         self,
@@ -1134,7 +1365,10 @@ class InvoiceLifecycle:
         recorded_by: str,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
-        if invoice.status != "Foreign Payment / Awaiting Allocation":
+        if invoice.status not in {
+            "Foreign Payment / Awaiting Allocation",
+            "Approved for Payment - Foreign POA",
+        }:
             raise InvoiceLifecycleError(
                 f"Only foreign payments awaiting allocation can be allocated "
                 f"(status: {invoice.status})."
@@ -1145,12 +1379,16 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError("An allocation date is required.")
         self._move_pdf_in_sharepoint(
             invoice,
-            self._company_folders(invoice).reconciled,
+            self._company_folders(invoice).paid,
             self._filed_filename(invoice),
         )
         record = self.invoice_store.update_fields(
             invoice_id,
-            status="Reconciled / Complete",
+            status="Paid / Awaiting Bank Reconciliation",
+            payment_date=allocation_date,
+            payment_reference=allocation_reference.strip(),
+            payment_method="Foreign POA",
+            paid_by=recorded_by,
             foreign_allocation_date=allocation_date,
             foreign_allocation_reference=allocation_reference.strip(),
             foreign_allocated_by=recorded_by,
@@ -1160,7 +1398,7 @@ class InvoiceLifecycle:
             target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Foreign payment for invoice {invoice.irj_number} allocated and "
-                "completed."
+                "is awaiting bank reconciliation."
             ),
             invoice_id=invoice_id,
         )
@@ -1222,12 +1460,16 @@ class InvoiceLifecycle:
         )
         # SOFTWARE_SPEC.md section 11: "The system should record: ...Who
         # completed the reconciliation, where practical".
+        # reconciliation_date is the date Purchase Ledger says the payment
+        # appears on the bank statement; reconciled_at is the system
+        # timestamp of when the invoice was actually marked reconciled here.
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Reconciled / Complete",
             reconciliation_date=reconciliation_date,
             reconciliation_notes=notes,
             reconciled_by=recorded_by,
+            reconciled_at=datetime.now(timezone.utc).isoformat(),
         )
         self.activity_feed.add_event(
             event_type="reconciled",
@@ -1396,6 +1638,17 @@ class InvoiceLifecycle:
         if not invoice.irj_number:
             return invoice.original_filename
         prefix = f"{invoice.irj_number}_"
+        return (
+            invoice.original_filename
+            if invoice.original_filename.startswith(prefix)
+            else f"{prefix}{invoice.original_filename}"
+        )
+
+    @classmethod
+    def _rejected_filename(cls, invoice: InvoiceRecord) -> str:
+        if invoice.irj_number:
+            return cls._filed_filename(invoice)
+        prefix = f"invoice-{invoice.id}_"
         return (
             invoice.original_filename
             if invoice.original_filename.startswith(prefix)

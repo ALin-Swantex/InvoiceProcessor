@@ -46,8 +46,12 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert 'id="payment-method"' in home.text
     assert '<select id="admin-import-company" required>' in home.text
     assert "Supplier payment settings" in home.text
-    assert 'id="admin-metrics-placeholder"' in home.text
-    assert "Power BI dashboard — coming soon" in home.text
+    assert 'id="admin-bi-metrics"' in home.text
+    assert 'id="metrics-granularity"' in home.text
+    assert "Invoice volume interval" in home.text
+    assert "Total pending invoice value by company" in home.text
+    assert "Spend by supplier and company" in home.text
+    assert "function loadMetrics()" in home.text
     assert '<details class="admin-block admin-collapsible">' in home.text
     assert "<summary>Companies</summary>" in home.text
     assert 'id="admin-company-root-folder" required disabled' in home.text
@@ -74,6 +78,8 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert '<select id="preview-supplier" disabled>' in home.text
     assert "Purchase Ledger confirmation (editable" not in home.text
     assert "Invoice details (AI-extracted — review and correct before confirming)" in home.text
+    assert "Outlook email and PDF data will be loaded here." not in home.text
+    assert 'id="intake-notice"' not in home.text
     assert "function renderCompanyGroupedTables" in home.text
     assert "function suppliersGroupedByCompany" in home.text
     assert "function refreshAdminMatrixSupplierOptions" in home.text
@@ -92,22 +98,44 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert 'class="invoice-analysis-pdf"' in home.text
     assert "Extracted invoice analysis" in home.text
     assert "File as statement" in home.text
+    assert 'data-action="reject-flagged"' in home.text
+    assert "/api/invoices/${id}/reject-flagged" in home.text
     assert "/api/invoices/${id}/file-statement" in home.text
     assert "/api/invoices/${id}/mark-as-invoice" in home.text
-    assert "Search invoices by IRJ number" in home.text
+    assert "Search invoices" in home.text
+    assert 'data-tab="payment-bacs"' in home.text
+    assert 'data-tab="payment-bankline"' in home.text
+    assert 'data-tab="payment-foreign-poa"' in home.text
+    assert "Appeared on bank statement" in home.text
+    assert "Marked reconciled" in home.text
+    assert "Uploaded '${record.original_filename}' to ${destination}." in home.text
     assert "Statements/{Company}" in home.text
     assert 'id="statement-company"' in home.text
     assert 'fetch("/api/statements")' in home.text
     assert 'const ACTIVE_TAB_STORAGE_KEY = "invoice-processor-active-tab"' in home.text
     assert 'fetch(\n                  "/api/invoices?limit=500",\n                  { cache: "no-store" }' in home.text
     assert "function clearInvoicePreview()" in home.text
+    assert "function connectLiveUpdates()" in home.text
+    assert "new EventSource(" in home.text
+    assert 'activityEventSource.addEventListener("invoice-update"' in home.text
+    assert "window.setInterval(loadInvoices, 120000)" in home.text
+    assert "metricsRefreshTimer = window.setTimeout(loadMetrics, 3000)" in home.text
+    assert (
+        'id="admin-companies-config"' in home.text
+        and "loadSharePointFolderOptions();" in home.text
+    )
+    assert "function isFlaggedInvoice(invoice)" in home.text
+    assert 'return invoice.status === "Needs Review";' in home.text
+    assert "let openedFlaggedInvoiceId = null;" in home.text
+    assert "openedFlaggedInvoiceId = id;" in home.text
+    assert "const invoiceId = displayedInvoiceId;" in home.text
     assert 'document.addEventListener("visibilitychange"' in home.text
     assert "window.clearInterval(invoicePollTimer)" in home.text
     assert "let renderedInvoiceSnapshot = null;" in home.text
     assert "if (refreshedSnapshot === renderedInvoiceSnapshot) return;" in home.text
     assert "function activateTab(tab)" in home.text
     assert 'window.addEventListener("beforeunload"' in home.text
-    assert "/api/invoice-search?irj_number=${encodeURIComponent(query)}" in home.text
+    assert "/api/invoice-search/filter?${params}" in home.text
     assert "Purchase Ledger: confirm invoice" in home.text
     assert '<button class="danger" id="delete-invoice-button">' in home.text
     assert 'sendJson(`/api/invoices/${invoice.id}`, "DELETE")' in home.text
@@ -208,6 +236,39 @@ def test_invoice_search_rejects_non_six_digit_reference(tmp_path) -> None:
     assert response.json()["detail"] == (
         "An IRJ number must contain exactly six digits."
     )
+
+
+def test_invoice_search_filters_by_company_and_supplier(tmp_path) -> None:
+    client = client_for(tmp_path)
+    store = client.app.state.invoice_store
+    first = store.add_from_outlook(
+        message={"id": "filter-message-1"},
+        attachment={"id": "filter-attachment-1", "name": "first.pdf"},
+        stored_path=tmp_path / "first.pdf",
+    )
+    second = store.add_from_outlook(
+        message={"id": "filter-message-2"},
+        attachment={"id": "filter-attachment-2", "name": "second.pdf"},
+        stored_path=tmp_path / "second.pdf",
+    )
+    store.update_fields(
+        first.id, company="Acme Trading Ltd", supplier="Supplier Ltd"
+    )
+    store.update_fields(
+        second.id, company="Another Company", supplier="Other Supplier"
+    )
+    assert client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    ).status_code == 200
+
+    response = client.get(
+        "/api/invoice-search/filter",
+        params={"company": "Acme Trading Ltd", "supplier": "Supplier Ltd"},
+    )
+
+    assert response.status_code == 200
+    assert [invoice["id"] for invoice in response.json()] == [first.id]
 
 
 def test_statement_library_is_read_from_sharepoint(tmp_path) -> None:

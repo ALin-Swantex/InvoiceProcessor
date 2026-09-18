@@ -232,6 +232,7 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
     companies_store = None
     suppliers_store = None
     approval_matrix_store = None
+    process_configuration_store = None
     if backend == "postgres":
         from app.postgres_invoices import create_postgres_invoice_store
         from app.postgres_services import (
@@ -267,8 +268,14 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
             suppliers_store,
             approval_matrix_store,
             _supplier_terms_store,
-            _process_configuration_store,
+            process_configuration_store,
         ) = postgres_config_stores()
+    else:
+        from app.config_db import SQLiteProcessConfigurationStore
+
+        process_configuration_store = SQLiteProcessConfigurationStore(
+            Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
+        )
     sharepoint_client = sharepoint_client_from_environment()
     lifecycle = InvoiceLifecycle(
         invoice_store,
@@ -278,6 +285,7 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
         companies_store=companies_store,
         approval_matrix_store=approval_matrix_store,
         suppliers_store=suppliers_store,
+        configuration_getter=process_configuration_store.get,
     )
     extraction_runner: Callable[[int], object] = (
         lifecycle.run_extraction

@@ -21,7 +21,9 @@ class PostgresIrjNumberGenerator:
             connection_factory = postgres_connection_factory(settings)
         self._connection_factory = connection_factory
 
-    def generate(self) -> str:
+    def generate(self, company: str | None = None) -> str:
+        if company is not None:
+            return self._generate_for_company(company)
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -40,6 +42,102 @@ class PostgresIrjNumberGenerator:
         if number > 999999:
             raise RuntimeError("The six-digit IRJ number range is exhausted.")
         return f"{number:06d}"
+
+    def reserve(self, irj_number: str, company: str | None = None) -> None:
+        if company is not None:
+            self._reserve_for_company(company, irj_number)
+            return
+        number = int(irj_number)
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO irj_sequence (id, next_number)
+                    VALUES (1, %s)
+                    ON CONFLICT (id) DO UPDATE
+                    SET next_number = GREATEST(
+                        irj_sequence.next_number,
+                        excluded.next_number
+                    )
+                    """,
+                    (number + 1,),
+                )
+
+    def current(self, company: str) -> str | None:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT next_number FROM company_irj_sequences
+                    WHERE lower(company) = lower(%s)
+                    """,
+                    (company.strip(),),
+                )
+                row = cursor.fetchone()
+        if row is None or int(row["next_number"]) <= 1:
+            return None
+        return f"{int(row['next_number']) - 1:06d}"
+
+    def set_current(self, company: str, irj_number: str) -> None:
+        number = self._validate_number(irj_number)
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO company_irj_sequences (company, next_number)
+                    VALUES (%s, %s)
+                    ON CONFLICT (company) DO UPDATE
+                    SET next_number = excluded.next_number
+                    """,
+                    (company.strip(), number + 1),
+                )
+
+    def _generate_for_company(self, company: str) -> str:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO company_irj_sequences (company, next_number)
+                    VALUES (%s, 2)
+                    ON CONFLICT (company) DO UPDATE
+                    SET next_number = company_irj_sequences.next_number + 1
+                    RETURNING next_number - 1 AS number
+                    """,
+                    (company.strip(),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return an IRJ sequence number.")
+        number = int(row["number"])
+        if number > 999999:
+            raise RuntimeError(
+                f"The six-digit IRJ number range for {company} is exhausted."
+            )
+        return f"{number:06d}"
+
+    def _reserve_for_company(self, company: str, irj_number: str) -> None:
+        number = self._validate_number(irj_number)
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO company_irj_sequences (company, next_number)
+                    VALUES (%s, %s)
+                    ON CONFLICT (company) DO UPDATE
+                    SET next_number = GREATEST(
+                        company_irj_sequences.next_number,
+                        excluded.next_number
+                    )
+                    """,
+                    (company.strip(), number + 1),
+                )
+
+    @staticmethod
+    def _validate_number(irj_number: str) -> int:
+        normalized = irj_number.strip()
+        if len(normalized) != 6 or not normalized.isdigit():
+            raise ValueError("The IRJ number must contain exactly six digits.")
+        return int(normalized)
 
 
 class PostgresActivityFeedStore:
