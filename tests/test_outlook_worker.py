@@ -309,6 +309,46 @@ def test_worker_uploads_outlook_pdf_to_sharepoint_before_registration(
     assert extracted_ids == [record.id]
 
 
+def test_outlook_intake_flags_identical_pdf_before_extraction(
+    tmp_path: Path,
+) -> None:
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    first_path = tmp_path / "first.pdf"
+    first_path.write_bytes(VALID_PDF_BYTES)
+    original = invoices.add_from_outlook(
+        message={"id": "earlier-message"},
+        attachment={"id": "earlier-attachment", "name": "original.pdf"},
+        stored_path=first_path,
+    )
+    extracted_ids: list[int] = []
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, FakeSharePointIncomingClient()),
+        invoices,
+        cache_directory=tmp_path / "cache",
+        extraction_runner=extracted_ids.append,
+        activity_feed=ActivityFeedStore(tmp_path / "activity.db"),
+    )
+
+    duplicate = monitor.ingest_item(
+        {
+            "id": "new-sharepoint-item",
+            "name": "resent.pdf",
+            "size": len(VALID_PDF_BYTES),
+            "webUrl": "https://sharepoint.example/resent.pdf",
+        },
+        source_message={"id": "new-message"},
+        source_attachment={"id": "new-attachment", "name": "resent.pdf"},
+        content=VALID_PDF_BYTES,
+        event_type="outlook_intake",
+    )
+
+    assert duplicate is not None
+    assert duplicate.status == "Needs Review"
+    assert duplicate.duplicate_of_invoice_id == original.id
+    assert "identical PDF content" in str(duplicate.review_reason)
+    assert extracted_ids == []
+
+
 def test_worker_repairs_existing_unlinked_outlook_attachment(
     tmp_path: Path,
 ) -> None:

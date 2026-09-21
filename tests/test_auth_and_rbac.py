@@ -3,6 +3,9 @@ configuration CRUD, duplicate detection, and the approval on-hold/resume
 flow -- the behaviours added to implement MANUAL_VS_AUTOMATED.md end to end."""
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
+from threading import Barrier, Lock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,7 +15,9 @@ from app.ai_extraction import ExtractionResult
 from app.approval_matrix import ApprovalMatrixStore
 from app.auth import AuthStore
 from app.companies import CompanyStore
+from app.config_db import SQLiteProcessConfigurationStore
 from app.invoices import InvoiceStore
+from app.invoice_lifecycle import InvoiceLifecycleError
 from app.main import create_app
 from app.outlook_notifications import OutlookNotificationStore
 from app.suppliers import SupplierStore
@@ -31,6 +36,9 @@ def make_client(tmp_path: Path) -> TestClient:
             companies_store=CompanyStore(tmp_path / "config.db"),
             suppliers_store=SupplierStore(tmp_path / "config.db"),
             approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+            process_configuration_store=SQLiteProcessConfigurationStore(
+                tmp_path / "config.db"
+            ),
             activity_feed=ActivityFeedStore(tmp_path / "activity_feed.db"),
             notification_store=OutlookNotificationStore(
                 tmp_path / "outlook_notifications.db"
@@ -158,13 +166,7 @@ def test_non_admin_cannot_access_admin_endpoints(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     assert client.get("/api/admin/companies").status_code == 403
-    assert client.get("/api/admin/users").status_code == 403
-    assert (
-        client.put(
-            "/api/admin/users/admin", json={"display_name": "Unauthorised"}
-        ).status_code
-        == 403
-    )
+    assert client.get("/api/admin/users").status_code == 404
     assert (
         client.put(
             "/api/admin/supplier-terms/1",
@@ -174,57 +176,78 @@ def test_non_admin_cannot_access_admin_endpoints(tmp_path: Path) -> None:
     )
 
 
-def test_admin_can_edit_user_profile_role_and_password(tmp_path: Path) -> None:
+def test_local_development_identities_are_not_persisted_as_users(
+    tmp_path: Path,
+) -> None:
     client = make_client(tmp_path)
     login(client, "admin", "ChangeMe-Admin1!")
 
-    updated = client.put(
-        "/api/admin/users/purchase.ledger",
-        json={
-            "display_name": "Ledger Manager",
-            "email": "ledger.manager@example.test",
-            "role": "purchasing",
-            "password": "Replacement-PL1!",
-        },
-    )
-
-    assert updated.status_code == 200, updated.text
-    assert updated.json() == {
-        "username": "purchase.ledger",
-        "display_name": "Ledger Manager",
-        "email": "ledger.manager@example.test",
-        "role": "purchasing",
-    }
-    client.post("/api/auth/logout")
-    assert (
-        client.post(
-            "/api/auth/login",
-            json={
-                "username": "purchase.ledger",
-                "password": "ChangeMe-PL1!",
-            },
-        ).status_code
-        == 401
-    )
-    login(client, "purchase.ledger", "Replacement-PL1!")
-    assert client.get("/api/auth/me").json()["role"] == "purchasing"
+    with client.app.state.auth_store._connect() as connection:
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert "users" not in tables
+    assert "federated_sessions" not in tables
+    assert "sessions" in tables
+    assert client.get("/api/admin/users").status_code == 404
 
 
-def test_admin_can_clear_user_optional_email(tmp_path: Path) -> None:
-    client = make_client(tmp_path)
-    login(client, "admin", "ChangeMe-Admin1!")
-    client.put(
-        "/api/admin/users/purchase.ledger",
-        json={"email": "ledger@example.test"},
-    )
+def test_auth_store_migrates_legacy_users_and_preserves_entra_sessions(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-auth.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE users (
+                username TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                email TEXT,
+                role TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE sessions (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            CREATE TABLE federated_sessions (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                email TEXT,
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            INSERT INTO federated_sessions VALUES (
+                'entra-token', 'entra-user', 'Entra User',
+                'entra@example.test', 'purchase_ledger',
+                '2026-09-21T12:00:00+00:00', '2099-09-21T12:00:00+00:00'
+            );
+            """
+        )
 
-    updated = client.put(
-        "/api/admin/users/purchase.ledger",
-        json={"email": None},
-    )
+    store = AuthStore(database)
 
-    assert updated.status_code == 200, updated.text
-    assert updated.json()["email"] is None
+    user = store.get_user_by_session("entra-token")
+    assert user is not None
+    assert user.username == "entra-user"
+    with store._connect() as connection:
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert "users" not in tables
+    assert "federated_sessions" not in tables
 
 
 def test_admin_can_manage_companies_suppliers_and_matrix(tmp_path: Path) -> None:
@@ -344,6 +367,31 @@ def test_flagged_invoice_can_be_accepted_back_to_its_workflow_stage(
     assert accepted.json()["status"] == "Awaiting AI Extraction"
     assert accepted.json()["review_reason"] is None
     assert accepted.json()["review_return_status"] is None
+
+
+def test_flagged_invoice_can_be_rejected_directly(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("flagged.pdf", VALID_PDF_BYTES, "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    client.app.state.invoice_store.update_fields(
+        invoice_id,
+        status="Needs Review",
+        review_reason="Invoice details require review.",
+    )
+
+    rejected = client.post(
+        f"/api/invoices/{invoice_id}/reject-flagged",
+        json={"reason": "Not a valid supplier invoice."},
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "Rejected"
+    assert rejected.json()["rejection_reason"] == "Not a valid supplier invoice."
+    assert rejected.json()["review_reason"] is None
 
 
 def test_purchase_ledger_can_delete_invoice_before_approval(
@@ -470,7 +518,7 @@ def _upload_and_confirm(client: TestClient, *, supplier_invoice_number: str = "I
     assert confirm.json()["status"] == "Awaiting Sage Registration"
     register = client.post(
         f"/api/invoices/{invoice_id}/register-sage",
-        json={"sage_reference": f"SAGE-{supplier_invoice_number}"},
+        json={"irj_number": confirm.json()["irj_number"]},
     )
     assert register.status_code == 200, register.text
     assert register.json()["status"] == "Awaiting Approval 1"
@@ -480,6 +528,10 @@ def _upload_and_confirm(client: TestClient, *, supplier_invoice_number: str = "I
 def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     invoice_id = _upload_and_confirm(client)
+    sharepoint_moves: list[tuple[object, ...]] = []
+    client.app.state.lifecycle._move_pdf_in_sharepoint = (
+        lambda *args: sharepoint_moves.append(args)
+    )
 
     # Approver 1 places the invoice on hold with a required comment.
     login(client, "jordan.blake", "ChangeMe-App1!")
@@ -488,7 +540,12 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
         json={"level": 1, "decision": "on_hold", "comments": "Querying unit price with supplier."},
     )
     assert hold.status_code == 200, hold.text
-    assert hold.json()["status"] == "Approval Query / On Hold"
+    assert hold.json()["status"] == "Awaiting Approval 1"
+    assert hold.json()["hold_level"] == 1
+    assert "Jordan Blake (Approver 1) recorded approval query" in hold.json()["hold_reason"]
+    assert "BST]" in hold.json()["hold_reason"] or "GMT]" in hold.json()["hold_reason"]
+    assert "Querying unit price with supplier." in hold.json()["hold_reason"]
+    assert sharepoint_moves == []
 
     # A hold requires a comment.
     login(client, "jordan.blake", "ChangeMe-App1!")
@@ -501,6 +558,10 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     )
     assert resumed.status_code == 200, resumed.text
     assert resumed.json()["status"] == "Awaiting Approval 1"
+    assert resumed.json()["hold_level"] is None
+    assert "Querying unit price with supplier." in resumed.json()["hold_reason"]
+    assert "Supplier confirmed the price is correct." in resumed.json()["hold_reason"]
+    assert sharepoint_moves == []
 
     # Approver 1 approves; since a second approver is configured this moves
     # to Awaiting Approval 2 rather than Approved.
@@ -521,7 +582,7 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     assert approve2.status_code == 200
     assert approve2.json()["status"] == "Approved"
 
-    # Purchase Ledger marks it paid.
+    # Purchase Ledger selects BACS, then records payment.
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     client.app.state.invoice_store.update_fields(
         invoice_id,
@@ -529,6 +590,12 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
         foreign_allocation_reference="STALE-FX",
         foreign_allocated_by="Previous User",
     )
+    routed = client.post(
+        f"/api/invoices/{invoice_id}/payment-route",
+        json={"route": "bacs"},
+    )
+    assert routed.status_code == 200
+    assert routed.json()["status"] == "Approved for Payment - BACS"
     paid = client.post(
         f"/api/invoices/{invoice_id}/pay",
         json={
@@ -556,9 +623,174 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     )
     assert reconciled.status_code == 200
     assert reconciled.json()["status"] == "Reconciled / Complete"
+    # The date the payment appears on the bank statement (user-entered) is
+    # distinct from the system-recorded timestamp of when the invoice was
+    # marked reconciled.
+    assert reconciled.json()["reconciliation_date"] == "2026-01-17"
+    assert reconciled.json()["reconciled_at"] is not None
+    assert reconciled.json()["reconciled_at"].startswith("2026-")
 
 
-def test_named_second_approver_is_required_before_email_is_configured(
+def test_concurrent_final_approval_sends_one_email(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = make_client(tmp_path)
+    invoice_id = _upload_and_confirm(client)
+
+    login(client, "jordan.blake", "ChangeMe-App1!")
+    approve1 = client.post(
+        f"/api/invoices/{invoice_id}/approve",
+        json={"level": 1, "decision": "approved"},
+    )
+    assert approve1.status_code == 200
+    assert approve1.json()["status"] == "Awaiting Approval 2"
+
+    lifecycle = client.app.state.lifecycle
+    claim_barrier = Barrier(2)
+    moved_invoice_ids: list[int] = []
+    sent_subjects: list[str] = []
+    sent_subjects_lock = Lock()
+    original_claim = lifecycle.invoice_store.update_fields_if_status
+
+    def synchronized_claim(
+        invoice_id: int,
+        expected_status: str,
+        **fields: object,
+    ):
+        if expected_status == "Awaiting Approval 2":
+            claim_barrier.wait(timeout=5)
+        return original_claim(invoice_id, expected_status, **fields)
+
+    def capture_move(invoice, *args: object, **kwargs: object) -> None:
+        moved_invoice_ids.append(invoice.id)
+
+    def capture_email(*, recipient: str, subject: str, body: str) -> None:
+        with sent_subjects_lock:
+            sent_subjects.append(subject)
+
+    monkeypatch.setattr(
+        lifecycle.invoice_store,
+        "update_fields_if_status",
+        synchronized_claim,
+    )
+    monkeypatch.setattr(lifecycle, "_move_pdf_in_sharepoint", capture_move)
+    monkeypatch.setattr(
+        "app.invoice_lifecycle.send_email_notification",
+        capture_email,
+    )
+
+    def approve() -> str:
+        try:
+            return lifecycle.decide_approval(
+                invoice_id,
+                level=2,
+                decision="approved",
+                comments=None,
+                recorded_by="Sam Ellis",
+            ).status
+        except InvoiceLifecycleError as error:
+            return str(error)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _: approve(), range(2)))
+
+    assert outcomes.count("Approved") == 1
+    assert sum("is not Awaiting Approval 2" in outcome for outcome in outcomes) == 1
+    assert moved_invoice_ids == [invoice_id]
+    assert sent_subjects == ["Invoice (invoice.pdf) fully approved"]
+
+
+def test_approval_query_cycle_does_not_repeat_stage_email(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = make_client(tmp_path)
+    sent_subjects: list[str] = []
+    monkeypatch.setattr(
+        "app.invoice_lifecycle.send_email_notification",
+        lambda *, recipient, subject, body: sent_subjects.append(subject),
+    )
+
+    invoice_id = _upload_and_confirm(client)
+    assert sent_subjects == ["New invoice (invoice.pdf) waiting for approval"]
+
+    login(client, "jordan.blake", "ChangeMe-App1!")
+    hold = client.post(
+        f"/api/invoices/{invoice_id}/approve",
+        json={
+            "level": 1,
+            "decision": "on_hold",
+            "comments": "Please confirm the coding.",
+        },
+    )
+    assert hold.status_code == 200
+
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    resumed = client.post(
+        f"/api/invoices/{invoice_id}/resume-approval",
+        json={"resolution_notes": "Coding confirmed."},
+    )
+    assert resumed.status_code == 200
+    assert sent_subjects == ["New invoice (invoice.pdf) waiting for approval"]
+
+    lifecycle = client.app.state.lifecycle
+    lifecycle._send_stage_email_once(
+        invoice_id,
+        "approval_1",
+        recipient="jordan.blake@example.test",
+        subject="Duplicate approval request",
+        body="This must not be sent.",
+    )
+    assert sent_subjects == ["New invoice (invoice.pdf) waiting for approval"]
+
+
+def test_failed_stage_email_can_be_retried_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = make_client(tmp_path)
+    lifecycle = client.app.state.lifecycle
+    attempts: list[str] = []
+
+    def fail_once(*, recipient: str, subject: str, body: str) -> bool:
+        attempts.append(subject)
+        if len(attempts) == 1:
+            raise RuntimeError("Graph unavailable")
+        return True
+
+    monkeypatch.setattr(
+        "app.invoice_lifecycle.send_email_notification",
+        fail_once,
+    )
+
+    with pytest.raises(RuntimeError, match="Graph unavailable"):
+        lifecycle._send_stage_email_once(
+            99,
+            "approval_1",
+            recipient="approver@example.test",
+            subject="Approval required",
+            body="Review invoice.",
+        )
+    lifecycle._send_stage_email_once(
+        99,
+        "approval_1",
+        recipient="approver@example.test",
+        subject="Approval required",
+        body="Review invoice.",
+    )
+    lifecycle._send_stage_email_once(
+        99,
+        "approval_1",
+        recipient="approver@example.test",
+        subject="Duplicate",
+        body="Must not send.",
+    )
+
+    assert attempts == ["Approval required", "Approval required"]
+
+
+def test_sage_registration_stops_before_approval_when_recipient_email_is_missing(
     tmp_path: Path,
 ) -> None:
     client = make_client(tmp_path)
@@ -570,9 +802,41 @@ def test_named_second_approver_is_required_before_email_is_configured(
         route.id,
         approver2_email="",
     )
-    invoice_id = _upload_and_confirm(
-        client, supplier_invoice_number="MISSING-APPROVER-EMAIL"
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("missing-email.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
+    invoice_id = upload.json()["id"]
+    confirm = client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "MISSING-APPROVER-EMAIL",
+            "invoice_value": 500.0,
+            "currency": "GBP",
+        },
+    )
+    registration = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"irj_number": confirm.json()["irj_number"]},
+    )
+    assert registration.status_code == 200
+    assert registration.json()["status"] == "Needs Review"
+    assert "Approver 2 (Sam Ellis)" in registration.json()["review_reason"]
+    assert registration.json()["approver1_email"] is None
+
+    client.app.state.approval_matrix_store.update(
+        route.id,
+        approver2_email="sam.ellis@example.test",
+    )
+    retried = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"irj_number": confirm.json()["irj_number"]},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "Awaiting Approval 1"
 
     login(client, "jordan.blake", "ChangeMe-App1!")
     approved = client.post(
@@ -583,10 +847,118 @@ def test_named_second_approver_is_required_before_email_is_configured(
     assert approved.status_code == 200, approved.text
     assert approved.json()["status"] == "Awaiting Approval 2"
     assert approved.json()["approver2_name"] == "Sam Ellis"
-    assert approved.json()["approver2_email"] == ""
+    assert approved.json()["approver2_email"] == "sam.ellis@example.test"
 
 
-def test_foreign_payment_is_allocated_directly_to_complete(tmp_path: Path) -> None:
+def test_manual_irj_company_accepts_unique_six_digit_irj_at_sage(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    client.app.state.process_configuration_store.set(
+        "irj_mode:acme trading ltd", "manual"
+    )
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("edit-irj.pdf", VALID_PDF_BYTES, "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    confirmed = client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "EDIT-IRJ-1",
+        },
+    )
+    assert confirmed.json()["irj_number"] is None
+
+    registered = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"irj_number": "000250"},
+    )
+
+    assert registered.status_code == 200
+    assert registered.json()["irj_number"] == "000250"
+    assert registered.json()["sage_reference"] is None
+
+    second_upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("next-irj.pdf", VALID_PDF_BYTES, "application/pdf")},
+    )
+    second_confirmed = client.post(
+        f"/api/invoices/{second_upload.json()['id']}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "EDIT-IRJ-2",
+        },
+    )
+    assert second_confirmed.json()["irj_number"] is None
+    duplicate = client.post(
+        f"/api/invoices/{second_upload.json()['id']}/register-sage",
+        json={"irj_number": "000250"},
+    )
+    assert duplicate.status_code == 422
+    assert "already assigned" in duplicate.json()["detail"]
+
+
+def test_automatic_irj_company_rejects_edit_at_sage(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    upload = client.post(
+        "/api/invoices/manual-upload",
+        files={"file": ("automatic-irj.pdf", VALID_PDF_BYTES, "application/pdf")},
+    )
+    invoice_id = upload.json()["id"]
+    confirmed = client.post(
+        f"/api/invoices/{invoice_id}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "AUTO-IRJ-1",
+        },
+    )
+    assert confirmed.status_code == 200
+    assigned_irj = confirmed.json()["irj_number"]
+    assert assigned_irj is not None
+
+    response = client.post(
+        f"/api/invoices/{invoice_id}/register-sage",
+        json={"irj_number": "000250"},
+    )
+
+    assert response.status_code == 422
+    assert assigned_irj in response.json()["detail"]
+
+
+def test_admin_sets_company_irj_mode_and_latest_paper_number(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    login(client, "admin", "ChangeMe-Admin1!")
+
+    response = client.put(
+        "/api/admin/irj-configurations/Acme%20Trading%20Ltd",
+        json={"mode": "automatic", "current_irj": "004321"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "company": "Acme Trading Ltd",
+        "mode": "automatic",
+        "current_irj": "004321",
+    }
+
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    invoice_id = _upload_and_confirm(
+        client, supplier_invoice_number="AUTO-IRJ-4322"
+    )
+    invoice = client.get(f"/api/invoices/{invoice_id}").json()
+    assert invoice["irj_number"] == "004322"
+
+
+def test_foreign_poa_payment_flows_through_bank_reconciliation(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     invoice_id = _upload_and_confirm(
         client, supplier_invoice_number="FOREIGN-1"
@@ -615,36 +987,39 @@ def test_foreign_payment_is_allocated_directly_to_complete(tmp_path: Path) -> No
         reconciliation_notes="Stale reconciliation",
         reconciled_by="Previous User",
     )
-    routed = client.post(f"/api/invoices/{invoice_id}/route-foreign-payment")
+    routed = client.post(
+        f"/api/invoices/{invoice_id}/payment-route",
+        json={"route": "foreign_poa"},
+    )
     assert routed.status_code == 200
-    assert routed.json()["status"] == "Foreign Payment / Awaiting Allocation"
+    assert routed.json()["status"] == "Approved for Payment - Foreign POA"
     assert routed.json()["is_foreign_payment"] == 1
     assert routed.json()["payment_route_decided_by"] == "Purchase Ledger"
     assert routed.json()["payment_date"] is None
     assert routed.json()["payment_reference"] is None
     assert routed.json()["reconciliation_date"] is None
 
-    reverted = client.post(
-        f"/api/invoices/{invoice_id}/revert-foreign-payment"
-    )
-    assert reverted.status_code == 200
-    assert reverted.json()["status"] == "Approved"
-    assert reverted.json()["is_foreign_payment"] is None
-
-    routed = client.post(f"/api/invoices/{invoice_id}/route-foreign-payment")
-    assert routed.json()["status"] == "Foreign Payment / Awaiting Allocation"
-
-    allocated = client.post(
-        f"/api/invoices/{invoice_id}/allocate-foreign-payment",
+    paid = client.post(
+        f"/api/invoices/{invoice_id}/pay",
         json={
-            "allocation_date": "2026-01-20",
-            "allocation_reference": "FX-ALLOC-9",
+            "payment_date": "2026-01-20",
+            "payment_reference": "FX-ALLOC-9",
         },
     )
-    assert allocated.status_code == 200
-    assert allocated.json()["status"] == "Reconciled / Complete"
-    assert allocated.json()["foreign_allocation_reference"] == "FX-ALLOC-9"
-    assert allocated.json()["reconciliation_date"] is None
+    assert paid.status_code == 200
+    assert paid.json()["status"] == "Paid / Awaiting Bank Reconciliation"
+    assert paid.json()["payment_method"] == "Foreign POA"
+
+    reconciled = client.post(
+        f"/api/invoices/{invoice_id}/reconcile",
+        json={
+            "reconciliation_date": "2026-01-22",
+            "notes": "Appeared on the bank statement.",
+        },
+    )
+    assert reconciled.status_code == 200
+    assert reconciled.json()["status"] == "Reconciled / Complete"
+    assert reconciled.json()["reconciliation_date"] == "2026-01-22"
 
 
 def test_on_hold_requires_a_comment(tmp_path: Path) -> None:
@@ -681,7 +1056,7 @@ def test_missing_approver_route_can_be_configured_and_retried(
 
     registered = client.post(
         f"/api/invoices/{invoice_id}/register-sage",
-        json={"sage_reference": "SAGE-NEW-1"},
+        json={"irj_number": confirmed.json()["irj_number"]},
     )
     assert registered.json()["status"] == "Needs Review"
     assert "No approval matrix entry" in registered.json()["review_reason"]
@@ -701,11 +1076,11 @@ def test_missing_approver_route_can_be_configured_and_retried(
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     retried = client.post(
         f"/api/invoices/{invoice_id}/register-sage",
-        json={"sage_reference": "SAGE-NEW-1"},
+        json={"irj_number": confirmed.json()["irj_number"]},
     )
     assert retried.status_code == 200
     assert retried.json()["status"] == "Awaiting Approval 1"
-    assert retried.json()["sage_reference"] == "SAGE-NEW-1"
+    assert retried.json()["sage_reference"] is None
 
 
 def test_po_query_resolution_requires_sage_registration_before_approval(
@@ -729,6 +1104,10 @@ def test_po_query_resolution_requires_sage_registration_before_approval(
         },
     )
     assert confirmed.json()["status"] == "Awaiting PO Matching"
+    sharepoint_moves: list[tuple[object, ...]] = []
+    client.app.state.lifecycle._move_pdf_in_sharepoint = (
+        lambda *args: sharepoint_moves.append(args)
+    )
 
     query = client.post(
         f"/api/invoices/{invoice_id}/po-match",
@@ -739,17 +1118,24 @@ def test_po_query_resolution_requires_sage_registration_before_approval(
             "purchasing_contact": "Purchasing Team",
         },
     )
-    assert query.json()["status"] == "PO Query / Matching Issue"
+    assert query.json()["status"] == "Awaiting PO Matching"
+    assert "Purchase Ledger recorded PO query" in query.json()["po_query_notes"]
+    assert "BST]" in query.json()["po_query_notes"] or "GMT]" in query.json()["po_query_notes"]
+    assert "Goods receipt is missing." in query.json()["po_query_notes"]
+    assert query.json()["po_query_category"] == "missing goods receipt"
+    assert sharepoint_moves == []
 
     matched = client.post(
         f"/api/invoices/{invoice_id}/po-match",
         json={"matched": True, "notes": "Goods receipt recorded."},
     )
     assert matched.json()["status"] == "Awaiting Sage Registration"
+    assert "Goods receipt is missing." in matched.json()["po_query_notes"]
+    assert "Goods receipt recorded." in matched.json()["po_query_notes"]
 
     registered = client.post(
         f"/api/invoices/{invoice_id}/register-sage",
-        json={"sage_reference": "SAGE-PO-100"},
+        json={"irj_number": matched.json()["irj_number"]},
     )
     assert registered.status_code == 200
     assert registered.json()["status"] == "Approved"

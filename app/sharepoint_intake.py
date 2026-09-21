@@ -37,6 +37,8 @@ class InvoiceIntakeStore(Protocol):
 
     def update_fields(self, invoice_id: int, **fields: object) -> InvoiceRecord: ...
 
+    def list(self, limit: int = 100) -> list[InvoiceRecord]: ...
+
 
 class SharePointIncomingMonitor:
     """Registers each PDF found in SharePoint Incoming exactly once.
@@ -141,6 +143,32 @@ class SharePointIncomingMonitor:
             attachment=attachment,
             stored_path=cached_path,
         )
+        if event_type == "outlook_intake":
+            duplicate = self._find_identical_pdf(record, pdf_content)
+            if duplicate is not None:
+                record = self.invoice_store.update_fields(
+                    record.id,
+                    status="Needs Review",
+                    duplicate_of_invoice_id=duplicate.id,
+                    review_reason=(
+                        f"Possible duplicate of invoice #{duplicate.id} "
+                        f"(IRJ {duplicate.irj_number or 'not yet assigned'}, "
+                        f"status {duplicate.status}), matched on identical PDF "
+                        "content. Purchase Ledger must confirm whether this is "
+                        "a genuinely separate invoice."
+                    ),
+                )
+                if self.activity_feed is not None:
+                    self.activity_feed.add_event(
+                        event_type="possible_duplicate",
+                        target_role=ROLE_PURCHASE_LEDGER,
+                        message=(
+                            f"'{filename}' is byte-for-byte identical to invoice "
+                            f"#{duplicate.id} and needs duplicate review."
+                        ),
+                        invoice_id=record.id,
+                    )
+                return record
         if self.activity_feed is not None:
             self.activity_feed.add_event(
                 event_type=event_type,
@@ -163,6 +191,23 @@ class SharePointIncomingMonitor:
                 pass
             return self.invoice_store.get_by_sharepoint_item_id(item_id)
         return record
+
+    def _find_identical_pdf(
+        self, invoice: InvoiceRecord, content: bytes
+    ) -> InvoiceRecord | None:
+        content_digest = hashlib.sha256(content).digest()
+        for candidate in self.invoice_store.list(limit=500):
+            if candidate.id == invoice.id:
+                continue
+            try:
+                candidate_digest = hashlib.sha256(
+                    Path(candidate.stored_path).read_bytes()
+                ).digest()
+            except OSError:
+                continue
+            if candidate_digest == content_digest:
+                return candidate
+        return None
 
     def _handle_invalid_item(
         self, item: dict[str, object], error: InvalidIncomingPdfError

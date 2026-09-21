@@ -7,9 +7,8 @@ from typing import BinaryIO
 from openpyxl import load_workbook
 
 from app.approval_matrix import ALL_COMPANIES, ApprovalMatrixStore
-from app.auth import AuthStore
 from app.companies import CompanyStore
-from app.suppliers import SupplierStore
+from app.suppliers import SupplierProfile, SupplierStore
 from app.supplier_terms import SupplierTermsStore
 
 
@@ -176,12 +175,18 @@ def find_existing_supplier_imports(
             "'Supplier' or 'Trading Partner Name')."
         )
 
+    supplier_lookup: dict[str, SupplierProfile] = {}
+    for profile in supplier_store.list():
+        supplier_lookup[profile.name.strip().casefold()] = profile
+        for alias in profile.aliases:
+            supplier_lookup[alias.strip().casefold()] = profile
+
     duplicates: dict[str, dict[str, object]] = {}
     for row_number, row in enumerate(rows_iter, start=2):
         supplier = _cell(row, mapping, "supplier")
         if not supplier:
             continue
-        existing = supplier_store.get(supplier)
+        existing = supplier_lookup.get(supplier.strip().casefold())
         if existing is None:
             continue
         key = existing.name.strip().casefold()
@@ -218,7 +223,6 @@ def import_supplier_workbook(
     supplier_store: SupplierStore,
     approval_matrix_store: ApprovalMatrixStore,
     supplier_terms_store: SupplierTermsStore,
-    auth_store: AuthStore,
     default_company: str | None = None,
 ) -> ImportSummary:
     workbook = load_workbook(source, data_only=True, read_only=True)
@@ -239,10 +243,33 @@ def import_supplier_workbook(
     selected_company = (default_company or "").strip()
     if selected_company and company_store.get(selected_company) is None:
         raise ValueError(f"Selected company '{selected_company}' was not found.")
-
-    users_by_name = {
-        user.display_name.strip().casefold(): user for user in auth_store.list_users()
+    bulk_writer = getattr(supplier_store, "bulk_import_master_data", None)
+    use_bulk_writer = callable(bulk_writer) and bool(selected_company)
+    supplier_lookup: dict[str, SupplierProfile] = {}
+    for profile in supplier_store.list():
+        supplier_lookup[profile.name.strip().casefold()] = profile
+        for alias in profile.aliases:
+            supplier_lookup[alias.strip().casefold()] = profile
+    approval_lookup = {
+        (entry.company.strip().casefold(), entry.supplier.strip().casefold()): entry
+        for entry in approval_matrix_store.list()
     }
+    bulk_suppliers: dict[str, tuple[str, str]] = {}
+    bulk_approvals: dict[
+        tuple[str, str],
+        tuple[str, str, str, str, str | None, str | None],
+    ] = {}
+    bulk_terms: dict[
+        tuple[str, str],
+        tuple[
+            str,
+            str,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+        ],
+    ] = {}
 
     summary = ImportSummary()
     for row_number, row in enumerate(rows_iter, start=2):
@@ -264,7 +291,7 @@ def import_supplier_workbook(
                 )
             )
             continue
-        supplier_profile = supplier_store.get(supplier)
+        supplier_profile = supplier_lookup.get(supplier.strip().casefold())
         if supplier_profile is not None:
             supplier = supplier_profile.name
 
@@ -278,7 +305,9 @@ def import_supplier_workbook(
             _cell(row, mapping, "approver1_email"),
             _cell(row, mapping, "approver2_email"),
         ]
-        existing_entry = approval_matrix_store.find_exact(company, supplier)
+        existing_entry = approval_lookup.get(
+            (company.strip().casefold(), supplier.strip().casefold())
+        )
         existing_emails = (
             {
                 approver.name.strip().casefold(): approver.email
@@ -294,11 +323,9 @@ def import_supplier_workbook(
         resolved: list[tuple[str, str]] = []
         missing_emails: list[str] = []
         for index, name in enumerate(approver_names[:2]):
-            user = users_by_name.get(name.strip().casefold())
-            display_name = user.display_name if user is not None else name
+            display_name = name
             email = (
                 supplied_emails[index]
-                or (user.email if user is not None else None)
                 or existing_emails.get(display_name.strip().casefold())
             )
             resolved.append((display_name, email or ""))
@@ -317,13 +344,22 @@ def import_supplier_workbook(
         # approval matrix / supplier terms rows can reference them; leave
         # folder paths for the admin to adjust afterwards if this created a
         # brand-new company.
-        if company != ALL_COMPANIES and company_store.get(company) is None:
+        if (
+            not use_bulk_writer
+            and company != ALL_COMPANIES
+            and company_store.get(company) is None
+        ):
             company_store.create(
                 name=company,
                 sharepoint_root_folder=f"Invoices/{company}",
             )
         supplier_default_company = company if company != ALL_COMPANIES else None
-        if supplier_profile is None:
+        if use_bulk_writer:
+            bulk_suppliers[supplier.casefold()] = (
+                supplier,
+                supplier_default_company or "",
+            )
+        elif supplier_profile is None:
             supplier_store.create(
                 name=supplier,
                 default_company=supplier_default_company,
@@ -337,7 +373,18 @@ def import_supplier_workbook(
         if resolved:
             approver1_name, approver1_email = resolved[0]
             approver2_name, approver2_email = resolved[1] if len(resolved) > 1 else (None, None)
-            if existing_entry is None:
+            if use_bulk_writer:
+                bulk_approvals[
+                    (company.casefold(), supplier.casefold())
+                ] = (
+                    company,
+                    supplier,
+                    approver1_name,
+                    approver1_email,
+                    approver2_name,
+                    approver2_email,
+                )
+            elif existing_entry is None:
                 approval_matrix_store.create(
                     company=company,
                     supplier=supplier,
@@ -355,14 +402,33 @@ def import_supplier_workbook(
                     approver2_email=approver2_email,
                 )
 
-        supplier_terms_store.upsert(
-            company=company,
-            supplier=supplier,
-            supplier_account_number=_cell(row, mapping, "supplier_account_number"),
-            default_payment_method=_cell(row, mapping, "default_payment_method"),
-            payment_terms_notice=_cell(row, mapping, "payment_terms_notice"),
-            bank_account=_cell(row, mapping, "bank_account"),
+        account_number = _cell(row, mapping, "supplier_account_number")
+        term_values = (
+            company,
+            supplier,
+            account_number,
+            _cell(row, mapping, "default_payment_method"),
+            _cell(row, mapping, "payment_terms_notice"),
+            _cell(row, mapping, "bank_account"),
         )
+        if use_bulk_writer:
+            bulk_terms[
+                (
+                    company.casefold(),
+                    account_number.casefold()
+                    if account_number
+                    else supplier.casefold(),
+                )
+            ] = term_values
+        else:
+            supplier_terms_store.upsert(
+                company=company,
+                supplier=supplier,
+                supplier_account_number=account_number,
+                default_payment_method=term_values[3],
+                payment_terms_notice=term_values[4],
+                bank_account=term_values[5],
+            )
 
         summary.rows.append(
             ImportRowResult(
@@ -374,4 +440,10 @@ def import_supplier_workbook(
             )
         )
 
+    if use_bulk_writer:
+        bulk_writer(
+            suppliers=list(bulk_suppliers.values()),
+            approvals=list(bulk_approvals.values()),
+            terms=list(bulk_terms.values()),
+        )
     return summary

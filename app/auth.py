@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
 import secrets
 import sqlite3
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,44 +35,25 @@ SESSION_COOKIE_NAME = "session_token"
 SESSION_LIFETIME = timedelta(hours=12)
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    email TEXT,
-    role TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
     username TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    email TEXT,
+    role TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_flows (
+    state TEXT PRIMARY KEY,
+    flow_json TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
 """
 
-# ---------------------------------------------------------------------------
-# PLACEHOLDER — IDENTITY PROVIDER
-# ---------------------------------------------------------------------------
-# This module is a local username/password stand-in for real staff login.
-# The specification and PROJECT_HANDOFF.md call for signing in with existing
-# Microsoft 365 accounts through Microsoft Entra ID (no separate application
-# passwords). To swap this module for real SSO:
-#
-#   1. Register an Entra ID app (OUTLOOK_MCP_CLIENT_ID / _SECRET / _TENANT_ID
-#      in .env are already reserved for Graph access and can be reused or a
-#      dedicated web-app registration can be added).
-#   2. Add AUTH_ENTRA_CLIENT_ID / AUTH_ENTRA_CLIENT_SECRET / AUTH_ENTRA_TENANT_ID
-#      placeholders (see .env.example) and implement an MSAL Authorization
-#      Code flow in place of authenticate_user() / login below.
-#   3. Map Entra ID group membership (or app roles) onto ROLE_* above instead
-#      of the local `role` column.
-#
-# Until that integration exists, the seeded accounts below let every role be
-# exercised end-to-end. **Change these passwords before any real deployment.**
-# ---------------------------------------------------------------------------
+# These identities support optional local development and automated tests only.
+# They are never persisted. Production uses Microsoft Entra app roles.
 
 SEED_USERS: list[tuple[str, str, str, str, str]] = [
     # username, display name, email, role, placeholder password
@@ -122,173 +102,191 @@ class AuthError(ValueError):
 
 
 class AuthStore:
-    """SQLite-backed local users + sessions. See the PLACEHOLDER note above
-    for how this should be replaced with Entra ID SSO in production."""
+    """SQLite-backed sessions for identities supplied by Microsoft Entra."""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            self._migrate_legacy_identity_tables(connection)
             connection.executescript(SCHEMA)
             connection.commit()
-        self._seed_default_users()
 
-    def _seed_default_users(self) -> None:
-        with self._connect() as connection:
-            existing = connection.execute("SELECT COUNT(*) AS n FROM users").fetchone()
-            if existing["n"]:
-                return
-        for username, display_name, email, role, password in SEED_USERS:
-            self.create_user(
-                username=username,
-                display_name=display_name,
-                email=email,
-                role=role,
-                password=password,
-            )
-
-    # ------------------------------------------------------------------
-    # User management (admin-only via the API layer)
-    # ------------------------------------------------------------------
-
-    def create_user(
-        self,
-        *,
-        username: str,
-        display_name: str,
-        email: str | None,
-        role: str,
-        password: str,
-    ) -> User:
-        if role not in ALL_ROLES:
-            raise AuthError(f"Unknown role '{role}'.")
-        salt = secrets.token_hex(16)
-        password_hash = _hash_password(password, salt)
-        created_at = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO users (
-                        username, display_name, email, role,
-                        password_hash, password_salt, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (username, display_name, email, role, password_hash, salt, created_at),
-                )
-                connection.commit()
-            except sqlite3.IntegrityError as error:
-                raise AuthError(f"User '{username}' already exists.") from error
-        return User(username=username, display_name=display_name, email=email, role=role)
-
-    def list_users(self) -> list[User]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT username, display_name, email, role FROM users ORDER BY role, username"
+    @staticmethod
+    def _migrate_legacy_identity_tables(connection: sqlite3.Connection) -> None:
+        tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
-        return [User(**dict(row)) for row in rows]
+        }
+        session_columns = (
+            {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(sessions)"
+                ).fetchall()
+            }
+            if "sessions" in tables
+            else set()
+        )
+        legacy_tables = {"users", "federated_sessions"} & tables
+        if not legacy_tables and (
+            not session_columns or "display_name" in session_columns
+        ):
+            return
 
-    def update_user(self, username: str, **fields: object) -> User:
-        allowed = {"display_name", "email", "role", "password"}
-        unknown = set(fields) - allowed
-        if unknown:
-            raise AuthError(f"Unknown user fields: {', '.join(sorted(unknown))}.")
-        role = fields.get("role")
-        if role is not None and role not in ALL_ROLES:
-            raise AuthError(f"Unknown role '{role}'.")
-        password = fields.pop("password", None)
-        if password is not None:
-            if not isinstance(password, str) or not password:
-                raise AuthError("A new password cannot be empty.")
-            salt = secrets.token_hex(16)
-            fields["password_hash"] = _hash_password(password, salt)
-            fields["password_salt"] = salt
-        if not fields:
-            users = {user.username: user for user in self.list_users()}
-            if username not in users:
-                raise AuthError(f"User '{username}' was not found.")
-            return users[username]
-        assignments = ", ".join(f"{key} = ?" for key in fields)
-        with self._connect() as connection:
-            try:
-                cursor = connection.execute(
-                    f"UPDATE users SET {assignments} WHERE username = ?",
-                    (*fields.values(), username),
-                )
-                connection.commit()
-            except sqlite3.IntegrityError as error:
-                raise AuthError(
-                    "Another user already has that email address."
-                ) from error
-            if cursor.rowcount == 0:
-                raise AuthError(f"User '{username}' was not found.")
-        return next(user for user in self.list_users() if user.username == username)
-
-    def delete_user(self, username: str) -> None:
-        with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM users WHERE username = ?", (username,))
-            connection.commit()
-            if cursor.rowcount == 0:
-                raise AuthError(f"User '{username}' was not found.")
-
-    def set_password(self, username: str, password: str) -> None:
-        salt = secrets.token_hex(16)
-        password_hash = _hash_password(password, salt)
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE users SET password_hash = ?, password_salt = ? WHERE username = ?",
-                (password_hash, salt, username),
+        connection.execute(
+            """
+            CREATE TABLE sessions_replacement (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                email TEXT,
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             )
-            connection.commit()
-            if cursor.rowcount == 0:
-                raise AuthError(f"User '{username}' was not found.")
+            """
+        )
+        if "sessions" in tables and "display_name" in session_columns:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO sessions_replacement
+                SELECT token, username, display_name, email, role,
+                       created_at, expires_at
+                FROM sessions
+                """
+            )
+        elif "sessions" in tables and "users" in tables:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO sessions_replacement
+                SELECT sessions.token, users.username, users.display_name,
+                       users.email, users.role, sessions.created_at,
+                       sessions.expires_at
+                FROM sessions
+                JOIN users ON users.username = sessions.username
+                """
+            )
+        if "federated_sessions" in tables:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO sessions_replacement
+                SELECT token, username, display_name, email, role,
+                       created_at, expires_at
+                FROM federated_sessions
+                """
+            )
+        connection.executescript(
+            """
+            DROP TABLE IF EXISTS sessions;
+            ALTER TABLE sessions_replacement RENAME TO sessions;
+            DROP TABLE IF EXISTS federated_sessions;
+            DROP TABLE IF EXISTS users;
+            """
+        )
 
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------
 
     def authenticate(self, username: str, password: str) -> User:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT username, display_name, email, role, password_hash, password_salt
-                FROM users WHERE username = ?
-                """,
-                (username,),
-            ).fetchone()
-        if row is None:
-            raise AuthError("Invalid username or password.")
-        expected = _hash_password(password, row["password_salt"])
-        if not hmac.compare_digest(expected, row["password_hash"]):
-            raise AuthError("Invalid username or password.")
-        return User(
-            username=row["username"],
-            display_name=row["display_name"],
-            email=row["email"],
-            role=row["role"],
+        user = next(
+            (
+                User(seed_username, display_name, email, role)
+                for seed_username, display_name, email, role, seed_password
+                in SEED_USERS
+                if secrets.compare_digest(
+                    seed_username.encode(), username.encode()
+                )
+                and secrets.compare_digest(
+                    seed_password.encode(), password.encode()
+                )
+            ),
+            None,
         )
+        if user is None:
+            raise AuthError("Invalid username or password.")
+        return user
 
     def create_session(self, username: str) -> str:
+        user = next(
+            (
+                User(seed_username, display_name, email, role)
+                for seed_username, display_name, email, role, _ in SEED_USERS
+                if seed_username == username
+            ),
+            None,
+        )
+        if user is None:
+            raise AuthError(f"Unknown local development identity '{username}'.")
+        return self.create_federated_session(user)
+
+    def create_federated_session(self, user: User) -> str:
+        if user.role not in ALL_ROLES:
+            raise AuthError(f"Unknown role '{user.role}'.")
         token = secrets.token_urlsafe(32)
         now = datetime.now(timezone.utc)
         expires_at = now + SESSION_LIFETIME
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO sessions (token, username, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                (token, username, now.isoformat(), expires_at.isoformat()),
+                """
+                INSERT INTO sessions (
+                    token, username, display_name, email, role,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    user.username,
+                    user.display_name,
+                    user.email,
+                    user.role,
+                    now.isoformat(),
+                    expires_at.isoformat(),
+                ),
             )
             connection.commit()
         return token
+
+    def save_oauth_flow(self, state: str, flow: dict[str, object]) -> None:
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO oauth_flows (
+                    state, flow_json, expires_at
+                ) VALUES (?, ?, ?)
+                """,
+                (state, json.dumps(flow), expires_at.isoformat()),
+            )
+            connection.commit()
+
+    def pop_oauth_flow(self, state: str) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT flow_json, expires_at FROM oauth_flows WHERE state = ?",
+                (state,),
+            ).fetchone()
+            connection.execute(
+                "DELETE FROM oauth_flows WHERE state = ?", (state,)
+            )
+            connection.commit()
+        if row is None:
+            return None
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at < datetime.now(timezone.utc):
+            return None
+        flow = json.loads(row["flow_json"])
+        return flow if isinstance(flow, dict) else None
 
     def get_user_by_session(self, token: str) -> User | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT users.username AS username, users.display_name AS display_name,
-                       users.email AS email, users.role AS role,
-                       sessions.expires_at AS expires_at
+                SELECT username, display_name, email, role, expires_at
                 FROM sessions
-                JOIN users ON users.username = sessions.username
                 WHERE sessions.token = ?
                 """,
                 (token,),
@@ -317,13 +315,6 @@ class AuthStore:
         connection = sqlite3.connect(self.database_path)
         connection.row_factory = sqlite3.Row
         return connection
-
-
-def _hash_password(password: str, salt: str) -> str:
-    # PBKDF2-HMAC-SHA256 is adequate for this local placeholder identity
-    # store. Replace entirely with Entra ID SSO (see module docstring)
-    # before handling real invoices/staff credentials.
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
 
 
 # ---------------------------------------------------------------------------

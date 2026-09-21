@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app.document_classification import classify_document_text
 
@@ -89,11 +89,15 @@ class ExtractionResult:
         return json.dumps(self.field_confidences, sort_keys=True)
 
 
-def confidence_threshold() -> float:
+def confidence_threshold(
+    setting_getter: Callable[[str, str | None], str | None] | None = None,
+) -> float:
     try:
-        from app.config_db import get_setting
+        if setting_getter is None:
+            from app.config_db import get_setting
 
-        raw = get_setting("ai_confidence_threshold", "") or ""
+            setting_getter = get_setting
+        raw = setting_getter("ai_confidence_threshold", "") or ""
     except Exception:
         raw = ""
     if not raw:

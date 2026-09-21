@@ -18,6 +18,16 @@ CREATE TABLE IF NOT EXISTS activity_events (
 
 CREATE INDEX IF NOT EXISTS idx_activity_events_id
 ON activity_events(id);
+
+CREATE INDEX IF NOT EXISTS idx_activity_events_invoice
+ON activity_events(invoice_id, id);
+
+CREATE TABLE IF NOT EXISTS invoice_email_stages (
+    invoice_id INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (invoice_id, stage)
+);
 """
 
 # Valid target_role values used throughout the app. "all" is broadcast to
@@ -94,6 +104,52 @@ class ActivityFeedStore:
                 (since_id, limit),
             ).fetchall()
         return [ActivityEvent(**dict(row)) for row in rows]
+
+    def list_for_invoice(
+        self, invoice_id: int, limit: int = 200
+    ) -> list[ActivityEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, event_type, target_role, message, invoice_id, created_at
+                FROM (
+                    SELECT id, event_type, target_role, message,
+                           invoice_id, created_at
+                    FROM activity_events
+                    WHERE invoice_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (invoice_id, limit),
+            ).fetchall()
+        return [ActivityEvent(**dict(row)) for row in rows]
+
+    def claim_email_stage(self, invoice_id: int, stage: str) -> bool:
+        """Atomically reserve one email delivery attempt for an invoice stage."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO invoice_email_stages (
+                    invoice_id, stage, claimed_at
+                ) VALUES (?, ?, ?)
+                """,
+                (invoice_id, stage, datetime.now(timezone.utc).isoformat()),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def release_email_stage(self, invoice_id: int, stage: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM invoice_email_stages
+                WHERE invoice_id = ? AND stage = ?
+                """,
+                (invoice_id, stage),
+            )
+            connection.commit()
 
     def latest_id(self) -> int:
         with self._connect() as connection:

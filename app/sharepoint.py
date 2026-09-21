@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from threading import Lock
+from time import monotonic
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -61,6 +63,14 @@ class SharePointClient:
         self.settings = sharepoint_settings
         self.token_provider = token_provider or MsalTokenProvider(outlook_settings)
         self.http_client = http_client or httpx.Client(timeout=60.0)
+        self._cache_lock = Lock()
+        self._folder_cache: dict[str, tuple[float, str]] = {}
+        self._folder_inventory_cache: dict[int, tuple[float, list[str]]] = {}
+        self._statement_library_cache: dict[
+            tuple[str, int],
+            tuple[float, dict[str, list[dict[str, Any]]]],
+        ] = {}
+        self._cache_ttl_seconds = 300.0
 
     def upload_to_incoming(
         self,
@@ -189,6 +199,8 @@ class SharePointClient:
             "name": destination_filename,
         }
         response = self._send_json("PATCH", url, payload)
+        with self._cache_lock:
+            self._statement_library_cache.clear()
         return response.json()
 
     def upload_and_move(
@@ -224,6 +236,10 @@ class SharePointClient:
         """
         if max_folders < 1:
             raise ValueError("max_folders must be greater than zero.")
+        with self._cache_lock:
+            cached = self._folder_inventory_cache.get(max_folders)
+            if cached is not None and monotonic() - cached[0] < self._cache_ttl_seconds:
+                return list(cached[1])
 
         drive_prefix = (
             f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
@@ -275,7 +291,10 @@ class SharePointClient:
                     )
             next_link = payload.get("@odata.nextLink")
             url = next_link if isinstance(next_link, str) else None
-        return sorted(paths, key=str.casefold)
+        result = sorted(paths, key=str.casefold)
+        with self._cache_lock:
+            self._folder_inventory_cache[max_folders] = (monotonic(), result)
+        return list(result)
 
     def list_statement_library(
         self,
@@ -289,6 +308,11 @@ class SharePointClient:
         normalized_root = str(PurePosixPath(statements_root)).strip("/")
         if not normalized_root:
             raise ValueError("statements_root must not be empty.")
+        cache_key = (normalized_root.casefold(), max_items)
+        with self._cache_lock:
+            cached = self._statement_library_cache.get(cache_key)
+            if cached is not None and monotonic() - cached[0] < self._cache_ttl_seconds:
+                return self._copy_statement_library(cached[1])
 
         drive_prefix = (
             f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
@@ -363,13 +387,16 @@ class SharePointClient:
             next_link = payload.get("@odata.nextLink")
             url = next_link if isinstance(next_link, str) else None
 
-        return {
+        result = {
             company: sorted(
                 files,
                 key=lambda item: str(item.get("name", "")).casefold(),
             )
             for company, files in sorted(library.items(), key=lambda pair: pair[0].casefold())
         }
+        with self._cache_lock:
+            self._statement_library_cache[cache_key] = (monotonic(), result)
+        return self._copy_statement_library(result)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -419,10 +446,38 @@ class SharePointClient:
             raise SharePointError("Destination folder path must not be empty.")
 
         current_id: str | None = None
+        resolved_parts: list[str] = []
         for part in parts:
+            resolved_parts.append(part)
+            cache_key = "/".join(resolved_parts).casefold()
+            cached_id = self._cached_folder_id(cache_key)
+            if cached_id is not None:
+                current_id = cached_id
+                continue
             current_id = self._get_or_create_folder(part, parent_id=current_id)
+            with self._cache_lock:
+                self._folder_cache[cache_key] = (monotonic(), current_id)
         assert isinstance(current_id, str)
         return current_id
+
+    def _cached_folder_id(self, cache_key: str) -> str | None:
+        with self._cache_lock:
+            cached = self._folder_cache.get(cache_key)
+            if cached is None:
+                return None
+            if monotonic() - cached[0] >= self._cache_ttl_seconds:
+                del self._folder_cache[cache_key]
+                return None
+            return cached[1]
+
+    @staticmethod
+    def _copy_statement_library(
+        library: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            company: [dict(statement) for statement in statements]
+            for company, statements in library.items()
+        }
 
     def _get_or_create_folder(
         self, name: str, *, parent_id: str | None
@@ -483,6 +538,8 @@ class SharePointClient:
             "@microsoft.graph.conflictBehavior": "rename",
         }
         created = self._send_json("POST", create_url, payload)
+        with self._cache_lock:
+            self._folder_inventory_cache.clear()
         return str(created.json()["id"])
 
     def _send_json(

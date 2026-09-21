@@ -118,6 +118,7 @@ FIELD_COLUMNS: dict[str, str] = {
     "reconciliation_date": "reconciliation_date",
     "reconciliation_notes": "reconciliation_notes",
     "reconciled_by": "reconciled_by",
+    "reconciled_at": "reconciled_at",
     "rejection_reason": "rejection_reason",
     "review_reason": "review_reason",
     "review_return_status": "review_return_status",
@@ -274,6 +275,9 @@ class SharePointInvoiceStore:
         records.sort(key=lambda record: record.created_at, reverse=True)
         return records[:limit]
 
+    def list_all(self) -> list[InvoiceRecord]:
+        return self.list(limit=500)
+
     def list_by_status(
         self, statuses: list[str], limit: int = 200
     ) -> list[InvoiceRecord]:
@@ -288,10 +292,19 @@ class SharePointInvoiceStore:
         item = self._get_item(invoice_id)
         return self._item_to_record(item) if item is not None else None
 
-    def get_by_irj_number(self, irj_number: str) -> InvoiceRecord | None:
+    def get_by_irj_number(
+        self, irj_number: str, company: str | None = None
+    ) -> InvoiceRecord | None:
         key = irj_number.strip().casefold()
         for record in self.list(limit=500):
-            if (record.irj_number or "").strip().casefold() == key:
+            if (
+                (record.irj_number or "").strip().casefold() == key
+                and (
+                    company is None
+                    or (record.company or "").strip().casefold()
+                    == company.strip().casefold()
+                )
+            ):
                 return record
         return None
 
@@ -344,6 +357,17 @@ class SharePointInvoiceStore:
         if record is None:
             raise KeyError(f"Invoice {invoice_id} was not found.")
         return record
+
+    def update_fields_if_status(
+        self,
+        invoice_id: int,
+        expected_status: str,
+        **fields: object,
+    ) -> InvoiceRecord | None:
+        record = self.get(invoice_id)
+        if record is None or record.status != expected_status:
+            return None
+        return self.update_fields(invoice_id, **fields)
 
     def delete(self, invoice_id: int) -> None:
         url = f"{self._list_base_url()}/items/{invoice_id}"

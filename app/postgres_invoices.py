@@ -154,6 +154,12 @@ class PostgresInvoiceStore:
             (limit,),
         )
 
+    def list_all(self) -> list[InvoiceRecord]:
+        return self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices ORDER BY created_at DESC",
+            (),
+        )
+
     def list_by_status(self, statuses: list[str], limit: int = 200) -> list[InvoiceRecord]:
         if not statuses:
             return []
@@ -174,14 +180,25 @@ class PostgresInvoiceStore:
                 row = cursor.fetchone()
         return self._record(row) if row is not None else None
 
-    def get_by_irj_number(self, irj_number: str) -> InvoiceRecord | None:
+    def get_by_irj_number(
+        self, irj_number: str, company: str | None = None
+    ) -> InvoiceRecord | None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
-                cursor.execute(
-                    f"SELECT {_SELECT_COLUMNS} FROM invoices "
-                    "WHERE upper(btrim(irj_number)) = upper(btrim(%s)) LIMIT 1",
-                    (irj_number,),
-                )
+                if company is None:
+                    cursor.execute(
+                        f"SELECT {_SELECT_COLUMNS} FROM invoices "
+                        "WHERE upper(btrim(irj_number)) = upper(btrim(%s)) "
+                        "ORDER BY id LIMIT 1",
+                        (irj_number,),
+                    )
+                else:
+                    cursor.execute(
+                        f"SELECT {_SELECT_COLUMNS} FROM invoices "
+                        "WHERE upper(btrim(irj_number)) = upper(btrim(%s)) "
+                        "AND lower(company) = lower(%s) ORDER BY id LIMIT 1",
+                        (irj_number, company),
+                    )
                 row = cursor.fetchone()
         return self._record(row) if row is not None else None
 
@@ -251,6 +268,33 @@ class PostgresInvoiceStore:
         if row is None:
             raise KeyError(f"Invoice {invoice_id} was not found.")
         return self._record(row)
+
+    def update_fields_if_status(
+        self,
+        invoice_id: int,
+        expected_status: str,
+        **fields: object,
+    ) -> InvoiceRecord | None:
+        """Atomically update an invoice only while it remains in the expected state."""
+        unknown = set(fields) - _UPDATABLE_COLUMNS
+        if unknown:
+            raise ValueError(f"Unknown invoice fields: {', '.join(sorted(unknown))}.")
+        if not fields:
+            record = self.get(invoice_id)
+            return record if record is not None and record.status == expected_status else None
+
+        assignments = ", ".join(f"{name} = %s" for name in fields)
+        parameters = (*fields.values(), invoice_id, expected_status)
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"UPDATE invoices SET {assignments} "
+                    "WHERE id = %s AND status = %s "
+                    f"RETURNING {_SELECT_COLUMNS}",
+                    parameters,
+                )
+                row = cursor.fetchone()
+        return self._record(row) if row is not None else None
 
     def delete(self, invoice_id: int) -> None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]

@@ -53,6 +53,8 @@ def make_workbook(rows: list[list[object]]) -> io.BytesIO:
             "Bank Account",
             "Approver",
             "Approver 2",
+            "Approver Email",
+            "Approver 2 Email",
         ]
     )
     for row in rows:
@@ -108,8 +110,6 @@ def test_import_supplier_workbook_creates_master_data_and_terms(tmp_path) -> Non
     supplier_store = SupplierStore(tmp_path / "config.db")
     approval_matrix_store = ApprovalMatrixStore(tmp_path / "config.db")
     supplier_terms_store = SupplierTermsStore(tmp_path / "config.db")
-    auth_store = AuthStore(tmp_path / "auth.db")
-
     workbook = make_workbook(
         [
             [
@@ -121,6 +121,8 @@ def test_import_supplier_workbook_creates_master_data_and_terms(tmp_path) -> Non
                 "GBP Main Account",
                 "Jordan Blake (Approver 1)",
                 "Sam Ellis (Approver 2)",
+                "jordan.blake@example.test",
+                "sam.ellis@example.test",
             ],
             [
                 "Brand New Co",
@@ -141,7 +143,6 @@ def test_import_supplier_workbook_creates_master_data_and_terms(tmp_path) -> Non
         supplier_store=supplier_store,
         approval_matrix_store=approval_matrix_store,
         supplier_terms_store=supplier_terms_store,
-        auth_store=auth_store,
     )
 
     assert summary.imported_count == 1
@@ -214,6 +215,8 @@ def test_admin_import_endpoint_imports_rows_end_to_end(tmp_path) -> None:
                 "14 days net",
                 "GBP Acme Account",
                 "Jordan Blake (Approver 1)",
+                None,
+                "jordan.blake@example.test",
                 None,
             ]
         ]
@@ -391,7 +394,6 @@ def test_selected_company_overrides_company_column_for_every_row(tmp_path) -> No
         supplier_store=supplier_store,
         approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
         supplier_terms_store=terms_store,
-        auth_store=AuthStore(tmp_path / "auth.db"),
         default_company="Acme Trading Ltd",
     )
 
@@ -409,8 +411,6 @@ def test_imports_attached_workbook_shape_for_selected_company(tmp_path) -> None:
     supplier_store = SupplierStore(tmp_path / "config.db")
     approval_matrix_store = ApprovalMatrixStore(tmp_path / "config.db")
     supplier_terms_store = SupplierTermsStore(tmp_path / "config.db")
-    auth_store = AuthStore(tmp_path / "auth.db")
-
     workbook = Workbook()
     sheet = workbook.active
     sheet.append(
@@ -447,7 +447,6 @@ def test_imports_attached_workbook_shape_for_selected_company(tmp_path) -> None:
         supplier_store=supplier_store,
         approval_matrix_store=approval_matrix_store,
         supplier_terms_store=supplier_terms_store,
-        auth_store=auth_store,
     )
 
     assert summary.warning_count == 1
@@ -507,7 +506,6 @@ def test_selected_company_updates_existing_supplier_and_imports_named_approvers(
         supplier_store=supplier_store,
         approval_matrix_store=approval_matrix_store,
         supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
-        auth_store=AuthStore(tmp_path / "auth.db"),
         default_company="GIFTED",
     )
 
@@ -537,7 +535,6 @@ def test_selected_company_updates_existing_supplier_and_imports_named_approvers(
         supplier_store=supplier_store,
         approval_matrix_store=approval_matrix_store,
         supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
-        auth_store=AuthStore(tmp_path / "auth.db"),
         default_company="GIFTED",
     )
     preserved = approval_matrix_store.find_exact("GIFTED", "123RF GB Ltd")
@@ -579,7 +576,6 @@ def test_company_specific_import_does_not_overwrite_global_route(tmp_path) -> No
         supplier_store=supplier_store,
         approval_matrix_store=approval_matrix_store,
         supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
-        auth_store=AuthStore(tmp_path / "auth.db"),
         default_company="Acme Trading Ltd",
     )
 
@@ -630,7 +626,6 @@ def test_workbook_without_company_imports_global_supplier_profile(tmp_path) -> N
         supplier_store=supplier_store,
         approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
         supplier_terms_store=terms_store,
-        auth_store=AuthStore(tmp_path / "auth.db"),
     )
 
     assert summary.warning_count == 1

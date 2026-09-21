@@ -258,6 +258,66 @@ def test_move_resolves_existing_folders_without_unsupported_graph_filter() -> No
     assert requested_paths[-1] == "/v1.0/drives/drive/items/pdf-1"
 
 
+def test_repeated_moves_reuse_resolved_sharepoint_folder_ids() -> None:
+    requested_paths: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
+        children = {
+            "/v1.0/drives/drive/root/children": {
+                "value": [{"id": "invoices", "name": "Invoices", "folder": {}}]
+            },
+            "/v1.0/drives/drive/items/invoices/children": {
+                "value": [{"id": "gifted", "name": "GIFTED", "folder": {}}]
+            },
+            "/v1.0/drives/drive/items/gifted/children": {
+                "value": [
+                    {
+                        "id": "nominal",
+                        "name": "Nominal Invoices",
+                        "folder": {},
+                    }
+                ]
+            },
+        }
+        return httpx.Response(200, json=children[request.url.path])
+
+    client = _client(httpx.MockTransport(respond))
+    client.move_to_folder(
+        "pdf-1",
+        "Invoices/GIFTED/Nominal Invoices",
+        "000001-first.pdf",
+    )
+    first_move_request_count = len(requested_paths)
+    client.move_to_folder(
+        "pdf-2",
+        "Invoices/GIFTED/Nominal Invoices",
+        "000002-second.pdf",
+    )
+
+    assert first_move_request_count == 4
+    assert requested_paths[first_move_request_count:] == [
+        "/v1.0/drives/drive/items/pdf-2"
+    ]
+
+
+def test_statement_library_inventory_is_cached() -> None:
+    request_count = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={"value": []})
+
+    client = _client(httpx.MockTransport(respond))
+
+    assert client.list_statement_library() == {}
+    assert client.list_statement_library() == {}
+    assert request_count == 1
+
+
 def test_lists_and_downloads_incoming_pdfs_with_bearer_token() -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer token"
@@ -562,6 +622,32 @@ def test_admin_can_load_sharepoint_folder_options(tmp_path) -> None:
     )
     assert invalid_company.status_code == 400
     assert "complete company folder structure" in invalid_company.json()["detail"]
+
+
+def test_company_list_imports_complete_sharepoint_companies(tmp_path) -> None:
+    app = create_app(
+        invoice_store=InvoiceStore(tmp_path / "invoices.db"),
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        companies_store=CompanyStore(tmp_path / "config.db"),
+        suppliers_store=SupplierStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+        activity_feed=ActivityFeedStore(tmp_path / "activity.db"),
+        notification_store=OutlookNotificationStore(tmp_path / "notifications.db"),
+        sharepoint_client=cast(SharePointClient, FakeSharePointClient()),
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    ).status_code == 200
+
+    first = client.get("/api/companies")
+    second = client.get("/api/companies")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert [company["name"] for company in first.json()].count("Acme") == 1
+    assert [company["name"] for company in second.json()].count("Acme") == 1
 
 
 def test_incomplete_company_folder_is_not_offered() -> None:
