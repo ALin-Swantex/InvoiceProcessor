@@ -9,6 +9,7 @@ from app.email_notifications import (
     EmailNotificationError,
     EmailNotificationSettings,
     GraphEmailNotifier,
+    send_email_notification,
 )
 from app.outlook_graph import OutlookSettings
 
@@ -93,3 +94,15 @@ def test_graph_email_notification_surfaces_delivery_failure(
             subject="Test",
             body="Test",
         )
+
+
+def test_disabled_email_notification_reports_not_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMAIL_NOTIFICATIONS_ENABLED", "false")
+
+    assert send_email_notification(
+        recipient="approver@example.test",
+        subject="Test",
+        body="Test",
+    ) is False

@@ -624,6 +624,32 @@ def test_admin_can_load_sharepoint_folder_options(tmp_path) -> None:
     assert "complete company folder structure" in invalid_company.json()["detail"]
 
 
+def test_company_list_imports_complete_sharepoint_companies(tmp_path) -> None:
+    app = create_app(
+        invoice_store=InvoiceStore(tmp_path / "invoices.db"),
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        companies_store=CompanyStore(tmp_path / "config.db"),
+        suppliers_store=SupplierStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+        activity_feed=ActivityFeedStore(tmp_path / "activity.db"),
+        notification_store=OutlookNotificationStore(tmp_path / "notifications.db"),
+        sharepoint_client=cast(SharePointClient, FakeSharePointClient()),
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    ).status_code == 200
+
+    first = client.get("/api/companies")
+    second = client.get("/api/companies")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert [company["name"] for company in first.json()].count("Acme") == 1
+    assert [company["name"] for company in second.json()].count("Acme") == 1
+
+
 def test_incomplete_company_folder_is_not_offered() -> None:
     folders = [
         "Invoices",

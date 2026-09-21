@@ -188,9 +188,13 @@ Purchase Ledger should be able to record a note against the invoice explaining t
 
 Where necessary, the query can then be referred to the relevant person in Purchasing for investigation.
 
-The invoice should remain in an appropriate outstanding/query status until the issue has been resolved.
+The invoice should remain at its current workflow stage and in its current
+SharePoint folder while the query is unresolved. The query is recorded as
+metadata against the invoice and must not itself cause a move.
 
-Once the query has been resolved and Purchase Ledger is satisfied that the invoice can be processed, they should be able to mark it as Matched / Approved, which will move it into the Approved folder.
+Once the query has been resolved and Purchase Ledger is satisfied that the
+invoice can be processed, an explicit Matched / Approved or Rejected decision
+may advance the workflow and move the PDF.
 
 A record of the query and any relevant notes should remain against the invoice for future reference.
 

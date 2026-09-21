@@ -10,6 +10,7 @@ from app.postgres_config import (
     PostgresCompanyStore,
     PostgresProcessConfigurationStore,
     PostgresSupplierStore,
+    PostgresSupplierTermsStore,
 )
 from app.postgres_config_migrate import migrate_sqlite_configuration
 from app.config_db import configuration_backend
@@ -27,6 +28,9 @@ class RecordingCursor:
         return None
 
     def execute(self, sql: str, parameters: object | None = None) -> None:
+        self.calls.append((sql, parameters))
+
+    def executemany(self, sql: str, parameters: object) -> None:
         self.calls.append((sql, parameters))
 
     def fetchone(self):
@@ -153,6 +157,53 @@ def test_postgres_process_configuration_uses_parameterized_upsert() -> None:
     sql, parameters = connection.recording_cursor.calls[0]
     assert "ON CONFLICT (key) DO UPDATE" in sql
     assert parameters == ("ai_confidence_threshold", "0.75")
+
+
+def test_supplier_terms_null_account_parameter_has_explicit_type() -> None:
+    connection = RecordingConnection()
+    store = PostgresSupplierTermsStore(connection_factory=lambda: connection)
+
+    with pytest.raises(RuntimeError, match="did not return supplier terms ID"):
+        store.upsert(
+            company="GIFTED",
+            supplier="Supplier Ltd",
+            supplier_account_number=None,
+        )
+
+    sql, parameters = connection.recording_cursor.calls[0]
+    assert "%s::text IS NULL" in sql
+    assert parameters == ("GIFTED", None, None, "Supplier Ltd")
+
+
+def test_postgres_bulk_import_uses_set_based_upserts_in_one_connection() -> None:
+    connection = RecordingConnection()
+    store = PostgresSupplierStore(connection_factory=lambda: connection)
+
+    store.bulk_import_master_data(
+        suppliers=[("Supplier One", "GIFTED"), ("Supplier Two", "GIFTED")],
+        approvals=[
+            (
+                "GIFTED",
+                "Supplier One",
+                "Approver",
+                "approver@example.test",
+                None,
+                None,
+            )
+        ],
+        terms=[
+            ("GIFTED", "Supplier One", "A001", "BACS", "30 days", "Main"),
+            ("GIFTED", "Supplier Two", None, None, None, None),
+        ],
+    )
+
+    assert len(connection.recording_cursor.calls) == 4
+    sql = "\n".join(call[0] for call in connection.recording_cursor.calls)
+    assert "ON CONFLICT (lower(name)) DO UPDATE" in sql
+    assert "ON CONFLICT (lower(company), lower(supplier)) DO UPDATE" in sql
+    assert "ON CONFLICT (company, supplier_account_number) DO UPDATE" in sql
+    assert "WHERE supplier_account_number IS NULL" in sql
+    assert sql.count("jsonb_to_recordset") == 4
 
 
 @pytest.mark.parametrize(

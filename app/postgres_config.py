@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Iterable
 
 from app.approval_matrix import (
@@ -188,19 +189,21 @@ class PostgresSupplierStore(_PostgresStore):
                 invoice_number_pattern
             ),
         )
+        company_id = self._company_id(profile.default_company)
         try:
             with self._connection_factory() as connection:  # type: ignore[attr-defined]
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
                         INSERT INTO suppliers (
-                            name, aliases, default_company, contact_email,
-                            invoice_number_pattern
-                        ) VALUES (%s, %s, %s, %s, %s)
+                            name, aliases, default_company_id, default_company,
+                            contact_email, invoice_number_pattern
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
                         """,
                         (
                             profile.name,
                             ",".join(profile.aliases),
+                            company_id,
                             profile.default_company,
                             profile.contact_email,
                             profile.invoice_number_pattern,
@@ -237,6 +240,12 @@ class PostgresSupplierStore(_PostgresStore):
                 if isinstance(fields["invoice_number_pattern"], str)
                 else None
             )
+        if "default_company" in fields:
+            fields["default_company_id"] = self._company_id(
+                fields["default_company"]
+                if isinstance(fields["default_company"], str)
+                else None
+            )
         if not fields:
             return existing
         assignments = ", ".join(f"{key} = %s" for key in fields)
@@ -257,6 +266,24 @@ class PostgresSupplierStore(_PostgresStore):
             raise RuntimeError(f"Supplier '{name}' disappeared after it was updated.")
         return updated
 
+    def _company_id(self, company: str | None) -> int | None:
+        if not company:
+            return None
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id FROM companies
+                    WHERE lower(name) = lower(%s) AND active
+                    LIMIT 1
+                    """,
+                    (company,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Company '{company}' was not found.")
+        return int(row["id"])
+
     def delete(self, name: str) -> None:
         existing = self.get(name)
         if existing is None:
@@ -269,6 +296,161 @@ class PostgresSupplierStore(_PostgresStore):
                 )
                 if cursor.rowcount == 0:
                     raise KeyError(f"Supplier '{name}' was not found.")
+
+    def bulk_import_master_data(
+        self,
+        *,
+        suppliers: list[tuple[str, str]],
+        approvals: list[
+            tuple[str, str, str, str, str | None, str | None]
+        ],
+        terms: list[
+            tuple[
+                str,
+                str,
+                str | None,
+                str | None,
+                str | None,
+                str | None,
+            ]
+        ],
+    ) -> None:
+        """Persist a parsed workbook in one transaction using pipelined batches."""
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO suppliers (
+                        name, default_company_id, default_company
+                    )
+                    SELECT item.name, company.id, item.company
+                    FROM jsonb_to_recordset(%s::jsonb)
+                        AS item(name text, company text)
+                    JOIN companies AS company
+                      ON lower(company.name) = lower(item.company)
+                     AND company.active
+                    ON CONFLICT (lower(name)) DO UPDATE
+                    SET default_company_id = excluded.default_company_id,
+                        default_company = excluded.default_company,
+                        updated_at = now()
+                    """,
+                    (json.dumps([
+                        {"name": supplier, "company": company}
+                        for supplier, company in suppliers
+                    ]),),
+                )
+                if approvals:
+                    cursor.execute(
+                        """
+                        INSERT INTO approval_matrix (
+                            company, supplier, approver1_name, approver1_email,
+                            approver2_name, approver2_email
+                        )
+                        SELECT company, supplier, approver1_name, approver1_email,
+                               approver2_name, approver2_email
+                        FROM jsonb_to_recordset(%s::jsonb) AS item(
+                            company text,
+                            supplier text,
+                            approver1_name text,
+                            approver1_email text,
+                            approver2_name text,
+                            approver2_email text
+                        )
+                        ON CONFLICT (lower(company), lower(supplier)) DO UPDATE
+                        SET approver1_name = excluded.approver1_name,
+                            approver1_email = excluded.approver1_email,
+                            approver2_name = excluded.approver2_name,
+                            approver2_email = excluded.approver2_email
+                        """,
+                        (json.dumps([
+                            {
+                                "company": row[0],
+                                "supplier": row[1],
+                                "approver1_name": row[2],
+                                "approver1_email": row[3],
+                                "approver2_name": row[4],
+                                "approver2_email": row[5],
+                            }
+                            for row in approvals
+                        ]),),
+                    )
+                account_terms = [row for row in terms if row[2] is not None]
+                if account_terms:
+                    cursor.execute(
+                        """
+                        INSERT INTO supplier_terms (
+                            company, supplier, supplier_account_number,
+                            default_payment_method, payment_terms_notice,
+                            bank_account
+                        )
+                        SELECT company, supplier, supplier_account_number,
+                               default_payment_method, payment_terms_notice,
+                               bank_account
+                        FROM jsonb_to_recordset(%s::jsonb) AS item(
+                            company text,
+                            supplier text,
+                            supplier_account_number text,
+                            default_payment_method text,
+                            payment_terms_notice text,
+                            bank_account text
+                        )
+                        ON CONFLICT (company, supplier_account_number) DO UPDATE
+                        SET supplier = excluded.supplier,
+                            default_payment_method = excluded.default_payment_method,
+                            payment_terms_notice = excluded.payment_terms_notice,
+                            bank_account = excluded.bank_account
+                        """,
+                        (json.dumps([
+                            {
+                                "company": row[0],
+                                "supplier": row[1],
+                                "supplier_account_number": row[2],
+                                "default_payment_method": row[3],
+                                "payment_terms_notice": row[4],
+                                "bank_account": row[5],
+                            }
+                            for row in account_terms
+                        ]),),
+                    )
+                default_terms = [row for row in terms if row[2] is None]
+                if default_terms:
+                    cursor.execute(
+                        """
+                        INSERT INTO supplier_terms (
+                            company, supplier, supplier_account_number,
+                            default_payment_method, payment_terms_notice,
+                            bank_account
+                        )
+                        SELECT company, supplier, supplier_account_number,
+                               default_payment_method, payment_terms_notice,
+                               bank_account
+                        FROM jsonb_to_recordset(%s::jsonb) AS item(
+                            company text,
+                            supplier text,
+                            supplier_account_number text,
+                            default_payment_method text,
+                            payment_terms_notice text,
+                            bank_account text
+                        )
+                        ON CONFLICT (company, supplier)
+                            WHERE supplier_account_number IS NULL
+                        DO UPDATE SET
+                            default_payment_method = excluded.default_payment_method,
+                            payment_terms_notice = excluded.payment_terms_notice,
+                            bank_account = excluded.bank_account
+                        """,
+                        (json.dumps([
+                            {
+                                "company": row[0],
+                                "supplier": row[1],
+                                "supplier_account_number": row[2],
+                                "default_payment_method": row[3],
+                                "payment_terms_notice": row[4],
+                                "bank_account": row[5],
+                            }
+                            for row in default_terms
+                        ]),),
+                    )
 
     def _ensure_identifiers_available(
         self,
@@ -488,7 +670,7 @@ class PostgresSupplierTermsStore(_PostgresStore):
                     SELECT id FROM supplier_terms
                     WHERE lower(company) = lower(%s) AND (
                         supplier_account_number = %s
-                        OR (supplier_account_number IS NULL AND %s IS NULL
+                        OR (supplier_account_number IS NULL AND %s::text IS NULL
                             AND lower(supplier) = lower(%s))
                     )
                     """,

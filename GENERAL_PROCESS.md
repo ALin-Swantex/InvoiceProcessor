@@ -270,9 +270,14 @@ Purchase Ledger records:
 - Purchasing contact
 - Date raised
 
-Set status to `PO Query / Matching Issue`.
+Keep the status as `Awaiting PO Matching` and record the query against that
+stage.
 
-Notify the relevant Purchasing contact where required. The invoice remains in the PO matching area and stays outstanding until Purchase Ledger records that the query has been resolved. It must not be registered in Sage or moved to Approved until the match is confirmed. The original query and resolution notes must remain in the history.
+Notify the relevant Purchasing contact where required. Recording the query
+must not move the PDF or move the invoice to another workflow stage. It
+remains in the PO matching area and stays outstanding until Purchase Ledger
+explicitly marks it matched or rejected. The original query and resolution
+notes must remain in the history.
 
 ## Sage Registration for Nominal Invoices
 
@@ -337,7 +342,10 @@ Require a rejection reason, record the decision, and set status to `Rejected`. T
 
 #### Query or delay
 
-Where the approval mechanism supports it, record the reason and set status to `Approval Query / On Hold`. Define how the invoice returns to active approval after the issue is resolved.
+Where the approval mechanism supports it, record the reason against the
+current `Awaiting Approval 1` or `Awaiting Approval 2` stage. Recording or
+resolving a query must not move the PDF or change its approval stage. Only an
+explicit approval or rejection advances or removes it from that stage.
 
 ### 14. Run Approval 2
 
@@ -395,10 +403,8 @@ The system writes a history entry and sets status to `Reconciled / Complete`.
 | Needs Review | Automation cannot safely continue | Purchase Ledger / Administrator |
 | Awaiting Sage Registration | Valid nominal invoice is ready to be registered in Sage | Purchase Ledger |
 | Awaiting PO Matching | PO invoice needs manual matching | Purchase Ledger |
-| PO Query / Matching Issue | PO discrepancy is under investigation | Purchase Ledger / Purchasing |
 | Awaiting Approval 1 | First nominal approval is outstanding | Approver 1 |
 | Awaiting Approval 2 | Second nominal approval is outstanding | Approver 2 |
-| Approval Query / On Hold | Approver has identified an unresolved issue | Approver / Purchase Ledger |
 | Rejected | Approval was rejected and processing has stopped | Purchase Ledger |
 | Approved | Matching or required approvals are complete | Purchase Ledger |
 | Paid / Awaiting Bank Reconciliation | Payment has been recorded | Purchase Ledger |
@@ -449,6 +455,15 @@ Create an Invoice History entry for at least:
 - Payment recorded
 - Reconciliation recorded
 - Flow failure and restart
+
+The web application exposes this history when an invoice is found by IRJ
+number. The search result shows the invoice's current status and its
+invoice-specific, timestamped event history in chronological order.
+
+Stage email delivery is idempotent. A persistent `(invoice, stage)` claim is
+created before sending the PO matching, Approver 1, Approver 2, or approved-for-
+payment email. Returning from a query/hold, retrying an action, or revisiting a
+stage must not send that stage's email again.
 
 Each entry should include:
 

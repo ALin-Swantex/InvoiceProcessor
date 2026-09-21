@@ -14,6 +14,7 @@ from app.postgres_settings import AAD_SCOPE, PostgresSettings
 
 class Token:
     token = "entra-token"
+    expires_on = 9999999999
 
 
 class Credential:
@@ -106,6 +107,68 @@ def test_password_connection_factory_uses_checked_shared_pool(
     assert created[0]["check"] is FakePool.check_connection
     assert created[0]["max_idle"] == 300.0
     postgres_settings._postgres_pool.cache_clear()
+
+
+def test_entra_connection_factory_uses_token_aware_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[dict[str, object]] = []
+
+    class FakeConnection:
+        @classmethod
+        def connect(cls, conninfo: str = "", **kwargs: object) -> object:
+            return (conninfo, kwargs)
+
+    class FakePool:
+        @staticmethod
+        def check_connection(connection: object) -> None:
+            del connection
+
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+        def connection(self) -> object:
+            return object()
+
+    class FakePoolModule:
+        ConnectionPool = FakePool
+
+    class FakePsycopg:
+        Connection = FakeConnection
+
+    class FakeRows:
+        dict_row = object()
+
+    credential = Credential()
+    monkeypatch.setattr(
+        postgres_settings,
+        "_default_credential",
+        lambda *args: credential,
+    )
+    real_import_module = postgres_settings.importlib.import_module
+
+    def import_module(name: str) -> object:
+        if name == "psycopg_pool":
+            return FakePoolModule
+        if name == "psycopg":
+            return FakePsycopg
+        if name == "psycopg.rows":
+            return FakeRows
+        return real_import_module(name)
+
+    monkeypatch.setattr(postgres_settings.importlib, "import_module", import_module)
+    postgres_settings._entra_postgres_pool.cache_clear()
+    settings = PostgresSettings("db.example", "invoices", "Invoice MCP")
+
+    first = postgres_settings.postgres_connection_factory(settings)
+    second = postgres_settings.postgres_connection_factory(settings)
+
+    assert len(created) == 1
+    assert first.__self__ is second.__self__
+    assert created[0]["connection_class"].__name__ == "EntraConnection"
+    assert created[0]["max_lifetime"] == 2700
+    assert "password" not in created[0]["kwargs"]
+    postgres_settings._entra_postgres_pool.cache_clear()
 
 
 def test_optional_dependencies_are_not_imported_by_module_import() -> None:
@@ -261,10 +324,20 @@ def test_authoritative_schema_contains_current_and_company_scoped_tables() -> No
 
     assert "CREATE TABLE invoices" in schema
     assert "ai_field_confidences text" in schema
-    assert "CREATE TABLE company_user_access" in schema
     assert "CREATE TABLE approval_matrix" in schema
     assert "CREATE TABLE supplier_terms" in schema
     assert "ENABLE ROW LEVEL SECURITY" not in schema
+
+    user_removal = (
+        Path(__file__).parents[1]
+        / "app"
+        / "postgres_migrations"
+        / "010_remove_users_add_email_stages.sql"
+    ).read_text()
+    assert "DROP TABLE IF EXISTS company_user_access" in user_removal
+    assert "DROP TABLE IF EXISTS user_sessions" in user_removal
+    assert "DROP TABLE IF EXISTS users" in user_removal
+    assert "CREATE TABLE invoice_email_stages" in user_removal
 
 
 def test_company_irj_migration_allows_same_irj_across_companies() -> None:
@@ -291,6 +364,19 @@ def test_company_irj_seed_migration_continues_existing_sequences() -> None:
     assert "max(irj_number::bigint) + 1" in migration
     assert "greatest(sequence.next_number, maxima.next_number)" in migration
     assert "WHERE NOT EXISTS" in migration
+
+
+def test_supplier_company_link_migration_backfills_foreign_keys() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "app"
+        / "postgres_migrations"
+        / "009_link_suppliers_to_companies.sql"
+    ).read_text()
+
+    assert "SET default_company_id = company.id" in migration
+    assert "lower(company.name) = lower(supplier.default_company)" in migration
+    assert "idx_suppliers_default_company_id" in migration
 
 
 def test_document_classification_migration_adds_statement_fields() -> None:

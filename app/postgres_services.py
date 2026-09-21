@@ -195,6 +195,56 @@ class PostgresActivityFeedStore:
                 rows = cursor.fetchall()
         return [_activity_event(row) for row in rows]
 
+    def list_for_invoice(
+        self, invoice_id: int, limit: int = 200
+    ) -> list[ActivityEvent]:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, event_type, target_role, message,
+                           invoice_id, created_at
+                    FROM (
+                        SELECT id, event_type, target_role, message,
+                               invoice_id, created_at
+                        FROM activity_events
+                        WHERE invoice_id = %s
+                        ORDER BY id DESC
+                        LIMIT %s
+                    ) AS latest_events
+                    ORDER BY id ASC
+                    """,
+                    (invoice_id, limit),
+                )
+                rows = cursor.fetchall()
+        return [_activity_event(row) for row in rows]
+
+    def claim_email_stage(self, invoice_id: int, stage: str) -> bool:
+        """Atomically reserve one email delivery attempt for an invoice stage."""
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO invoice_email_stages (invoice_id, stage)
+                    VALUES (%s, %s)
+                    ON CONFLICT (invoice_id, stage) DO NOTHING
+                    RETURNING invoice_id
+                    """,
+                    (invoice_id, stage),
+                )
+                return cursor.fetchone() is not None
+
+    def release_email_stage(self, invoice_id: int, stage: str) -> None:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM invoice_email_stages
+                    WHERE invoice_id = %s AND stage = %s
+                    """,
+                    (invoice_id, stage),
+                )
+
     def latest_id(self) -> int:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:

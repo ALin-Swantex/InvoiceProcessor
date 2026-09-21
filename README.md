@@ -168,9 +168,10 @@ Assigning roles to Entra security groups requires Microsoft Entra ID licensing
 that supports group-based application assignment. Direct user assignment works
 without that group-assignment capability.
 
-Local username/password login remains available for development when Entra is
-not configured. It is automatically disabled when Entra is configured unless
-`AUTH_LOCAL_LOGIN_ENABLED=true` is explicitly set.
+Local username/password login remains available only as an opt-in development
+and automated-test aid. Its fixed test identities are held in application
+memory and are never stored in a users table. Production identity, role
+assignment, and access management are owned exclusively by Microsoft Entra.
 
 ## Run tests
 
@@ -222,20 +223,20 @@ schema migrations with a DBA/deployment identity using
 `app/postgres_runtime_grants.sql.template` to grant the mapped Invoice MCP role
 the required DML permissions. SQLite remains the default for offline testing.
 
-Users and sessions remain in the existing authentication store until Entra web
-sign-in is activated. Row-level security is therefore intentionally not enabled
-yet.
+The application does not maintain a users table. Microsoft Entra owns users and
+app-role assignments; the local authentication store contains only short-lived
+session claims and OAuth flow state. PostgreSQL migration 010 removes the
+obsolete users, user-session, and company-user-access tables.
 
-Password-authenticated PostgreSQL deployments use a shared connection pool
+PostgreSQL deployments use a shared connection pool
 instead of opening a new TLS connection for every store operation. The defaults
 are one warm connection and a maximum of ten connections; override
 `POSTGRES_POOL_MIN_SIZE`, `POSTGRES_POOL_MAX_SIZE`, and
 `POSTGRES_POOL_TIMEOUT_SECONDS` only to match the hosting plan's connection
 limits. Idle connections are retired after
 `POSTGRES_POOL_MAX_IDLE_SECONDS` (five minutes by default), and connections
-are checked before reuse. Entra-token database authentication continues to
-create connections on demand so an expired access token is never retained by
-a long-lived pool.
+are checked before reuse. Entra-authenticated pools request a fresh token for
+every new physical connection and rotate connections before token expiry.
 
 ### Local PostgreSQL testing
 
@@ -273,8 +274,8 @@ python -m app.outlook_worker
 The import is transactional and idempotent, so it can be rerun safely before
 retiring the SQLite configuration file. Set `CONFIG_STORE_BACKEND=sqlite` to
 retain SQLite configuration while using PostgreSQL invoices; otherwise the
-configuration backend follows `INVOICE_STORE_BACKEND`. Users continue to use
-the authentication store during this phase.
+configuration backend follows `INVOICE_STORE_BACKEND`. Sign-in continues to use
+Microsoft Entra during this phase.
 
 ## Direct Microsoft Graph access
 

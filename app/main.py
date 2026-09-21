@@ -269,21 +269,6 @@ class IrjConfigurationUpdateRequest(BaseModel):
     current_irj: str | None = None
 
 
-class UserCreateRequest(BaseModel):
-    username: str
-    display_name: str
-    email: str | None = None
-    role: str
-    password: str
-
-
-class UserUpdateRequest(BaseModel):
-    display_name: str | None = None
-    email: str | None = None
-    role: str | None = None
-    password: str | None = None
-
-
 def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore:
     """Choose the invoice metadata store backend.
 
@@ -397,12 +382,9 @@ def create_app(
         if entra_auth_client is not None
         else entra_auth_client_from_environment()
     )
-    local_login_setting = os.environ.get("AUTH_LOCAL_LOGIN_ENABLED", "").strip()
-    app.state.local_login_enabled = (
-        local_login_setting.casefold() in {"1", "true", "yes", "on"}
-        if local_login_setting
-        else app.state.entra_auth_client is None
-    )
+    app.state.local_login_enabled = os.environ.get(
+        "AUTH_LOCAL_LOGIN_ENABLED", "false"
+    ).strip().casefold() in {"1", "true", "yes", "on"}
     config_store_backend = configuration_backend(invoice_store_backend)
     use_postgres_config = (
         invoice_store is None
@@ -451,6 +433,7 @@ def create_app(
     app.state.sharepoint_attach_attempted = (
         app.state.sharepoint_client is not None or not auto_configure_sharepoint
     )
+    app.state.sharepoint_company_sync_complete = False
 
     def _sharepoint_startup_status() -> str:
         # The previous message only reported whether a client had been injected
@@ -508,6 +491,54 @@ def create_app(
                     error,
                 )
         return current
+
+    def _sync_sharepoint_companies() -> list[CompanyProfile]:
+        """Import complete SharePoint company folders into the company store."""
+        if app.state.sharepoint_company_sync_complete:
+            return []
+        client = _lifecycle().sharepoint_client
+        if client is None:
+            return []
+        try:
+            structures = discover_company_folder_structures(
+                client.list_folder_paths()
+            )
+        except SharePointError as error:
+            logger.warning("SharePoint company synchronization failed: %s", error)
+            return []
+
+        existing = app.state.companies_store.list()
+        existing_names = {profile.name.strip().casefold() for profile in existing}
+        existing_roots = {
+            profile.sharepoint_root_folder.strip().casefold()
+            for profile in existing
+        }
+        created: list[CompanyProfile] = []
+        for structure in structures:
+            name = structure.root.rsplit("/", 1)[-1]
+            if (
+                name.casefold() in existing_names
+                or structure.root.casefold() in existing_roots
+            ):
+                continue
+            try:
+                profile = app.state.companies_store.create(
+                    name=name,
+                    sharepoint_root_folder=structure.root,
+                )
+            except ValueError:
+                # Another worker may have inserted the same company.
+                continue
+            created.append(profile)
+            existing_names.add(profile.name.casefold())
+            existing_roots.add(profile.sharepoint_root_folder.casefold())
+        app.state.sharepoint_company_sync_complete = True
+        if created:
+            logger.info(
+                "Imported %d company folder(s) from SharePoint into configuration.",
+                len(created),
+            )
+        return created
 
     @app.get("/", response_class=HTMLResponse)
     def prototype_home() -> str:
@@ -744,8 +775,30 @@ def create_app(
               background: #fff8e7; color: #7c4a03; font-size: .78rem;
               line-height: 1.45; white-space: pre-wrap;
             }
+            .analysis-history {
+              display: grid; gap: .55rem; margin-top: .4rem; padding: .75rem;
+              border: 1px solid #d9e2ec; border-radius: 8px; background: #f8fafc;
+            }
+            .analysis-history-item {
+              padding-bottom: .55rem; border-bottom: 1px solid #e4e7eb;
+              color: #334e68; font-size: .78rem; line-height: 1.45;
+              white-space: pre-wrap; overflow-wrap: anywhere;
+            }
+            .analysis-history-item:last-child { padding-bottom: 0; border-bottom: 0; }
+            .analysis-history-item strong { display: block; color: #102a43; }
+            .supplier-match-prompt { grid-column: 1 / -1; margin: 0; }
+            .supplier-match-actions {
+              display: flex; align-items: center; gap: .55rem; flex-wrap: wrap;
+              margin-top: .55rem;
+            }
             table.section-table th { color: #52606d; font-size: .72rem; text-transform: uppercase; }
             table.section-table tr:last-child td { border-bottom: 0; }
+            .invoice-description-cell { min-width: 180px; max-width: 280px; }
+            .mini-description {
+              min-height: 34px; padding: .48rem .58rem; border: 1px solid #d9e2ec;
+              border-radius: 7px; background: #f8fafc; color: #334e68;
+              line-height: 1.35; white-space: pre-wrap; overflow-wrap: anywhere;
+            }
             .row-actions {
               display: grid; gap: .45rem; min-width: 190px;
             }
@@ -835,17 +888,77 @@ def create_app(
               .grid, .grid.three { grid-template-columns: 1fr; }
             }
             #login-screen {
-              position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center;
-              background: #0b1f33;
+              position: fixed; inset: 0; z-index: 2000; display: grid;
+              place-items: center; padding: 1.25rem;
+              background:
+                radial-gradient(circle at 18% 15%, rgba(47, 128, 237, .24), transparent 34%),
+                radial-gradient(circle at 82% 85%, rgba(52, 211, 153, .12), transparent 30%),
+                linear-gradient(145deg, #071727 0%, #102a43 55%, #173f68 100%);
             }
             #login-screen.hidden { display: none; }
             .login-card {
-              width: min(360px, 90vw); background: white; border-radius: 12px;
-              padding: 1.6rem; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+              position: relative; width: min(430px, 94vw); overflow: hidden;
+              background: rgba(255, 255, 255, .98); border: 1px solid rgba(255,255,255,.7);
+              border-radius: 18px; padding: 2.25rem;
+              box-shadow: 0 28px 80px rgba(0,0,0,.38);
             }
-            .login-card h1 { font-size: 1.1rem; margin: 0 0 .3rem; }
-            .login-card p { margin: 0 0 1rem; color: #52606d; font-size: .82rem; }
+            .login-card::before {
+              content: ""; position: absolute; inset: 0 0 auto; height: 5px;
+              background: linear-gradient(90deg, #2f80ed, #56ccf2);
+            }
+            .login-brand {
+              display: flex; align-items: center; gap: .8rem; margin-bottom: 1.8rem;
+            }
+            .login-brand-mark {
+              display: grid; place-items: center; width: 46px; height: 46px;
+              border-radius: 12px; background: #102a43; color: white;
+              font-size: 1.25rem; font-weight: 800; box-shadow: 0 8px 18px rgba(16,42,67,.2);
+            }
+            .login-brand strong { display: block; color: #102a43; font-size: 1.05rem; }
+            .login-brand span {
+              display: block; margin-top: .12rem; color: #829ab1;
+              font-size: .72rem; font-weight: 700; letter-spacing: .08em;
+              text-transform: uppercase;
+            }
+            .login-card h1 {
+              margin: 0 0 .5rem; color: #102a43; font-size: 1.65rem;
+              letter-spacing: -.025em;
+            }
+            .login-card p { margin: 0 0 1.35rem; color: #52606d; font-size: .88rem; line-height: 1.55; }
             .login-card label { margin-bottom: .7rem; }
+            .microsoft-login {
+              display: flex; align-items: center; justify-content: center; gap: .75rem;
+              width: 100%; min-height: 48px; padding: .75rem 1rem;
+              border: 1px solid #185abd; border-radius: 9px; background: #2f80ed;
+              color: white; text-decoration: none; font-weight: 750;
+              box-shadow: 0 7px 16px rgba(47,128,237,.22);
+              transition: transform .08s ease, box-shadow .12s ease, background-color .12s ease;
+            }
+            .microsoft-login:hover {
+              transform: translateY(-1px); background: #1f6fc9;
+              box-shadow: 0 9px 20px rgba(47,128,237,.3);
+            }
+            .microsoft-mark {
+              display: grid; grid-template-columns: repeat(2, 8px);
+              grid-template-rows: repeat(2, 8px); gap: 2px;
+            }
+            .microsoft-mark span:nth-child(1) { background: #f35325; }
+            .microsoft-mark span:nth-child(2) { background: #81bc06; }
+            .microsoft-mark span:nth-child(3) { background: #05a6f0; }
+            .microsoft-mark span:nth-child(4) { background: #ffba08; }
+            .login-security {
+              display: flex; align-items: center; justify-content: center; gap: .35rem;
+              margin: 1rem 0 0; color: #829ab1; font-size: .72rem;
+            }
+            .login-security::before { content: "●"; color: #22a06b; font-size: .65rem; }
+            .login-divider {
+              display: flex; align-items: center; gap: .7rem; margin: 1.2rem 0;
+              color: #9fb3c8; font-size: .72rem; text-transform: uppercase;
+              letter-spacing: .06em;
+            }
+            .login-divider::before, .login-divider::after {
+              content: ""; height: 1px; flex: 1; background: #d9e2ec;
+            }
             #login-error { color: #c53030; font-size: .8rem; min-height: 1.1em; margin-bottom: .5rem; }
             #app-root.hidden { display: none; }
             .user-chip {
@@ -1017,16 +1130,32 @@ def create_app(
 
           <div id="login-screen">
             <form class="login-card" id="login-form">
-              <h1>Swantex</h1>
-              <p>Sign in with your staff account to continue.</p>
+              <div class="login-brand">
+                <div class="login-brand-mark" aria-hidden="true">S</div>
+                <div>
+                  <strong>Swantex</strong>
+                  <span>Invoice Processing</span>
+                </div>
+              </div>
+              <h1>Welcome back</h1>
+              <p>
+                Sign in with your Swantex Microsoft 365 account to securely
+                access invoice processing and approvals.
+              </p>
               <div id="login-error"></div>
               <a
                 id="microsoft-login-button"
-                class="primary hidden"
+                class="microsoft-login hidden"
                 href="/api/auth/microsoft/login"
-                style="display: block; padding: .7rem; text-align: center; text-decoration: none"
-              >Sign in with Microsoft 365</a>
+              >
+                <span class="microsoft-mark" aria-hidden="true">
+                  <span></span><span></span><span></span><span></span>
+                </span>
+                Continue with Microsoft 365
+              </a>
+              <div class="login-security">Protected by Microsoft Entra ID</div>
               <div id="local-login-fields">
+                <div class="login-divider">Development access</div>
                 <label>Username<input id="login-username" autocomplete="username"></label>
                 <label>Password<input id="login-password" type="password" autocomplete="current-password"></label>
                 <button type="submit" class="primary" style="width: 100%">Local sign in</button>
@@ -1209,6 +1338,15 @@ def create_app(
                           <option value="">Select a company first…</option>
                         </select>
                       </label>
+                      <div class="notice supplier-match-prompt" id="supplier-match-prompt" style="display: none;">
+                        <strong>Supplier check</strong>
+                        <div>
+                          <span id="supplier-match-text"></span>
+                          <div class="supplier-match-actions">
+                            <button type="button" id="confirm-supplier-match">Confirm suggested supplier</button>
+                          </div>
+                        </div>
+                      </div>
                       <label>Supplier invoice number
                         <input id="preview-supplier-invoice" placeholder="Extracted invoice number">
                       </label>
@@ -1523,32 +1661,6 @@ def create_app(
                     </form>
                   </div>
 
-                  <div class="admin-block" id="local-user-management">
-                    <h3>Users</h3>
-                    <form class="admin-form" id="admin-user-form">
-                      <input id="admin-user-username" placeholder="Username" required>
-                      <input id="admin-user-display-name" placeholder="Display name" required>
-                      <input id="admin-user-email" placeholder="Email (optional)">
-                      <select id="admin-user-role">
-                        <option value="admin">Admin</option>
-                        <option value="purchase_ledger">Purchase Ledger</option>
-                        <option value="approver1">Approver 1</option>
-                        <option value="approver2">Approver 2</option>
-                        <option value="purchasing">Purchasing</option>
-                      </select>
-                      <input id="admin-user-password" placeholder="Password" type="password" required>
-                      <button type="submit" class="primary">Add user</button>
-                    </form>
-                    <div id="admin-users-table"></div>
-                  </div>
-                  <div class="admin-block hidden" id="entra-user-management">
-                    <h3>Microsoft 365 roles</h3>
-                    <p>
-                      User access is managed in Microsoft Entra under
-                      Enterprise applications → Invoice Processor → Users and groups.
-                      Assign exactly one Invoice Processor app role to each user or group.
-                    </p>
-                  </div>
                 </div>
               </section>
             </div>
@@ -1562,7 +1674,11 @@ def create_app(
               "sage-registration": ["Awaiting Sage Registration"],
               "approver1": ["Awaiting Approval 1"],
               "approver2": ["Awaiting Approval 2"],
-              "on-hold": ["Approval Query / On Hold"],
+              "on-hold": [
+                "Approval Query / On Hold",
+                "Awaiting Approval 1",
+                "Awaiting Approval 2",
+              ],
               "approved": ["Approved"],
               "payment-bacs": ["Approved for Payment - BACS"],
               "payment-bankline": ["Approved for Payment - Bankline"],
@@ -1783,6 +1899,8 @@ def create_app(
               document.getElementById("cancel-duplicate-button").style.display = "none";
               document.getElementById("retry-approval-route-button").style.display = "none";
               document.getElementById("delete-invoice-button").disabled = true;
+              document.getElementById("supplier-match-prompt").style.display = "none";
+              document.getElementById("confirm-supplier-match").dataset.supplier = "";
               pdfFrame.removeAttribute("src");
               pdfFrame.style.display = "none";
               pdfEmpty.style.display = "grid";
@@ -1910,6 +2028,7 @@ def create_app(
               if (!company) {
                 select.innerHTML = '<option value="">Select a company first…</option>';
                 select.disabled = true;
+                hideSupplierMatchPrompt();
                 return;
               }
               const response = await fetch(
@@ -1926,29 +2045,134 @@ def create_app(
                 option.textContent = supplier.name;
                 select.appendChild(option);
               }
-              if (
-                selectedSupplier &&
-                !suppliers.some(supplier => supplier.name === selectedSupplier)
-              ) {
-                const option = document.createElement("option");
-                option.value = selectedSupplier;
-                option.textContent =
-                  `${selectedSupplier} (not configured for this company)`;
-                select.appendChild(option);
+              const configuredSupplier = suppliers.find(supplier =>
+                supplier.name.localeCompare(
+                  selectedSupplier,
+                  undefined,
+                  { sensitivity: "accent" }
+                ) === 0 ||
+                (supplier.aliases || []).some(alias =>
+                  alias.localeCompare(
+                    selectedSupplier,
+                    undefined,
+                    { sensitivity: "accent" }
+                  ) === 0
+                )
+              );
+              if (configuredSupplier) {
+                select.value = configuredSupplier.name;
+                hideSupplierMatchPrompt();
+              } else if (selectedSupplier) {
+                select.value = "";
+                showSupplierMatchPrompt(selectedSupplier, company, suppliers);
+              } else {
+                select.value = "";
+                hideSupplierMatchPrompt();
               }
-              select.value = selectedSupplier;
             }
 
             document.getElementById("preview-company").addEventListener(
               "change",
               event => loadSuppliers(event.target.value, "")
             );
+            document.getElementById("preview-supplier").addEventListener(
+              "change",
+              event => {
+                if (event.target.value) hideSupplierMatchPrompt();
+              }
+            );
+
+            function normalizedSupplierName(value) {
+              return String(value || "")
+                .toLocaleLowerCase()
+                .replace(/&/g, " and ")
+                .replace(/\\b(limited|ltd|plc|inc|llc|company|co)\\b/g, "")
+                .replace(/[^a-z0-9]/g, "");
+            }
+
+            function supplierNameSimilarity(left, right) {
+              const a = normalizedSupplierName(left);
+              const b = normalizedSupplierName(right);
+              if (!a || !b) return 0;
+              if (a === b) return 1;
+              if (a.length < 2 || b.length < 2) return 0;
+              const pairs = value => {
+                const counts = new Map();
+                for (let index = 0; index < value.length - 1; index += 1) {
+                  const pair = value.slice(index, index + 2);
+                  counts.set(pair, (counts.get(pair) || 0) + 1);
+                }
+                return counts;
+              };
+              const aPairs = pairs(a);
+              const bPairs = pairs(b);
+              let overlap = 0;
+              for (const [pair, count] of aPairs) {
+                overlap += Math.min(count, bPairs.get(pair) || 0);
+              }
+              return (2 * overlap) / (a.length + b.length - 2);
+            }
+
+            function suggestedSupplier(extractedSupplier, suppliers) {
+              let best = null;
+              let bestScore = 0;
+              for (const supplier of suppliers) {
+                for (const candidate of [supplier.name, ...(supplier.aliases || [])]) {
+                  const score = supplierNameSimilarity(extractedSupplier, candidate);
+                  if (score > bestScore) {
+                    best = supplier;
+                    bestScore = score;
+                  }
+                }
+              }
+              return bestScore >= 0.62 ? best : null;
+            }
+
+            function hideSupplierMatchPrompt() {
+              const prompt = document.getElementById("supplier-match-prompt");
+              prompt.style.display = "none";
+              document.getElementById("confirm-supplier-match").dataset.supplier = "";
+            }
+
+            function showSupplierMatchPrompt(extractedSupplier, company, suppliers) {
+              const prompt = document.getElementById("supplier-match-prompt");
+              const text = document.getElementById("supplier-match-text");
+              const confirm = document.getElementById("confirm-supplier-match");
+              const suggestion = suggestedSupplier(extractedSupplier, suppliers);
+              if (suggestion) {
+                text.textContent =
+                  `We extracted “${extractedSupplier}”. Is this “${suggestion.name}” for ${company}?`;
+                confirm.textContent = `Yes — use ${suggestion.name}`;
+                confirm.dataset.supplier = suggestion.name;
+                confirm.style.display = "";
+              } else {
+                text.textContent =
+                  `“${extractedSupplier}” is not registered for ${company}. Select the correct supplier above or ask an administrator to add it.`;
+                confirm.dataset.supplier = "";
+                confirm.style.display = "none";
+              }
+              prompt.style.display = "grid";
+            }
+
+            document.getElementById("confirm-supplier-match").addEventListener(
+              "click",
+              event => {
+                const supplier = event.currentTarget.dataset.supplier;
+                if (!supplier) return;
+                document.getElementById("preview-supplier").value = supplier;
+                hideSupplierMatchPrompt();
+                showToast(`Supplier confirmed as ${supplier}.`);
+              }
+            );
 
             function updateCounts() {
               for (const tab of Object.keys(SECTION_STATUSES)) {
                 const count = tab === "incoming"
                   ? incomingInvoices().length
-                  : invoices.filter(i => SECTION_STATUSES[tab].includes(i.status)).length;
+                  : invoices.filter(i =>
+                      SECTION_STATUSES[tab].includes(i.status) &&
+                      (tab !== "on-hold" || i.status === "Approval Query / On Hold" || i.hold_level)
+                    ).length;
                 const el = document.getElementById(`count-${tab}`);
                 if (el) el.textContent = String(count);
               }
@@ -1976,11 +2200,96 @@ def create_app(
                 : escapeHtml(value);
             }
 
+            function formatUkTimestamp(value) {
+              if (!value) return "—";
+              const parsed = new Date(value);
+              if (Number.isNaN(parsed.getTime())) return value;
+              return parsed.toLocaleString("en-GB", {
+                timeZone: "Europe/London",
+                day: "2-digit",
+                month: "2-digit",
+                year: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+                timeZoneName: "short",
+              });
+            }
+
             function analysisField(label, value, confidence = null) {
               const confidenceBadge = confidence === null || confidence === undefined
                 ? ""
                 : `<span class="field-confidence">${Math.round(Number(confidence) * 100)}%</span>`;
               return `<dt>${escapeHtml(label)}</dt><dd>${analysisValue(value)}${confidenceBadge}</dd>`;
+            }
+
+            function invoiceHistoryHtml(invoice) {
+              const entries = [];
+              if (invoice.review_reason) {
+                entries.push(["Flagged / review", invoice.review_reason]);
+              }
+              if (invoice.po_query_notes) {
+                const context = [
+                  invoice.po_query_category && `Category: ${invoice.po_query_category}`,
+                  invoice.po_query_contact && `Contact: ${invoice.po_query_contact}`,
+                ].filter(Boolean).join(" · ");
+                entries.push([
+                  "PO query",
+                  `${invoice.po_query_notes}${context ? `\\n${context}` : ""}`,
+                ]);
+              }
+              if (invoice.hold_reason) {
+                entries.push(["Approval query / on hold", invoice.hold_reason]);
+              }
+              if (
+                invoice.approver1_comments &&
+                invoice.approver1_comments !== invoice.hold_reason
+              ) {
+                entries.push([
+                  `${invoice.approver1_name || "Approval"} note`,
+                  invoice.approver1_comments,
+                ]);
+              }
+              if (
+                invoice.approver2_comments &&
+                invoice.approver2_comments !== invoice.hold_reason
+              ) {
+                entries.push([
+                  `${invoice.approver2_name || "Approval"} note`,
+                  invoice.approver2_comments,
+                ]);
+              }
+              if (invoice.reconciliation_notes) {
+                entries.push(["Reconciliation note", invoice.reconciliation_notes]);
+              }
+              if (invoice.rejection_reason) {
+                entries.push(["Rejection reason", invoice.rejection_reason]);
+              }
+              if (invoice.cancellation_reason) {
+                entries.push(["Cancellation reason", invoice.cancellation_reason]);
+              }
+              if (!entries.length) {
+                return '<div class="mini-description">No queries or notes recorded.</div>';
+              }
+              return `<div class="analysis-history">${entries.map(([label, value]) =>
+                `<div class="analysis-history-item"><strong>${escapeHtml(label)}</strong>${escapeHtml(value)}</div>`
+              ).join("")}</div>`;
+            }
+
+            function invoiceAuditHtml(invoice) {
+              const events = Array.isArray(invoice.audit_trail)
+                ? invoice.audit_trail
+                : [];
+              if (!events.length) {
+                return '<div class="mini-description">No audit events recorded.</div>';
+              }
+              return `<div class="analysis-history">${events.map(event => {
+                const timestamp = event.created_at
+                  ? formatUkTimestamp(event.created_at)
+                  : "Unknown time";
+                return `<div class="analysis-history-item">` +
+                  `<strong>${escapeHtml(timestamp)} · ${escapeHtml(event.event_type)}</strong>` +
+                  `${escapeHtml(event.message)}</div>`;
+              }).join("")}</div>`;
             }
 
             function invoiceAnalysisHtml(invoice) {
@@ -2027,7 +2336,7 @@ def create_app(
                     <dl class="invoice-analysis-list">
                       ${analysisField("Filename", invoice.original_filename)}
                       ${analysisField("Sender", invoice.sender_address || invoice.sender_name)}
-                      ${analysisField("Received", invoice.received_at)}
+                      ${analysisField("Received", formatUkTimestamp(invoice.received_at))}
                       ${analysisField("Subject", invoice.subject)}
                     </dl>
                     ${invoice.approver1_name ? `
@@ -2035,9 +2344,29 @@ def create_app(
                       <dl class="invoice-analysis-list">
                         ${analysisField("Approver 1", invoice.approver1_name)}
                         ${analysisField("Approver 1 decision", invoice.approver1_decision)}
+                        ${analysisField("Approver 1 date", formatUkTimestamp(invoice.approver1_date))}
                         ${analysisField("Approver 2", invoice.approver2_name)}
                         ${analysisField("Approver 2 decision", invoice.approver2_decision)}
+                        ${analysisField("Approver 2 date", formatUkTimestamp(invoice.approver2_date))}
                       </dl>
+                    ` : ""}
+                    ${invoice.payment_date || invoice.reconciliation_date || invoice.reconciled_at ? `
+                      <h4>Payment and reconciliation</h4>
+                      <dl class="invoice-analysis-list">
+                        ${analysisField("Payment date", invoice.payment_date)}
+                        ${analysisField("Payment method", invoice.payment_method)}
+                        ${analysisField("Payment reference", invoice.payment_reference)}
+                        ${analysisField("Paid by", invoice.paid_by)}
+                        ${analysisField("Bank statement date", invoice.reconciliation_date)}
+                        ${analysisField("Marked reconciled", formatUkTimestamp(invoice.reconciled_at))}
+                        ${analysisField("Reconciled by", invoice.reconciled_by)}
+                      </dl>
+                    ` : ""}
+                    <h4>Description and history</h4>
+                    ${invoiceHistoryHtml(invoice)}
+                    ${Array.isArray(invoice.audit_trail) ? `
+                      <h4>Audit trail</h4>
+                      ${invoiceAuditHtml(invoice)}
                     ` : ""}
                     ${warnings ? `<div class="analysis-warning">${escapeHtml(warnings)}</div>` : ""}
                   </section>
@@ -2069,7 +2398,10 @@ def create_app(
                 html += `<tr class="invoice-summary-row" data-expand-invoice="${invoice.id}" ` +
                   `tabindex="0" aria-expanded="${expanded}" title="Click to view invoice analysis">`;
                 for (const column of columns) {
-                  html += `<td>${escapeHtml(column.value(invoice))}</td>`;
+                  const value = escapeHtml(column.value(invoice));
+                  html += column.boxed
+                    ? `<td class="invoice-description-cell"><div class="mini-description">${value}</div></td>`
+                    : `<td>${value}</td>`;
                 }
                 html += `<td class="row-actions"><div class="row-action-buttons">` +
                   `${actionsFn(invoice)}</div>` +
@@ -2104,6 +2436,48 @@ def create_app(
               });
             }
 
+            function invoiceDescription(invoice) {
+              const notes = [];
+              if (invoice.status === "Needs Review") {
+                notes.push(`Flagged: ${invoice.review_reason || invoice.ai_review_warnings || "Requires review"}`);
+              }
+              if (invoice.po_query_notes) {
+                const details = [invoice.po_query_category, invoice.po_query_contact]
+                  .filter(Boolean)
+                  .join(" · ");
+                notes.push(`PO query: ${invoice.po_query_notes}${details ? ` (${details})` : ""}`);
+              }
+              if (invoice.hold_reason) {
+                notes.push(`Approval query: ${invoice.hold_reason}`);
+              }
+              if (
+                invoice.approver1_comments &&
+                invoice.approver1_comments !== invoice.hold_reason
+              ) {
+                notes.push(
+                  `${invoice.approver1_name || "Approval"}: ${invoice.approver1_comments}`
+                );
+              }
+              if (
+                invoice.approver2_comments &&
+                invoice.approver2_comments !== invoice.hold_reason
+              ) {
+                notes.push(
+                  `${invoice.approver2_name || "Approval"}: ${invoice.approver2_comments}`
+                );
+              }
+              if (invoice.rejection_reason) {
+                notes.push(`Rejected: ${invoice.rejection_reason}`);
+              }
+              if (invoice.cancellation_reason) {
+                notes.push(`Cancelled: ${invoice.cancellation_reason}`);
+              }
+              if (invoice.reconciliation_notes) {
+                notes.push(`Reconciliation: ${invoice.reconciliation_notes}`);
+              }
+              return notes.length ? notes.join("\\n\\n") : "—";
+            }
+
             const BASE_COLUMNS = [
               { label: "Type", value: i => i.document_type === "statement" ? "Statement" : "Invoice" },
               { label: "IRJ", value: i => i.irj_number || "—" },
@@ -2111,6 +2485,7 @@ def create_app(
               { label: "Supplier", value: i => i.supplier || "—" },
               { label: "File", value: i => i.original_filename },
               { label: "Status", value: i => i.status },
+              { label: "Description", value: invoiceDescription, boxed: true },
             ];
 
             function pdfLinkButton(invoice) {
@@ -2340,7 +2715,6 @@ def create_app(
                 SECTION_STATUSES["needs-review"],
                 [
                   ...BASE_COLUMNS,
-                  { label: "Reason", value: i => i.review_reason || "—" },
                   { label: "Return stage", value: i => i.review_return_status || "Requires a dedicated resolution" },
                 ],
                 invoice => `
@@ -2364,7 +2738,10 @@ def create_app(
               renderSectionTable(
                 "po-matching-table",
                 SECTION_STATUSES["po-matching"],
-                [...BASE_COLUMNS, { label: "PO number", value: i => i.po_number || "—" }],
+                [
+                  ...BASE_COLUMNS,
+                  { label: "PO number", value: i => i.po_number || "—" },
+                ],
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   ${currentUser && currentUser.role === "purchasing" ? "" : `
@@ -2390,7 +2767,9 @@ def create_app(
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="approve" data-level="1" data-id="${invoice.id}">Approve</button>
-                  <button data-action="hold" data-level="1" data-id="${invoice.id}" class="secondary">Hold / query</button>
+                  ${invoice.hold_level === 1 ? "" : `
+                    <button data-action="hold" data-level="1" data-id="${invoice.id}" class="secondary">Record query</button>
+                  `}
                   <button data-action="reject" data-level="1" data-id="${invoice.id}" class="danger">Reject</button>
                 `
               );
@@ -2401,18 +2780,21 @@ def create_app(
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="approve" data-level="2" data-id="${invoice.id}">Approve</button>
-                  <button data-action="hold" data-level="2" data-id="${invoice.id}" class="secondary">Hold / query</button>
+                  ${invoice.hold_level === 2 ? "" : `
+                    <button data-action="hold" data-level="2" data-id="${invoice.id}" class="secondary">Record query</button>
+                  `}
                   <button data-action="reject" data-level="2" data-id="${invoice.id}" class="danger">Reject</button>
                 `
               );
               renderSectionTable(
                 "on-hold-table",
                 SECTION_STATUSES["on-hold"],
-                [...BASE_COLUMNS, { label: "Hold reason", value: i => i.hold_reason || "—" }],
+                BASE_COLUMNS,
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="resume" data-id="${invoice.id}">Resume approval</button>
-                `
+                `,
+                invoice => invoice.status === "Approval Query / On Hold" || Boolean(invoice.hold_level)
               );
               renderSectionTable(
                 "approved-table",
@@ -2470,9 +2852,19 @@ def create_app(
               renderSectionTable(
                 "rejected-table",
                 SECTION_STATUSES["rejected"],
-                [...BASE_COLUMNS, { label: "Reason", value: i => i.rejection_reason || i.cancellation_reason || "—" }],
+                BASE_COLUMNS,
                 invoice => pdfLinkButton(invoice)
               );
+            }
+
+            async function readResponseBody(response) {
+              const text = await response.text();
+              if (!text) return {};
+              try {
+                return JSON.parse(text);
+              } catch {
+                return { detail: text };
+              }
             }
 
             async function sendJson(url, method, body) {
@@ -2481,11 +2873,11 @@ def create_app(
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body || {}),
               });
+              const detail = await readResponseBody(response);
               if (!response.ok) {
-                const detail = await response.json().catch(() => ({}));
                 throw new Error(detail.detail || `Request failed (${response.status}).`);
               }
-              return response.json();
+              return detail;
             }
 
             async function postJson(url, body) {
@@ -3274,15 +3666,12 @@ def create_app(
 
             async function loadAdminPanel() {
               try {
-                const [companies, suppliers, matrix, supplierTerms, threshold, users, irjSettings] = await Promise.all([
+                const [companies, suppliers, matrix, supplierTerms, threshold, irjSettings] = await Promise.all([
                   fetch("/api/admin/companies").then(r => r.json()),
                   fetch("/api/admin/suppliers").then(r => r.json()),
                   fetch("/api/admin/approval-matrix").then(r => r.json()),
                   fetch("/api/admin/supplier-terms").then(r => r.json()),
                   fetch("/api/admin/ai-threshold").then(r => r.json()),
-                  authConfig.local_enabled
-                    ? fetch("/api/admin/users").then(r => r.json())
-                    : Promise.resolve([]),
                   fetch("/api/irj-configurations").then(r => r.json()),
                 ]);
                 adminCompanies = companies;
@@ -3652,64 +4041,6 @@ def create_app(
                     }
                   });
                 });
-                renderSimpleTable(
-                  document.getElementById("admin-users-table"),
-                  [
-                    { label: "Username", value: u => u.username },
-                    { label: "Display name", value: u => u.display_name },
-                    { label: "Role", value: u => u.role },
-                  ],
-                  users,
-                  async username => {
-                    await fetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: "DELETE" });
-                    await loadAdminPanel();
-                  },
-                  "username",
-                  account => {
-                    openAdminEditor(`Edit ${account.username}`, [
-                      {
-                        key: "display_name",
-                        label: "Display name",
-                        value: account.display_name,
-                        required: true,
-                      },
-                      {
-                        key: "email",
-                        label: "Email",
-                        type: "email",
-                        value: account.email,
-                        nullWhenBlank: true,
-                      },
-                      {
-                        key: "role",
-                        label: "Role",
-                        type: "select",
-                        options: [
-                          ["admin", "Admin"],
-                          ["purchase_ledger", "Purchase Ledger"],
-                          ["approver1", "Approver 1"],
-                          ["approver2", "Approver 2"],
-                          ["purchasing", "Purchasing"],
-                        ],
-                        value: account.role,
-                        required: true,
-                      },
-                      {
-                        key: "password",
-                        label: "New password (leave blank to keep current)",
-                        type: "password",
-                        omitWhenBlank: true,
-                        fullWidth: true,
-                      },
-                    ], async values => {
-                      await putJson(
-                        `/api/admin/users/${encodeURIComponent(account.username)}`,
-                        values
-                      );
-                      await loadAdminPanel();
-                    });
-                  }
-                );
               } catch (error) {
                 showToast(`Failed to load admin panel: ${error.message}`, true);
               }
@@ -3732,7 +4063,7 @@ def create_app(
                   method: "POST",
                   body: formData,
                 });
-                let body = await response.json();
+                let body = await readResponseBody(response);
                 if (response.status === 409 && body.detail?.duplicates) {
                   const duplicates = body.detail.duplicates
                     .map(item =>
@@ -3753,7 +4084,7 @@ def create_app(
                     method: "POST",
                     body: formData,
                   });
-                  body = await response.json();
+                  body = await readResponseBody(response);
                 }
                 if (!response.ok) {
                   const detail = typeof body.detail === "string"
@@ -3892,23 +4223,6 @@ def create_app(
               }
             });
 
-            document.getElementById("admin-user-form").addEventListener("submit", async event => {
-              event.preventDefault();
-              try {
-                await postJson("/api/admin/users", {
-                  username: document.getElementById("admin-user-username").value,
-                  display_name: document.getElementById("admin-user-display-name").value,
-                  email: document.getElementById("admin-user-email").value || null,
-                  role: document.getElementById("admin-user-role").value,
-                  password: document.getElementById("admin-user-password").value,
-                });
-                event.target.reset();
-                await loadAdminPanel();
-              } catch (error) {
-                showToast(error.message, true);
-              }
-            });
-
             document.getElementById("logout-button").addEventListener("click", async () => {
               if (authConfig.microsoft_enabled && !authConfig.local_enabled) {
                 window.location.href = "/api/auth/microsoft/logout";
@@ -3963,12 +4277,6 @@ def create_app(
                 authConfig.local_enabled;
               document.getElementById("login-password").required =
                 authConfig.local_enabled;
-              document.getElementById("local-user-management").classList.toggle(
-                "hidden", !authConfig.local_enabled
-              );
-              document.getElementById("entra-user-management").classList.toggle(
-                "hidden", !authConfig.microsoft_enabled
-              );
             }
 
             async function enterApp() {
@@ -4184,6 +4492,7 @@ def create_app(
 
     @app.get("/api/companies")
     def companies(user: User = Depends(get_current_user)) -> list[dict[str, str]]:
+        _sync_sharepoint_companies()
         return [
             {
                 "name": profile.name,
@@ -4518,7 +4827,12 @@ def create_app(
                 status_code=404,
                 detail=f"No invoice was found for IRJ number '{normalized}'.",
             )
-        return asdict(invoice)
+        result = asdict(invoice)
+        result["audit_trail"] = [
+            asdict(event)
+            for event in app.state.activity_feed.list_for_invoice(invoice.id)
+        ]
+        return result
 
     @app.get("/api/invoice-search/filter")
     def filter_invoices(
@@ -4556,7 +4870,13 @@ def create_app(
                 or invoice.supplier.strip().casefold() != normalized_supplier
             ):
                 continue
-            matches.append(asdict(invoice))
+            result = asdict(invoice)
+            if normalized_irj:
+                result["audit_trail"] = [
+                    asdict(event)
+                    for event in app.state.activity_feed.list_for_invoice(invoice.id)
+                ]
+            matches.append(result)
         return matches
 
     @app.get("/api/statements")
@@ -4715,6 +5035,7 @@ def create_app(
                 notes=request.notes,
                 query_category=request.query_category,
                 purchasing_contact=request.purchasing_contact,
+                recorded_by=user.display_name,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -4744,6 +5065,7 @@ def create_app(
                 level=request.level,
                 decision=request.decision,
                 comments=request.comments,
+                recorded_by=user.display_name,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -4757,7 +5079,9 @@ def create_app(
     ) -> dict[str, object]:
         try:
             record = _lifecycle().resume_approval(
-                invoice_id, resolution_notes=request.resolution_notes
+                invoice_id,
+                resolution_notes=request.resolution_notes,
+                recorded_by=user.display_name,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -4885,6 +5209,7 @@ def create_app(
     def admin_list_companies(
         user: User = Depends(require_role(ROLE_ADMIN)),
     ) -> list[dict[str, object]]:
+        _sync_sharepoint_companies()
         return [_company_response(profile) for profile in app.state.companies_store.list()]
 
     @app.get("/api/admin/sharepoint/folders")
@@ -5185,7 +5510,6 @@ def create_app(
                 supplier_store=app.state.suppliers_store,
                 approval_matrix_store=app.state.approval_matrix_store,
                 supplier_terms_store=app.state.supplier_terms_store,
-                auth_store=app.state.auth_store,
                 default_company=company,
             )
         except HTTPException:
@@ -5267,46 +5591,6 @@ def create_app(
             mode,
         )
         return _irj_configuration(company)
-
-    @app.get("/api/admin/users")
-    def admin_list_users(
-        user: User = Depends(require_role(ROLE_ADMIN)),
-    ) -> list[dict[str, object]]:
-        return [asdict(u) for u in app.state.auth_store.list_users()]
-
-    @app.post("/api/admin/users")
-    def admin_create_user(
-        request: UserCreateRequest, user: User = Depends(require_role(ROLE_ADMIN))
-    ) -> dict[str, object]:
-        try:
-            created = app.state.auth_store.create_user(**request.model_dump())
-        except AuthError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        return asdict(created)
-
-    @app.put("/api/admin/users/{username}")
-    def admin_update_user(
-        username: str,
-        request: UserUpdateRequest,
-        user: User = Depends(require_role(ROLE_ADMIN)),
-    ) -> dict[str, object]:
-        try:
-            updated = app.state.auth_store.update_user(
-                username, **request.model_dump(exclude_unset=True)
-            )
-        except AuthError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        return asdict(updated)
-
-    @app.delete("/api/admin/users/{username}")
-    def admin_delete_user(
-        username: str, user: User = Depends(require_role(ROLE_ADMIN))
-    ) -> dict[str, str]:
-        try:
-            app.state.auth_store.delete_user(username)
-        except AuthError as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        return {"status": "deleted"}
 
     @app.post("/api/outlook/notifications")
     async def outlook_notifications(

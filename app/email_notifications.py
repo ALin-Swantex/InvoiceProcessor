@@ -96,12 +96,13 @@ class GraphEmailNotifier:
             )
 
 
-def send_email_notification(*, recipient: str, subject: str, body: str) -> None:
+def send_email_notification(*, recipient: str, subject: str, body: str) -> bool:
     settings = EmailNotificationSettings.from_environment()
     if not settings.enabled:
-        return
+        return False
     notifier = _notifier_for(settings, settings_from_environment())
     notifier.send(recipient=recipient, subject=subject, body=body)
+    return True
 
 
 @lru_cache(maxsize=4)

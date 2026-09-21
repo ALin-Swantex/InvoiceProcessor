@@ -148,16 +148,32 @@ def postgres_connection_factory(
     settings: PostgresSettings | None = None,
 ) -> ConnectionFactory:
     resolved = settings or PostgresSettings.from_env()
+    pool_settings = (
+        _pool_size("POSTGRES_POOL_MIN_SIZE", 1),
+        _pool_size("POSTGRES_POOL_MAX_SIZE", 10),
+        _pool_timeout(),
+        _pool_max_idle(),
+    )
     if resolved.password is not None:
-        pool = _postgres_pool(
+        pool = _postgres_pool(resolved, *pool_settings)
+    else:
+        tenant_id = os.environ.get("OUTLOOK_MCP_TENANT_ID", "").strip()
+        client_id = os.environ.get("OUTLOOK_MCP_CLIENT_ID", "").strip()
+        client_secret = os.environ.get("OUTLOOK_MCP_CLIENT_SECRET", "").strip()
+        supplied = (tenant_id, client_id, client_secret)
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "The Invoice MCP tenant ID, client ID, and client secret "
+                "must all be configured for PostgreSQL authentication."
+            )
+        pool = _entra_postgres_pool(
             resolved,
-            _pool_size("POSTGRES_POOL_MIN_SIZE", 1),
-            _pool_size("POSTGRES_POOL_MAX_SIZE", 10),
-            _pool_timeout(),
-            _pool_max_idle(),
+            tenant_id,
+            client_id,
+            client_secret,
+            *pool_settings,
         )
-        return pool.connection  # type: ignore[no-any-return]
-    return lambda: connect_postgres(resolved)
+    return pool.connection  # type: ignore[no-any-return]
 
 
 @lru_cache(maxsize=4)
@@ -186,6 +202,60 @@ def _postgres_pool(
         check=pool_module.ConnectionPool.check_connection,
         open=True,
     )
+
+
+@lru_cache(maxsize=4)
+def _entra_postgres_pool(
+    settings: PostgresSettings,
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    min_size: int,
+    max_size: int,
+    timeout: float,
+    max_idle: float,
+) -> object:
+    if min_size > max_size:
+        raise ValueError(
+            "POSTGRES_POOL_MIN_SIZE must not exceed POSTGRES_POOL_MAX_SIZE."
+        )
+    psycopg = importlib.import_module("psycopg")
+    pool_module = importlib.import_module("psycopg_pool")
+    rows = importlib.import_module("psycopg.rows")
+    credential = _default_credential(tenant_id, client_id, client_secret)
+
+    class EntraConnection(psycopg.Connection):  # type: ignore[name-defined, misc]
+        @classmethod
+        def connect(cls, conninfo: str = "", **kwargs: object) -> object:
+            token = credential.get_token(AAD_SCOPE)  # type: ignore[attr-defined]
+            return super().connect(conninfo, password=token.token, **kwargs)
+
+    kwargs = settings.connection_kwargs(credential=_NoPasswordCredential())
+    kwargs.pop("password", None)
+    return pool_module.ConnectionPool(
+        connection_class=EntraConnection,
+        kwargs={
+            **kwargs,
+            "row_factory": rows.dict_row,
+        },
+        min_size=min_size,
+        max_size=max_size,
+        timeout=timeout,
+        max_idle=max_idle,
+        max_lifetime=2700,
+        check=pool_module.ConnectionPool.check_connection,
+        open=True,
+    )
+
+
+class _NoPasswordCredential:
+    def get_token(self, scope: str) -> object:
+        del scope
+
+        class EmptyToken:
+            token = ""
+
+        return EmptyToken()
 
 
 def _pool_size(name: str, default: int) -> int:
