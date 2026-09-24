@@ -95,6 +95,7 @@ duplicates. Ensure approver test accounts can receive mail and log in.
 | UAT-46 | Today-only mailbox polling | With older unread invoice emails and one received today, start local polling with lookback `0`. | Only today's qualifying email is queued. Increasing the lookback deliberately includes older messages without duplicating an existing queue item. |
 | UAT-47 | Multiple attachments and naming | Send one email with two PDF invoices. | Both PDFs create separate records. Final SharePoint names use `IRJ-original-name.pdf` and contain no `outlook-<hash>` prefix. |
 | UAT-48 | Desktop launcher | Run `invoice-processor`, start services, open the web app, then stop services. | The launcher works on the target OS, reports both process states, opens the app, and shuts both child processes down cleanly. |
+| UAT-49 | Individual approver isolation | Assign two invoices to different Approver 1 users and two to different Approver 2 users. Log in as each user and try the list, direct URL, PDF, search, activity feed, and approval endpoint for both invoices. | Each approver sees and can act only on invoices assigned to their own Entra email. Unassigned reads return 404 and unassigned decisions return 403. Admin retains authorised support access. |
 
 ## Exit criteria
 

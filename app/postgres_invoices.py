@@ -160,6 +160,20 @@ class PostgresInvoiceStore:
             (),
         )
 
+    def list_for_approver(
+        self, level: int, email: str, limit: int = 500
+    ) -> list[InvoiceRecord]:
+        if level not in (1, 2):
+            raise ValueError("Approval level must be 1 or 2.")
+        self._validate_limit(limit, maximum=500)
+        column = f"approver{level}_email"
+        return self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices "
+            f"WHERE lower(btrim({column})) = lower(btrim(%s)) "
+            "ORDER BY created_at DESC LIMIT %s",
+            (email, limit),
+        )
+
     def list_by_status(self, statuses: list[str], limit: int = 200) -> list[InvoiceRecord]:
         if not statuses:
             return []

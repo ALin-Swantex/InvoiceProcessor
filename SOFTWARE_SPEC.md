@@ -62,6 +62,8 @@ an older installation.
 - Route nominal invoices through Sage and the approval matrix.
 - Update an existing approval route when its emails are edited.
 - Support one or two approvers, holds, resumptions, and rejection.
+- Restrict each approver's invoice list, detail, PDF, search, activity, and
+  decisions to rows assigned to their verified Entra email.
 - Send each successful stage notification at most once per invoice.
 - Separate payment routing, payment, foreign allocation, and reconciliation.
 - Record each meaningful action in the audit trail.

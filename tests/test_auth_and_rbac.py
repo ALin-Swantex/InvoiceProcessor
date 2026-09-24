@@ -554,6 +554,111 @@ def test_approver1_cannot_decide_level_2(tmp_path: Path) -> None:
     assert response.status_code == 403
 
 
+def test_approvers_only_see_and_act_on_their_assigned_invoices(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+    store = client.app.state.invoice_store
+
+    def assigned_invoice(
+        message_id: str,
+        filename: str,
+        irj_number: str,
+        approver1_email: str,
+        approver2_email: str,
+    ) -> int:
+        pdf = tmp_path / filename
+        pdf.write_bytes(VALID_PDF_BYTES)
+        invoice = store.add_from_outlook(
+            message={"id": message_id},
+            attachment={"id": f"attachment-{message_id}", "name": filename},
+            stored_path=pdf,
+        )
+        return store.update_fields(
+            invoice.id,
+            company="Acme Trading Ltd",
+            supplier="Supplier Ltd",
+            irj_number=irj_number,
+            invoice_type="nominal",
+            status="Awaiting Approval 1",
+            approver1_name="Assigned Approver 1",
+            approver1_email=approver1_email,
+            approver2_name="Assigned Approver 2",
+            approver2_email=approver2_email,
+        ).id
+
+    own_id = assigned_invoice(
+        "own-message",
+        "own.pdf",
+        "100001",
+        "  JORDAN.BLAKE@example.test ",
+        "sam.ellis@example.test",
+    )
+    other_id = assigned_invoice(
+        "other-message",
+        "other.pdf",
+        "100002",
+        "another.approver@example.test",
+        "another.second.approver@example.test",
+    )
+    client.app.state.activity_feed.add_event(
+        event_type="approval_pending",
+        target_role="approver1",
+        message="Own invoice event",
+        invoice_id=own_id,
+    )
+    client.app.state.activity_feed.add_event(
+        event_type="approval_pending",
+        target_role="approver1",
+        message="Other invoice event",
+        invoice_id=other_id,
+    )
+
+    login(client, "jordan.blake", "ChangeMe-App1!")
+
+    listed = client.get("/api/invoices?limit=500")
+    assert listed.status_code == 200
+    assert [invoice["id"] for invoice in listed.json()] == [own_id]
+    assert client.get(f"/api/invoices/{own_id}").status_code == 200
+    assert client.get(f"/api/invoices/{other_id}").status_code == 404
+    assert client.get(f"/api/invoices/{own_id}/pdf").status_code == 200
+    assert client.get(f"/api/invoices/{other_id}/pdf").status_code == 404
+    assert client.get("/api/invoice-search?irj_number=100001").status_code == 200
+    assert client.get("/api/invoice-search?irj_number=100002").status_code == 404
+    filtered = client.get("/api/invoice-search/filter?supplier=Supplier%20Ltd")
+    assert [invoice["id"] for invoice in filtered.json()] == [own_id]
+    assert [
+        event["message"] for event in client.get("/api/activity").json()
+    ] == ["Own invoice event"]
+
+    forbidden = client.post(
+        f"/api/invoices/{other_id}/approve",
+        json={
+            "level": 1,
+            "decision": "on_hold",
+            "comments": "This must not be accepted.",
+        },
+    )
+    assert forbidden.status_code == 403
+    assert "different approver" in forbidden.json()["detail"]
+
+    allowed = client.post(
+        f"/api/invoices/{own_id}/approve",
+        json={
+            "level": 1,
+            "decision": "on_hold",
+            "comments": "Please clarify this invoice.",
+        },
+    )
+    assert allowed.status_code == 200
+
+    login(client, "sam.ellis", "ChangeMe-App2!")
+    assert [
+        invoice["id"] for invoice in client.get("/api/invoices").json()
+    ] == [own_id]
+    assert client.get(f"/api/invoices/{other_id}").status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # End-to-end nominal invoice flow: confirm -> Sage registration -> approver1
 # hold -> resume -> approver1 approve -> approver2 approve -> pay

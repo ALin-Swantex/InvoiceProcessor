@@ -288,6 +288,23 @@ class InvoiceStore:
             ).fetchall()
         return [InvoiceRecord(**dict(row)) for row in rows]
 
+    def list_for_approver(
+        self, level: int, email: str, limit: int = 500
+    ) -> list[InvoiceRecord]:
+        if level not in (1, 2):
+            raise ValueError("Approval level must be 1 or 2.")
+        if limit < 1 or limit > 500:
+            raise ValueError("Invoice limit must be between 1 and 500.")
+        column = f"approver{level}_email"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM invoices "
+                f"WHERE lower(trim({column})) = lower(trim(?)) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (email, limit),
+            ).fetchall()
+        return [InvoiceRecord(**dict(row)) for row in rows]
+
     def list_by_status(self, statuses: list[str], limit: int = 200) -> list[InvoiceRecord]:
         if not statuses:
             return []

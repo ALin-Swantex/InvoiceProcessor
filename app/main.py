@@ -4700,6 +4700,75 @@ def create_app(
             "current_irj": app.state.irj_generator.current(company.name),
         }
 
+    @staticmethod
+    def _normalized_email(value: str | None) -> str:
+        return (value or "").strip().casefold()
+
+    def _invoice_is_visible_to_user(
+        invoice: InvoiceRecord,
+        user: User,
+    ) -> bool:
+        """Limit approvers to invoices assigned to their Entra identity."""
+        if user.role not in {ROLE_APPROVER_1, ROLE_APPROVER_2}:
+            return True
+        user_email = _normalized_email(user.email)
+        if not user_email:
+            return False
+        assigned_email = (
+            invoice.approver1_email
+            if user.role == ROLE_APPROVER_1
+            else invoice.approver2_email
+        )
+        return _normalized_email(assigned_email) == user_email
+
+    def _invoice_for_user(invoice_id: int, user: User) -> InvoiceRecord:
+        invoice = app.state.invoice_store.get(invoice_id)
+        if invoice is None or not _invoice_is_visible_to_user(invoice, user):
+            # Use the same response for absent and inaccessible records so an
+            # approver cannot discover another approver's invoice IDs.
+            raise HTTPException(status_code=404, detail="Invoice was not found.")
+        return invoice
+
+    def _invoices_for_user(user: User, limit: int) -> list[InvoiceRecord]:
+        if user.role == ROLE_APPROVER_1:
+            return (
+                app.state.invoice_store.list_for_approver(1, user.email, limit)
+                if _normalized_email(user.email)
+                else []
+            )
+        if user.role == ROLE_APPROVER_2:
+            return (
+                app.state.invoice_store.list_for_approver(2, user.email, limit)
+                if _normalized_email(user.email)
+                else []
+            )
+        return app.state.invoice_store.list(limit)
+
+    def _require_assigned_approver(
+        invoice_id: int,
+        user: User,
+        level: int,
+    ) -> InvoiceRecord:
+        invoice = app.state.invoice_store.get(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice was not found.")
+        if user.role == ROLE_ADMIN:
+            return invoice
+        expected_role = ROLE_APPROVER_1 if level == 1 else ROLE_APPROVER_2
+        assigned_email = (
+            invoice.approver1_email if level == 1 else invoice.approver2_email
+        )
+        if (
+            user.role != expected_role
+            or not _normalized_email(user.email)
+            or _normalized_email(user.email) != _normalized_email(assigned_email)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="This invoice is assigned to a different approver.",
+            )
+        return invoice
+
     @app.get("/api/irj-configurations")
     def irj_configurations(
         user: User = Depends(get_current_user),
@@ -4781,7 +4850,20 @@ def create_app(
     def activity(
         since_id: int = Query(0, ge=0), user: User = Depends(get_current_user)
     ) -> list[dict[str, object]]:
-        return [asdict(event) for event in app.state.activity_feed.list_since(since_id)]
+        events = app.state.activity_feed.list_since(since_id)
+        if user.role in {ROLE_APPROVER_1, ROLE_APPROVER_2}:
+            visible_events = []
+            for event in events:
+                if event.invoice_id is None:
+                    continue
+                invoice = app.state.invoice_store.get(event.invoice_id)
+                if (
+                    invoice is not None
+                    and _invoice_is_visible_to_user(invoice, user)
+                ):
+                    visible_events.append(event)
+            events = visible_events
+        return [asdict(event) for event in events]
 
     @app.get("/api/activity/stream")
     async def activity_stream(
@@ -4822,7 +4904,8 @@ def create_app(
     def list_invoices(
         limit: int = Query(100, ge=1, le=500), user: User = Depends(get_current_user)
     ) -> list[dict[str, object]]:
-        return [asdict(invoice) for invoice in app.state.invoice_store.list(limit)]
+        invoices = _invoices_for_user(user, limit)
+        return [asdict(invoice) for invoice in invoices]
 
     @app.post("/api/invoices/manual-upload")
     async def manual_upload_invoice(
@@ -5010,9 +5093,7 @@ def create_app(
 
     @app.get("/api/invoices/{invoice_id}")
     def get_invoice(invoice_id: int, user: User = Depends(get_current_user)) -> dict[str, object]:
-        invoice = app.state.invoice_store.get(invoice_id)
-        if invoice is None:
-            raise HTTPException(status_code=404, detail="Invoice was not found.")
+        invoice = _invoice_for_user(invoice_id, user)
         return asdict(invoice)
 
     @app.delete("/api/invoices/{invoice_id}")
@@ -5041,7 +5122,7 @@ def create_app(
                 detail="An IRJ number must contain exactly six digits.",
             )
         invoice = app.state.invoice_store.get_by_irj_number(normalized)
-        if invoice is None:
+        if invoice is None or not _invoice_is_visible_to_user(invoice, user):
             raise HTTPException(
                 status_code=404,
                 detail=f"No invoice was found for IRJ number '{normalized}'.",
@@ -5076,7 +5157,12 @@ def create_app(
                 detail="Provide an IRJ number, company, or supplier.",
             )
         matches = []
-        for invoice in app.state.invoice_store.list_all():
+        candidates = (
+            _invoices_for_user(user, 500)
+            if user.role in {ROLE_APPROVER_1, ROLE_APPROVER_2}
+            else app.state.invoice_store.list_all()
+        )
+        for invoice in candidates:
             if normalized_irj and invoice.irj_number != normalized_irj:
                 continue
             if normalized_company and (
@@ -5151,9 +5237,7 @@ def create_app(
     def get_invoice_pdf(
         invoice_id: int, user: User = Depends(get_current_user)
     ) -> FileResponse:
-        invoice = app.state.invoice_store.get(invoice_id)
-        if invoice is None:
-            raise HTTPException(status_code=404, detail="Invoice was not found.")
+        invoice = _invoice_for_user(invoice_id, user)
         pdf_path = Path(invoice.stored_path)
         if not pdf_path.is_file():
             raise HTTPException(status_code=404, detail="Invoice PDF was not found.")
@@ -5280,6 +5364,7 @@ def create_app(
             raise HTTPException(
                 status_code=403, detail="Approver 2 can only decide level-2 approvals."
             )
+        _require_assigned_approver(invoice_id, user, request.level)
         try:
             record = _lifecycle().decide_approval(
                 invoice_id,
