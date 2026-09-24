@@ -339,6 +339,17 @@ def test_authoritative_schema_contains_current_and_company_scoped_tables() -> No
     assert "DROP TABLE IF EXISTS users" in user_removal
     assert "CREATE TABLE invoice_email_stages" in user_removal
 
+    operations = (
+        Path(__file__).parents[1]
+        / "app"
+        / "postgres_migrations"
+        / "013_operational_visibility.sql"
+    ).read_text()
+    assert "CREATE TABLE worker_heartbeats" in operations
+    assert "CREATE OR REPLACE VIEW bi_invoice_metadata" in operations
+    assert "CREATE VIEW bi_invoice_corrections" in operations
+    assert "corrected_fields_json" in operations
+
 
 def test_company_irj_migration_allows_same_irj_across_companies() -> None:
     migration = (

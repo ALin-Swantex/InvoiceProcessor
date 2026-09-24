@@ -351,5 +351,7 @@ def require_role(*roles: str):
     return _dependency
 
 
-def auth_store_from_environment() -> AuthStore:
-    return AuthStore(Path(os.environ.get("AUTH_DB_PATH", "runtime_data/auth.db")))
+def auth_store_from_environment() -> object:
+    from app.postgres_auth import PostgresAuthStore
+
+    return PostgresAuthStore()

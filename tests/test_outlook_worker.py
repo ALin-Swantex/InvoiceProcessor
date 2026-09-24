@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
@@ -20,10 +21,15 @@ class FakeOutlookRetriever:
     def __init__(self, pdf_path: Path, *, attachments: bool = True) -> None:
         self.pdf_path = pdf_path
         self.attachments = attachments
+        self.received_since: datetime | None = None
 
     async def list_invoice_emails(
-        self, limit: int = 20, unread_only: bool = True
+        self,
+        limit: int = 20,
+        unread_only: bool = True,
+        received_since: datetime | None = None,
     ) -> list[dict[str, object]]:
+        self.received_since = received_since
         return [{"id": "message-1", "hasAttachments": True}]
 
     async def get_invoice_email(self, message_id: str) -> dict[str, object]:
@@ -76,6 +82,7 @@ class FakeSharePointIncomingClient:
     def __init__(self) -> None:
         self.uploads: list[tuple[str, bytes]] = []
         self.conflict_behaviors: list[str] = []
+        self.moves: list[tuple[str, str, str]] = []
 
     def upload_to_incoming(
         self,
@@ -102,6 +109,16 @@ class FakeSharePointIncomingClient:
 
     def get_item_web_url(self, item: dict[str, object]) -> str | None:
         return str(item["webUrl"])
+
+    def move_to_folder(
+        self, item_id: str, folder: str, filename: str
+    ) -> dict[str, object]:
+        self.moves.append((item_id, folder, filename))
+        return {
+            "id": item_id,
+            "name": filename,
+            "webUrl": f"https://sharepoint.example/{folder}/{filename}",
+        }
 
 
 class RetryingMultiAttachmentRetriever(FakeOutlookRetriever):
@@ -347,6 +364,13 @@ def test_outlook_intake_flags_identical_pdf_before_extraction(
     assert duplicate.duplicate_of_invoice_id == original.id
     assert "identical PDF content" in str(duplicate.review_reason)
     assert extracted_ids == []
+    assert monitor.client.moves == [
+        (
+            "new-sharepoint-item",
+            "Invoices/Flagged Invoices",
+            "resent.pdf",
+        )
+    ]
 
 
 def test_worker_repairs_existing_unlinked_outlook_attachment(
@@ -564,14 +588,17 @@ def test_local_polling_enqueues_unread_outlook_messages(tmp_path: Path) -> None:
     pdf_path = tmp_path / "invoice.pdf"
     pdf_path.write_bytes(VALID_PDF_BYTES)
     notifications = OutlookNotificationStore(tmp_path / "notifications.db")
+    retriever = FakeOutlookRetriever(pdf_path)
     worker = OutlookInvoiceWorker(
         notifications,
         InvoiceStore(tmp_path / "invoices.db"),
-        FakeOutlookRetriever(pdf_path),
+        retriever,
     )
 
-    assert asyncio.run(worker.enqueue_from_mailbox()) == 1
-    assert asyncio.run(worker.enqueue_from_mailbox()) == 0
+    start = datetime(2026, 9, 24, tzinfo=timezone.utc)
+    assert asyncio.run(worker.enqueue_from_mailbox(received_since=start)) == 1
+    assert asyncio.run(worker.enqueue_from_mailbox(received_since=start)) == 0
+    assert retriever.received_since == start
 
     pending = notifications.list()
     assert len(pending) == 1

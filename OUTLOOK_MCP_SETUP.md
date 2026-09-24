@@ -37,7 +37,7 @@ When Graph reports a newly created Inbox message, the notification endpoint:
 1. Answers Microsoft's `validationToken` challenge in plain text.
 2. Verifies the subscription `clientState`.
 3. Extracts the Outlook message ID.
-4. Adds it to an idempotent SQLite queue.
+4. Adds it to the idempotent PostgreSQL queue.
 5. Returns `202 Accepted` immediately.
 
 It deliberately does not download or process the invoice inside the webhook
@@ -116,10 +116,10 @@ In a second terminal, run:
 python -m app.outlook_worker
 ```
 
-The worker polls the local notification queue, calls Microsoft Graph directly
+The worker polls the PostgreSQL notification queue, calls Microsoft Graph directly
 using the `OUTLOOK_MCP_TENANT_ID` / `OUTLOOK_MCP_CLIENT_ID` /
 `OUTLOOK_MCP_CLIENT_SECRET` / `OUTLOOK_MCP_MAILBOX` settings, and stores
-received invoice records in `INVOICE_DB_PATH`.
+received invoice records and runtime state in Azure PostgreSQL.
 
 ## 5. Create the Graph subscription
 
@@ -150,12 +150,21 @@ same direct Microsoft Graph connection instead:
 
 ```dotenv
 OUTLOOK_LOCAL_POLLING_ENABLED=true
+OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS=0
 ```
 
 Restart the worker after changing this value. This lets a test email reach the
 same queue, PDF download, invoice database, and frontend without exposing the
 application publicly. Keep this disabled in production, where Graph webhooks
 provide the deterministic trigger.
+
+Local polling reads only unread messages with attachments from the Inbox,
+newest first, beginning at midnight today in Europe/London. Set the lookback to
+`1` or more only when recovering messages after an outage. Successfully queued
+message identities are retained in PostgreSQL, so restarting the worker does
+not create a second queue item. Messages remain in the Inbox because this
+deployment uses `Mail.Read`; moving them would require the broader
+`Mail.ReadWrite` application permission.
 
 ## 6. Renew the Graph subscription
 
@@ -170,30 +179,17 @@ Use an Azure scheduled Function or equivalent managed job and alert if renewal
 fails. If a subscription expires, create a new one and reconcile the mailbox for
 messages received during the gap.
 
-## 7. Local queue and invoice storage
+## 7. Queue and invoice storage
 
-Accepted events are stored by default in:
+Accepted events, attempts, errors, worker heartbeat, invoice metadata, and
+workflow state are stored in Azure PostgreSQL. Duplicate deliveries are ignored
+using the subscription, resource, and change type. Invoice creation is also
+idempotent on Outlook message ID plus attachment ID. PDFs are stored in
+SharePoint; the worker's local download and SharePoint cache directories are
+temporary processing storage.
 
-```text
-runtime_data/outlook_notifications.db
-```
-
-Duplicate deliveries are ignored using the subscription, resource and change
-type as an idempotency key.
-
-Worker failures are retained with `failed` status, attempt count, and the most
-recent error rather than being discarded. Successful PDF records are stored by
-default in:
-
-```text
-runtime_data/invoices.db
-```
-
-The invoice table is idempotent on Outlook message ID plus attachment ID, so a
-duplicate Graph delivery does not create a duplicate invoice.
-
-SQLite is for local development only. Production should use Azure SQL with Azure
-Service Bus or Storage Queue before processing live invoices.
+Admin shows worker health and queue counts and permits an authorised retry of a
+failed queue item. A retry reuses the idempotency keys.
 
 ## 8. Test the complete email-to-screen flow
 
@@ -216,29 +212,27 @@ After tenant approval:
 7. Select the received invoice and confirm its sender, subject, received time,
    filename, and PDF are displayed.
 
-If the invoice does not appear, inspect the local queues without exposing email
-contents:
+If the invoice does not appear, inspect the Admin worker panel and application
+logs without exposing email contents. A database administrator can also inspect:
 
-```bash
-sqlite3 runtime_data/outlook_notifications.db \
-  "select id,message_id,status,attempts,last_error from outlook_notifications order by id desc limit 10;"
+```sql
+SELECT id, message_id, status, attempts, last_error
+FROM outlook_notifications ORDER BY id DESC LIMIT 10;
 
-sqlite3 runtime_data/invoices.db \
-  "select id,message_id,original_filename,status from invoices order by id desc limit 10;"
+SELECT id, message_id, original_filename, status
+FROM invoices ORDER BY id DESC LIMIT 10;
 ```
 
 An email without a PDF or a Graph download error is retained as `failed` with
 `last_error`. It is not silently discarded.
 
-## 9. Next production step
+## 9. Remaining production work
 
-After read-only access is proven:
-
-1. Replace local SQLite and filesystem storage with managed production services.
-2. Save each PDF to SharePoint Incoming Invoices.
-3. Send each PDF to the approved extraction API.
-4. Store and display the structured extraction result.
-5. Add retry policy, monitoring, alerts, and an authenticated exception screen.
+PostgreSQL persistence, SharePoint storage, extraction review, retry handling,
+and worker visibility are implemented. Remaining deployment work is to select
+and validate the production extraction model, deploy the web app and worker
+under process supervision, automate subscription renewal, and connect
+production alert delivery.
 
 Do not use an LLM or MCP tool call as the event trigger itself. Keep triggering,
 idempotency, retries, and audit handling deterministic.

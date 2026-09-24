@@ -8,7 +8,7 @@ from app.invoices import InvoiceRecord, InvoiceStore
 # ---------------------------------------------------------------------------
 # Duplicate detection.
 #
-# GENERAL_PROCESS.md section 7 ("Check for Duplicates") defines the
+# GENERAL_PROCESS.md defines the
 # suggested key as Company + Supplier + Supplier Invoice Number, with
 # invoice value and date as secondary evidence. A possible duplicate must be
 # placed in "Needs Review"; it must NEVER be automatically deleted or

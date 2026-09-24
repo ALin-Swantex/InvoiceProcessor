@@ -42,6 +42,7 @@ from app.entra_auth import (
     entra_auth_client_from_environment,
 )
 from app.company_folders import (
+    FLAGGED_INVOICES_FOLDER,
     INCOMING_INVOICES_FOLDER,
     REJECTED_INVOICES_FOLDER,
     CompanyFolderStructure,
@@ -52,7 +53,7 @@ from app.config_db import (
     SQLiteProcessConfigurationStore,
     configuration_backend,
 )
-from app.environment import load_project_environment
+from app.environment import load_project_environment, project_path_from_environment
 from app.invoice_lifecycle import (
     InvoiceExtractionUnavailableError,
     InvoiceLifecycle,
@@ -133,6 +134,7 @@ class InvoiceConfirmRequest(BaseModel):
     invoice_value: float | None = None
     currency: str | None = "GBP"
     override_duplicate: bool = False
+    correction_reason: str | None = None
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -270,31 +272,11 @@ class IrjConfigurationUpdateRequest(BaseModel):
 
 
 def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore:
-    """Choose the invoice metadata store backend.
+    """Build the application's authoritative PostgreSQL invoice store."""
+    del invoice_db_path
+    from app.postgres_invoices import create_postgres_invoice_store
 
-    Defaults to the local SQLite store (INVOICE_STORE_BACKEND unset or
-    "sqlite") so tests and prototype usage keep working with zero
-    configuration. Set INVOICE_STORE_BACKEND=postgres to persist invoice
-    metadata in Azure Database for PostgreSQL. The legacy sharepoint_list
-    adapter remains available for compatibility.
-    """
-    backend = os.environ.get("INVOICE_STORE_BACKEND", "sqlite").strip().lower()
-    if backend == "sqlite":
-        return InvoiceStore(invoice_db_path)
-    if backend == "postgres":
-        from app.postgres_invoices import create_postgres_invoice_store
-
-        return create_postgres_invoice_store()  # type: ignore[return-value]
-    if backend == "sharepoint_list":
-        from app.sharepoint_invoice_store import (
-            sharepoint_invoice_store_from_environment,
-        )
-
-        return sharepoint_invoice_store_from_environment()  # type: ignore[return-value]
-    raise ValueError(
-        f"Unknown INVOICE_STORE_BACKEND '{backend}'. Expected 'sqlite', "
-        "'postgres', or 'sharepoint_list'."
-    )
+    return create_postgres_invoice_store()  # type: ignore[return-value]
 
 
 def _company_response(profile: CompanyProfile) -> dict[str, object]:
@@ -323,16 +305,19 @@ def create_app(
     auto_configure_sharepoint: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="Invoice Intake Prototype", version="0.1.0")
-    app.state.notification_store = notification_store or OutlookNotificationStore(
-        Path(
-            os.environ.get(
-                "OUTLOOK_WEBHOOK_DB_PATH",
-                "runtime_data/outlook_notifications.db",
-            )
-        )
+    if notification_store is None:
+        from app.postgres_notifications import PostgresOutlookNotificationStore
+        from app.postgres_monitoring import PostgresWorkerMonitor
+
+        app.state.notification_store = PostgresOutlookNotificationStore()
+        app.state.worker_monitor = PostgresWorkerMonitor()
+    else:
+        app.state.notification_store = notification_store
+        app.state.worker_monitor = None
+    invoice_db_path = project_path_from_environment(
+        "INVOICE_DB_PATH", "runtime_data/invoices.db"
     )
-    invoice_db_path = Path(os.environ.get("INVOICE_DB_PATH", "runtime_data/invoices.db"))
-    invoice_store_backend = os.environ.get("INVOICE_STORE_BACKEND", "sqlite").strip().lower()
+    invoice_store_backend = "postgres" if invoice_store is None else "injected"
     app.state.invoice_store = invoice_store or _build_invoice_store_from_environment(
         invoice_db_path
     )
@@ -358,7 +343,7 @@ def create_app(
     irj_db_path = getattr(app.state.invoice_store, "database_path", invoice_db_path)
     if irj_generator is not None:
         app.state.irj_generator = irj_generator
-    elif invoice_store is None and invoice_store_backend == "postgres":
+    elif invoice_store is None:
         from app.postgres_services import PostgresIrjNumberGenerator
 
         app.state.irj_generator = PostgresIrjNumberGenerator()
@@ -366,13 +351,15 @@ def create_app(
         app.state.irj_generator = IrjNumberGenerator(irj_db_path)
     if activity_feed is not None:
         app.state.activity_feed = activity_feed
-    elif invoice_store is None and invoice_store_backend == "postgres":
+    elif invoice_store is None:
         from app.postgres_services import PostgresActivityFeedStore
 
         app.state.activity_feed = PostgresActivityFeedStore()
     else:
         app.state.activity_feed = ActivityFeedStore(
-            Path(os.environ.get("ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"))
+            project_path_from_environment(
+                "ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"
+            )
         )
     app.state.sharepoint_folder_paths = None
     app.state.sharepoint_company_structures = None
@@ -385,10 +372,8 @@ def create_app(
     app.state.local_login_enabled = os.environ.get(
         "AUTH_LOCAL_LOGIN_ENABLED", "false"
     ).strip().casefold() in {"1", "true", "yes", "on"}
-    config_store_backend = configuration_backend(invoice_store_backend)
     use_postgres_config = (
         invoice_store is None
-        and config_store_backend == "postgres"
         and companies_store is None
         and suppliers_store is None
         and approval_matrix_store is None
@@ -405,8 +390,8 @@ def create_app(
             app.state.process_configuration_store,
         ) = postgres_config_stores()
     else:
-        config_path = Path(
-            os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db")
+        config_path = project_path_from_environment(
+            "CONFIG_DB_PATH", "runtime_data/config.db"
         )
         app.state.companies_store = companies_store or CompanyStore(config_path)
         app.state.suppliers_store = suppliers_store or SupplierStore(config_path)
@@ -1378,6 +1363,18 @@ def create_app(
                       <label style="grid-column: 1 / -1">Review warnings
                         <textarea id="review-warnings" disabled placeholder="Missing, uncertain, or conflicting fields will be shown here."></textarea>
                       </label>
+                      <label>Extraction model
+                        <input id="extraction-model" disabled placeholder="Not recorded">
+                      </label>
+                      <label>Prompt / extraction version
+                        <input id="extraction-prompt-version" disabled placeholder="Not recorded">
+                      </label>
+                      <label style="grid-column: 1 / -1">Routing explanation
+                        <textarea id="routing-explanation" disabled placeholder="The routing decision will be shown here."></textarea>
+                      </label>
+                      <label style="grid-column: 1 / -1">Correction reason
+                        <textarea id="correction-reason" placeholder="Describe why any extracted values were changed (optional)."></textarea>
+                      </label>
                     </div>
 
                     <div class="notice" id="duplicate-warning" style="display: none; background: #fef2f2; border-color: #f5b5b5; color: #9b1c1c;">
@@ -1541,7 +1538,7 @@ def create_app(
               <section class="card">
                 <div class="content" id="admin-panel">
                   <details class="admin-block admin-collapsible" id="admin-bi-metrics">
-                    <summary>Power BI metrics</summary>
+                    <summary>Reporting metrics</summary>
                     <div class="admin-collapsible-content">
                       <div class="metrics-toolbar">
                         <label>Invoice volume interval
@@ -1554,6 +1551,16 @@ def create_app(
                       </div>
                       <div id="metrics-dashboard" class="empty-state">
                         Open this section to load metrics.
+                      </div>
+                    </div>
+                  </details>
+
+                  <details class="admin-block admin-collapsible" id="admin-operations">
+                    <summary>Worker and production monitoring</summary>
+                    <div class="admin-collapsible-content">
+                      <button type="button" id="refresh-operations" class="secondary">Refresh status</button>
+                      <div id="operations-dashboard" class="empty-state">
+                        Open this section to load worker and queue status.
                       </div>
                     </div>
                   </details>
@@ -1636,6 +1643,17 @@ def create_app(
 
                   <div class="admin-block">
                     <h3>Approval matrix</h3>
+                    <div class="metrics-toolbar">
+                      <label>Filter routes
+                        <input id="admin-matrix-filter" placeholder="Company, supplier or approver">
+                      </label>
+                      <label>Show
+                        <select id="admin-matrix-email-filter">
+                          <option value="all">All routes</option>
+                          <option value="missing">Missing approver email</option>
+                        </select>
+                      </label>
+                    </div>
                     <form class="admin-form" id="admin-matrix-form">
                       <select id="admin-matrix-company" required>
                         <option value="">Select invoice company…</option>
@@ -1645,10 +1663,10 @@ def create_app(
                         <option value="">Select supplier company…</option>
                       </select>
                       <input id="admin-matrix-approver1-name" placeholder="Approver 1 name" required>
-                      <input id="admin-matrix-approver1-email" placeholder="Approver 1 email" required>
+                      <input id="admin-matrix-approver1-email" type="email" placeholder="Approver 1 email" required>
                       <input id="admin-matrix-approver2-name" placeholder="Approver 2 name (optional)">
-                      <input id="admin-matrix-approver2-email" placeholder="Approver 2 email (optional)">
-                      <button type="submit" class="primary">Add entry</button>
+                      <input id="admin-matrix-approver2-email" type="email" placeholder="Approver 2 email (optional)">
+                      <button type="submit" class="primary">Save entry</button>
                     </form>
                     <div id="admin-matrix-table"></div>
                   </div>
@@ -1721,6 +1739,7 @@ def create_app(
             let adminSuppliers = [];
             let adminMatrix = [];
             let adminSupplierTerms = [];
+            let adminMatrixFilterTimer = null;
             let irjConfigurations = new Map();
             let supplierRequestSequence = 0;
             let invoiceRefreshSequence = 0;
@@ -1780,6 +1799,30 @@ def create_app(
               if (el) el.value = value || "";
             }
 
+            function applyPreviewConfidence(invoice) {
+              const confidences = fieldConfidences(invoice);
+              const fields = {
+                "preview-company": "company",
+                "preview-supplier": "supplier",
+                "preview-supplier-invoice": "supplier_invoice_number",
+                "preview-po": "purchase_order_number",
+                "preview-invoice-date": "invoice_date",
+                "preview-value": "invoice_value",
+                "preview-currency": "currency",
+              };
+              for (const [elementId, fieldName] of Object.entries(fields)) {
+                const element = document.getElementById(elementId);
+                if (!element) continue;
+                const confidence = confidences[fieldName];
+                element.title = confidence == null
+                  ? "No field confidence was recorded."
+                  : `AI confidence: ${Math.round(Number(confidence) * 100)}%`;
+                element.style.outline = confidence != null && Number(confidence) < 0.8
+                  ? "2px solid #d97706"
+                  : "";
+              }
+            }
+
             function showToast(message, isError) {
               const toast = document.createElement("div");
               toast.className = "toast" + (isError ? " error" : "");
@@ -1807,6 +1850,9 @@ def create_app(
                 "review-warnings",
                 invoice.ai_review_warnings || invoice.review_reason
               );
+              setValue("extraction-model", invoice.extraction_model);
+              setValue("extraction-prompt-version", invoice.extraction_prompt_version);
+              setValue("routing-explanation", invoice.routing_explanation);
               const duplicateWarning = document.getElementById("duplicate-warning");
               const overrideButton = document.getElementById("override-duplicate-button");
               const cancelDuplicateButton = document.getElementById("cancel-duplicate-button");
@@ -1853,6 +1899,8 @@ def create_app(
                 setValue("preview-invoice-date", invoice.invoice_date);
                 setValue("preview-value", invoice.invoice_value);
                 setValue("preview-currency", invoice.currency || "GBP");
+                setValue("correction-reason", invoice.correction_reason);
+                applyPreviewConfidence(invoice);
                 pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
               }
               pdfFrame.style.display = "block";
@@ -1883,6 +1931,10 @@ def create_app(
                 "ai-confidence",
                 "preview-irj",
                 "review-warnings",
+                "extraction-model",
+                "extraction-prompt-version",
+                "routing-explanation",
+                "correction-reason",
                 "preview-company",
                 "preview-supplier-invoice",
                 "preview-po",
@@ -2292,6 +2344,20 @@ def create_app(
               }).join("")}</div>`;
             }
 
+            function correctionFeedbackHtml(invoice) {
+              if (!invoice.corrected_fields_json) return "";
+              try {
+                const corrections = JSON.parse(invoice.corrected_fields_json);
+                const rows = Object.entries(corrections).map(([field, values]) =>
+                  `<div class="analysis-history-item"><strong>${escapeHtml(field.replaceAll("_", " "))}</strong>` +
+                  `${analysisValue(values.original)} → ${analysisValue(values.corrected)}</div>`
+                ).join("");
+                return `<h4>Human correction feedback</h4><div class="analysis-history">${rows}</div>`;
+              } catch (error) {
+                return "";
+              }
+            }
+
             function invoiceAnalysisHtml(invoice) {
               const confidences = fieldConfidences(invoice);
               const overallConfidence = invoice.ai_confidence === null ||
@@ -2321,6 +2387,9 @@ def create_app(
                       ${analysisField("IRJ number", invoice.irj_number)}
                       ${analysisField("Invoice type", invoice.invoice_type)}
                       ${analysisField("Overall confidence", overallConfidence)}
+                      ${analysisField("Extraction model", invoice.extraction_model)}
+                      ${analysisField("Extraction version", invoice.extraction_prompt_version)}
+                      ${analysisField("Routing explanation", invoice.routing_explanation)}
                     </dl>
                     <h4>Extracted fields</h4>
                     <dl class="invoice-analysis-list">
@@ -2332,6 +2401,12 @@ def create_app(
                       ${analysisField("Invoice value", invoice.invoice_value, confidences.invoice_value)}
                       ${analysisField("Currency", invoice.currency, confidences.currency)}
                     </dl>
+                    ${correctionFeedbackHtml(invoice)}
+                    ${invoice.reviewed_by ? `<dl class="invoice-analysis-list">
+                      ${analysisField("Reviewed by", invoice.reviewed_by)}
+                      ${analysisField("Reviewed at", formatUkTimestamp(invoice.reviewed_at))}
+                      ${analysisField("Correction reason", invoice.correction_reason)}
+                    </dl>` : ""}
                     <h4>Source</h4>
                     <dl class="invoice-analysis-list">
                       ${analysisField("Filename", invoice.original_filename)}
@@ -2709,6 +2784,80 @@ def create_app(
               }
             }
 
+            function operationsQueueTable(items, status) {
+              if (!items.length) return '<div class="empty-state">None.</div>';
+              return '<table class="section-table"><thead><tr>' +
+                '<th>Received</th><th>Message</th><th>Attempts</th><th>Error</th><th></th>' +
+                '</tr></thead><tbody>' + items.map(item => `<tr>` +
+                  `<td>${escapeHtml(formatUkTimestamp(item.received_at))}</td>` +
+                  `<td title="${escapeHtml(item.message_id)}">${escapeHtml(item.message_id)}</td>` +
+                  `<td>${escapeHtml(item.attempts)}</td>` +
+                  `<td>${escapeHtml(item.last_error || "—")}</td>` +
+                  `<td>${status === "failed" ? `<button type="button" class="secondary" ` +
+                    `data-retry-notification="${item.id}">Retry</button>` : ""}</td>` +
+                  `</tr>`).join("") + '</tbody></table>';
+            }
+
+            async function loadOperations() {
+              const dashboard = document.getElementById("operations-dashboard");
+              dashboard.className = "empty-state";
+              dashboard.textContent = "Loading worker and queue status…";
+              try {
+                const operations = await fetchAdminJson("/api/admin/operations");
+                const worker = operations.worker;
+                const workerStatus = worker
+                  ? `${worker.status} · last seen ${formatUkTimestamp(worker.last_seen_at)} ` +
+                    `(${worker.age_seconds}s ago)`
+                  : "No heartbeat recorded";
+                dashboard.className = "metrics-grid";
+                dashboard.innerHTML = `
+                  <section class="metric-panel wide">
+                    <h4>Outlook invoice worker</h4>
+                    <p><strong>${escapeHtml(workerStatus)}</strong></p>
+                    ${worker && worker.last_success_at
+                      ? `<p>Last successful cycle: ${escapeHtml(formatUkTimestamp(worker.last_success_at))}</p>`
+                      : ""}
+                    ${worker && worker.last_error
+                      ? `<p class="admin-help">Last error: ${escapeHtml(worker.last_error)}</p>`
+                      : ""}
+                    ${operations.alerts.length
+                      ? `<ul>${operations.alerts.map(alert => `<li>${escapeHtml(alert)}</li>`).join("")}</ul>`
+                      : '<p>No active monitoring alerts.</p>'}
+                  </section>
+                  <section class="metric-panel wide">
+                    <h4>Failed queue items (${operations.queue.failed.length})</h4>
+                    ${operationsQueueTable(operations.queue.failed, "failed")}
+                  </section>
+                  <section class="metric-panel">
+                    <h4>Pending (${operations.queue.pending.length})</h4>
+                    ${operationsQueueTable(operations.queue.pending, "pending")}
+                  </section>
+                  <section class="metric-panel">
+                    <h4>Processing (${operations.queue.processing.length})</h4>
+                    ${operationsQueueTable(operations.queue.processing, "processing")}
+                  </section>`;
+                dashboard.querySelectorAll("[data-retry-notification]").forEach(button => {
+                  button.addEventListener("click", async () => {
+                    button.disabled = true;
+                    try {
+                      await postJson(
+                        `/api/admin/outlook-queue/${button.dataset.retryNotification}/retry`,
+                        {}
+                      );
+                      showToast("Queue item returned to pending.");
+                      await loadOperations();
+                    } catch (error) {
+                      button.disabled = false;
+                      showToast(error.message, true);
+                    }
+                  });
+                });
+              } catch (error) {
+                dashboard.className = "empty-state";
+                dashboard.textContent = error.message;
+              }
+            }
+
             function renderAllSections() {
               renderSectionTable(
                 "needs-review-table",
@@ -2865,6 +3014,18 @@ def create_app(
               } catch {
                 return { detail: text };
               }
+            }
+
+            async function fetchAdminJson(url) {
+              const response = await fetch(url);
+              const body = await readResponseBody(response);
+              if (!response.ok) {
+                const detail = body.detail;
+                const message = typeof detail === "string" && detail !== "Internal Server Error"
+                  ? `: ${detail}` : "";
+                throw new Error(`${url} failed (HTTP ${response.status})${message}`);
+              }
+              return body;
             }
 
             async function sendJson(url, method, body) {
@@ -3184,6 +3345,7 @@ def create_app(
                   : null,
                 currency: document.getElementById("preview-currency").value || "GBP",
                 override_duplicate: overrideDuplicate,
+                correction_reason: document.getElementById("correction-reason").value || null,
               };
               try {
                 await postJson(`/api/invoices/${invoiceId}/confirm`, body);
@@ -3667,18 +3829,30 @@ def create_app(
             async function loadAdminPanel() {
               try {
                 const [companies, suppliers, matrix, supplierTerms, threshold, irjSettings] = await Promise.all([
-                  fetch("/api/admin/companies").then(r => r.json()),
-                  fetch("/api/admin/suppliers").then(r => r.json()),
-                  fetch("/api/admin/approval-matrix").then(r => r.json()),
-                  fetch("/api/admin/supplier-terms").then(r => r.json()),
-                  fetch("/api/admin/ai-threshold").then(r => r.json()),
-                  fetch("/api/irj-configurations").then(r => r.json()),
+                  fetchAdminJson("/api/admin/companies"),
+                  fetchAdminJson("/api/admin/suppliers"),
+                  fetchAdminJson("/api/admin/approval-matrix"),
+                  fetchAdminJson("/api/admin/supplier-terms"),
+                  fetchAdminJson("/api/admin/ai-threshold"),
+                  fetchAdminJson("/api/irj-configurations"),
                 ]);
                 adminCompanies = companies;
                 adminSuppliers = suppliers;
                 adminMatrix = matrix;
                 adminSupplierTerms = supplierTerms;
                 loadAdminReferenceOptions(companies, suppliers);
+                const matrixQuery = document.getElementById("admin-matrix-filter")
+                  .value.trim().toLowerCase();
+                const matrixEmailFilter = document.getElementById("admin-matrix-email-filter").value;
+                const visibleMatrix = matrix.filter(entry => {
+                  const searchText = [entry.company, entry.supplier, entry.approver1_name,
+                    entry.approver1_email, entry.approver2_name, entry.approver2_email]
+                    .filter(Boolean).join(" ").toLowerCase();
+                  const missingEmail = !entry.approver1_email ||
+                    (entry.approver2_name && !entry.approver2_email);
+                  return (!matrixQuery || searchText.includes(matrixQuery)) &&
+                    (matrixEmailFilter !== "missing" || missingEmail);
+                });
                 renderSimpleTable(
                   document.getElementById("admin-companies-table"),
                   [
@@ -3894,21 +4068,21 @@ def create_app(
                 );
                 renderCompanyGroupedTables(
                   document.getElementById("admin-matrix-table"),
-                  rowsGroupedByCompany(matrix),
+                  rowsGroupedByCompany(visibleMatrix),
                   [
                     { label: "Supplier company", value: m => m.supplier },
                     {
                       label: "Approver 1",
                       value: m => m.approver1_email
                         ? `${m.approver1_name} <${m.approver1_email}>`
-                        : m.approver1_name,
+                        : `${m.approver1_name} — missing email`,
                     },
                     {
                       label: "Approver 2",
                       value: m => m.approver2_name
                         ? (m.approver2_email
                           ? `${m.approver2_name} <${m.approver2_email}>`
-                          : m.approver2_name)
+                          : `${m.approver2_name} — missing email`)
                         : "—",
                     },
                   ],
@@ -4323,6 +4497,30 @@ def create_app(
               }
             );
 
+            document.getElementById("admin-operations").addEventListener(
+              "toggle",
+              event => {
+                if (event.target.open) loadOperations();
+              }
+            );
+            document.getElementById("refresh-operations").addEventListener(
+              "click",
+              loadOperations
+            );
+            document.getElementById("admin-matrix-filter").addEventListener(
+              "input",
+              () => {
+                if (adminMatrixFilterTimer !== null) {
+                  window.clearTimeout(adminMatrixFilterTimer);
+                }
+                adminMatrixFilterTimer = window.setTimeout(loadAdminPanel, 250);
+              }
+            );
+            document.getElementById("admin-matrix-email-filter").addEventListener(
+              "change",
+              loadAdminPanel
+            );
+
             document.getElementById("admin-companies-config").addEventListener(
               "toggle",
               event => {
@@ -4462,8 +4660,29 @@ def create_app(
         }
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "mode": "outlook-intake"}
+    def health() -> dict[str, object]:
+        if app.state.worker_monitor is None:
+            return {"status": "ok", "mode": "outlook-intake"}
+        try:
+            app.state.invoice_store.list(1)
+            worker = app.state.worker_monitor.status()
+        except Exception as error:
+            logger.exception("Health check failed")
+            return {
+                "status": "unhealthy",
+                "mode": "outlook-intake",
+                "database": "unavailable",
+                "detail": type(error).__name__,
+            }
+        stale_after = int(os.environ.get("WORKER_STALE_AFTER_SECONDS", "120"))
+        worker_stale = worker is None or int(worker["age_seconds"]) > stale_after
+        return {
+            "status": "degraded" if worker_stale else "ok",
+            "mode": "outlook-intake",
+            "database": "ok",
+            "worker": "stale" if worker_stale else str(worker["status"]),
+            "worker_last_seen_at": worker["last_seen_at"] if worker else None,
+        }
 
     def _irj_configuration(company: CompanyProfile) -> dict[str, object]:
         default_mode = (
@@ -5017,6 +5236,8 @@ def create_app(
                 invoice_value=request.invoice_value,
                 currency=request.currency,
                 override_duplicate=request.override_duplicate,
+                recorded_by=user.display_name,
+                correction_reason=request.correction_reason,
             )
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -5201,7 +5422,7 @@ def create_app(
     # ------------------------------------------------------------------
     # Admin configuration — Companies, Suppliers, Approval Matrix, AI
     # confidence threshold, and user management. All admin-only (see
-    # SOFTWARE_SPEC.md section 7: config must be maintainable by an
+    # SOFTWARE_SPEC.md: config must be maintainable by an
     # authorised staff member without touching code).
     # ------------------------------------------------------------------
 
@@ -5236,6 +5457,7 @@ def create_app(
             "company_roots": [structure.as_dict() for structure in structures],
             "shared_folders": {
                 "incoming": INCOMING_INVOICES_FOLDER,
+                "flagged": FLAGGED_INVOICES_FOLDER,
                 "rejected": REJECTED_INVOICES_FOLDER,
             },
         }
@@ -5389,7 +5611,14 @@ def create_app(
         request: ApprovalMatrixRequest, user: User = Depends(require_role(ROLE_ADMIN))
     ) -> dict[str, object]:
         try:
-            entry = app.state.approval_matrix_store.create(**request.model_dump())
+            fields = request.model_dump()
+            existing = app.state.approval_matrix_store.find_exact(
+                request.company, request.supplier
+            )
+            if existing is None:
+                entry = app.state.approval_matrix_store.create(**fields)
+            else:
+                entry = app.state.approval_matrix_store.update(existing.id, **fields)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return {
@@ -5452,6 +5681,50 @@ def create_app(
             app.state.supplier_terms_store.list(),
             granularity=granularity,
         )
+
+    @app.get("/api/admin/operations")
+    def admin_operations(
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        del user
+        worker = (
+            app.state.worker_monitor.status()
+            if app.state.worker_monitor is not None
+            else None
+        )
+        queue = {
+            status: [asdict(item) for item in app.state.notification_store.list(
+                status=status, limit=50
+            )]
+            for status in ("pending", "processing", "failed")
+        }
+        stale_after = int(os.environ.get("WORKER_STALE_AFTER_SECONDS", "120"))
+        alerts: list[str] = []
+        if worker is None:
+            alerts.append("The Outlook worker has not reported a heartbeat.")
+        elif int(worker["age_seconds"]) > stale_after:
+            alerts.append(
+                f"The Outlook worker heartbeat is {worker['age_seconds']} seconds old."
+            )
+        if queue["failed"]:
+            alerts.append(f"{len(queue['failed'])} Outlook queue item(s) have failed.")
+        if queue["processing"]:
+            alerts.append(
+                f"{len(queue['processing'])} Outlook queue item(s) are processing."
+            )
+        return {"worker": worker, "queue": queue, "alerts": alerts}
+
+    @app.post("/api/admin/outlook-queue/{notification_id}/retry")
+    def admin_retry_outlook_notification(
+        notification_id: int,
+        user: User = Depends(require_role(ROLE_ADMIN)),
+    ) -> dict[str, object]:
+        del user
+        try:
+            app.state.notification_store.retry_failed(notification_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return {"id": notification_id, "status": "pending"}
 
     @app.put("/api/admin/supplier-terms/{terms_id}")
     def admin_update_supplier_terms(

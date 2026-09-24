@@ -31,6 +31,13 @@ Important behavior:
 - Each configured notification stage sends at most one successful email per
   invoice, including across query/resume loops.
 - IRJ search shows the current status, notes, and chronological audit trail.
+- Purchase Ledger review shows the PDF beside editable extracted fields,
+  highlights low confidence values, records human corrections, and explains
+  the selected workflow route.
+- Documents requiring review are moved from Incoming to the shared SharePoint
+  `Invoices/Flagged Invoices` folder until resolved.
+- The Admin panel shows the Outlook worker heartbeat and queue, supports retry
+  of failed queue items, and highlights approval routes with missing emails.
 - Timestamps are displayed in UK time.
 
 See [INVOICE_WORKFLOW_FLOWCHART.md](INVOICE_WORKFLOW_FLOWCHART.md) for the
@@ -57,10 +64,12 @@ cp .env.example .env
 Configure `.env` with the required Entra, Microsoft Graph, SharePoint, Azure
 PostgreSQL, and Document Intelligence settings. Never commit `.env` or secrets.
 
-Production should use:
+The application runtime uses PostgreSQL for invoices, configuration, sessions,
+activity, IRJ sequences, and the Outlook processing queue:
 
 ```dotenv
 INVOICE_STORE_BACKEND=postgres
+CONFIG_STORE_BACKEND=postgres
 AUTH_LOCAL_LOGIN_ENABLED=false
 AUTH_COOKIE_SECURE=true
 ```
@@ -77,7 +86,39 @@ The deployment identity applying migrations requires schema-change permission.
 The runtime identity should use the narrower grants documented in
 `app/postgres_runtime_grants.sql.template`.
 
+Invoice source, extraction, review, approval, payment, reconciliation, queue,
+session, and configuration metadata are stored in PostgreSQL. The canonical PDF
+remains in SharePoint. For read-only Power BI reporting, see
+[POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md).
+
+The retained compatibility importer is only for upgrading an older local
+installation. It is not part of the application runtime:
+
+```bash
+python3 -m scripts.migrate_sqlite_runtime_to_postgres
+```
+
 ## Run the application
+
+After installing the project, the easiest cross-platform option is:
+
+```bash
+invoice-processor
+```
+
+This opens a small desktop launcher on Windows, macOS, and Linux. Its **Start**
+button starts both the web application and Outlook worker, **Open web app**
+opens the browser, and closing it stops both processes. For a server without a
+desktop environment, use `invoice-processor --headless --open-browser`.
+
+The launcher is installed by the existing setup command:
+
+```bash
+python3 -m pip install -e '.[azure,test]'
+```
+
+You can still run the services separately when diagnosing an individual
+component:
 
 Run the web application and worker in separate terminals from the repository
 root.
@@ -120,7 +161,9 @@ source .venv/bin/activate
 pytest -q
 ```
 
-The current suite contains 181 passing tests.
+The suite uses local and mocked services; passing tests do not establish live
+Azure connectivity. Run `python -m scripts.check_live_azure` for read-only
+PostgreSQL, Outlook, SharePoint, and Document Intelligence smoke checks.
 
 ## Authentication and roles
 
@@ -158,7 +201,9 @@ approval recipient has no email.
 - Back up PostgreSQL according to the required retention policy.
 - Apply migrations before deploying application code that uses new tables.
 - Use a public HTTPS endpoint for Microsoft Graph webhooks; local polling can be
-  enabled for development.
+  enabled for development. Local polling starts at midnight today in UK time by
+  default, and PostgreSQL prevents a restart from queueing the same message
+  twice.
 
 Webhook subscription commands:
 
@@ -169,9 +214,15 @@ python3 -m app.outlook_subscription renew "$OUTLOOK_SUBSCRIPTION_ID"
 
 ## Reference documents
 
-- [SOFTWARE_SPEC.md](SOFTWARE_SPEC.md) — original requirements and decisions
-- [GENERAL_PROCESS.md](GENERAL_PROCESS.md) — detailed process and business rules
+- [SOFTWARE_SPEC.md](SOFTWARE_SPEC.md) — current requirements, architecture,
+  delivery status, and remaining work
+- [GENERAL_PROCESS.md](GENERAL_PROCESS.md) — current business process and
+  operational rules
 - [INVOICE_WORKFLOW_FLOWCHART.md](INVOICE_WORKFLOW_FLOWCHART.md) — current
   workflow and implementation mapping
 - [OUTLOOK_MCP_SETUP.md](OUTLOOK_MCP_SETUP.md) — Microsoft Graph mailbox and
   webhook configuration
+- [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md) — reporting views and
+  Power BI connection instructions
+- [USER_ACCEPTANCE_TEST_CASES.md](USER_ACCEPTANCE_TEST_CASES.md) — pilot test
+  checklist and release criteria

@@ -561,6 +561,7 @@ class FakeSharePointClient:
         return [
             "Invoices",
             "Invoices/Incoming Invoices",
+            "Invoices/Flagged Invoices",
             "Invoices/Rejected Invoices",
             *structure.as_dict().values(),
         ]
@@ -596,6 +597,7 @@ def test_admin_can_load_sharepoint_folder_options(tmp_path) -> None:
     )
     assert body["shared_folders"] == {
         "incoming": "Invoices/Incoming Invoices",
+        "flagged": "Invoices/Flagged Invoices",
         "rejected": "Invoices/Rejected Invoices",
     }
     valid_company = client.post(
@@ -666,6 +668,7 @@ def test_discovers_all_verified_company_folder_structures() -> None:
     folders = [
         "Invoices",
         "Invoices/Incoming Invoices",
+        "Invoices/Flagged Invoices",
         "Invoices/Rejected Invoices",
     ]
     for code in company_codes:

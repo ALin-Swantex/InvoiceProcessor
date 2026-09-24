@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 from typing import Callable
@@ -24,6 +25,7 @@ from app.approval_matrix import find_approvers as _default_find_approvers
 from app.companies import CompanyStore
 from app.companies import get_company as _default_get_company
 from app.company_folders import (
+    FLAGGED_INVOICES_FOLDER,
     REJECTED_INVOICES_FOLDER,
     CompanyFolderStructure,
     statement_company_folder,
@@ -40,7 +42,13 @@ from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
 from app.suppliers import get_supplier as _default_get_supplier
-from app.workflow import ConfirmedInvoice, RoutingValidationError, route_confirmed_invoice
+from app.workflow import (
+    ConfirmedInvoice,
+    RoutingValidationError,
+    clean_invoice_filename,
+    prefixed_invoice_filename,
+    route_confirmed_invoice,
+)
 
 
 class InvoiceLifecycleError(ValueError):
@@ -179,7 +187,7 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError(
                 "AI extraction may only run while an invoice is awaiting extraction."
             )
-        # SOFTWARE_SPEC.md section 13 ("Exceptions and Errors") lists "the
+        # SOFTWARE_SPEC.md exception rules list "the
         # PDF cannot be read" as a scenario the system must handle sensibly
         # rather than crash on. Once real AI extraction (Azure Document
         # Intelligence) is wired into run_ai_extraction, a corrupt/unreadable
@@ -209,6 +217,7 @@ class InvoiceLifecycle:
             )
             raise InvoiceExtractionUnavailableError(str(error)) from error
         except Exception as error:
+            self._move_to_flagged(invoice)
             record = self.invoice_store.update_fields(
                 invoice_id,
                 status="Needs Review",
@@ -287,20 +296,30 @@ class InvoiceLifecycle:
                 )
 
         invoice_type = "po" if result.purchase_order_number else "nominal"
-        if company_profile is not None:
-            structure = CompanyFolderStructure.from_root(
-                company_profile.sharepoint_root_folder
-            )
-            review_folder = (
-                structure.po_on_hold
-                if invoice_type == "po"
-                else structure.nominal_on_hold
-            )
-            self._move_pdf_in_sharepoint(
-                invoice,
-                review_folder,
-                self._filed_filename(invoice),
-            )
+        extracted_fields = {
+            "company": company,
+            "supplier": supplier,
+            "supplier_invoice_number": result.supplier_invoice_number,
+            "po_number": result.purchase_order_number,
+            "invoice_date": result.invoice_date,
+            "invoice_value": result.invoice_value,
+            "currency": result.currency,
+        }
+        extraction_metadata = {
+            "extraction_model": os.environ.get(
+                "INVOICE_EXTRACTION_MODEL",
+                os.environ.get(
+                    "AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID", "prebuilt-invoice"
+                ),
+            ),
+            "extraction_prompt_version": os.environ.get(
+                "INVOICE_EXTRACTION_PROMPT_VERSION", "v1"
+            ),
+            "extracted_fields_json": json.dumps(
+                extracted_fields, sort_keys=True, separators=(",", ":")
+            ),
+        }
+        self._move_to_flagged(invoice)
 
         if result.needs_review or warnings:
             warning_text = "\n".join(warnings)
@@ -328,6 +347,11 @@ class InvoiceLifecycle:
                 ),
                 review_return_status=None,
                 review_reason=warning_text or "Purchase Ledger must confirm invoice details.",
+                routing_explanation=(
+                    "Automatic routing paused because extraction validation "
+                    "produced review warnings."
+                ),
+                **extraction_metadata,
             )
             self.activity_feed.add_event(
                 event_type=(
@@ -371,6 +395,11 @@ class InvoiceLifecycle:
             duplicate_of_invoice_id=None,
             review_return_status=None,
             review_reason="Awaiting Purchase Ledger confirmation.",
+            routing_explanation=(
+                f"AI suggested the {'PO Matching' if result.purchase_order_number else 'nominal'} "
+                "route; Purchase Ledger confirmation is required before filing."
+            ),
+            **extraction_metadata,
         )
 
     # ------------------------------------------------------------------
@@ -389,6 +418,8 @@ class InvoiceLifecycle:
         invoice_value: float | None,
         currency: str | None,
         override_duplicate: bool = False,
+        recorded_by: str = "Purchase Ledger",
+        correction_reason: str | None = None,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
         if invoice.document_type != "invoice":
@@ -403,6 +434,44 @@ class InvoiceLifecycle:
                 "(or the production Companies SharePoint List) first."
             )
         supplier_profile = self._get_supplier(supplier)
+        submitted_fields = {
+            "company": company,
+            "supplier": supplier,
+            "supplier_invoice_number": supplier_invoice_number,
+            "po_number": purchase_order_number or None,
+            "invoice_date": invoice_date,
+            "invoice_value": invoice_value,
+            "currency": currency,
+        }
+        original_fields: dict[str, object] = {}
+        if invoice.extracted_fields_json:
+            try:
+                parsed = json.loads(invoice.extracted_fields_json)
+                if isinstance(parsed, dict):
+                    original_fields = parsed
+            except json.JSONDecodeError:
+                original_fields = {}
+        corrected_fields = {
+            key: {"original": original_fields.get(key), "corrected": value}
+            for key, value in submitted_fields.items()
+            if original_fields and original_fields.get(key) != value
+        }
+        review_metadata: dict[str, object] = {
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+            "reviewed_by": recorded_by,
+            "corrected_fields_json": (
+                json.dumps(corrected_fields, sort_keys=True, separators=(",", ":"))
+                if corrected_fields
+                else None
+            ),
+            "correction_reason": (
+                correction_reason.strip()
+                if correction_reason and correction_reason.strip()
+                else "Purchase Ledger corrected extracted invoice fields."
+                if corrected_fields
+                else None
+            ),
+        }
         number_warnings = invoice_number_warnings(
             supplier_invoice_number,
             supplier=supplier,
@@ -430,6 +499,7 @@ class InvoiceLifecycle:
                 supplier_invoice_number=supplier_invoice_number,
             )
             if duplicate is not None:
+                self._move_to_flagged(invoice)
                 record = self.invoice_store.update_fields(
                     invoice_id,
                     company=company,
@@ -450,6 +520,11 @@ class InvoiceLifecycle:
                         "confirm this is a genuinely separate invoice before it "
                         "can be routed."
                     ),
+                    routing_explanation=(
+                        "Routing paused because the company, supplier and invoice "
+                        "number match an existing invoice."
+                    ),
+                    **review_metadata,
                 )
                 self.activity_feed.add_event(
                     event_type="possible_duplicate",
@@ -504,6 +579,7 @@ class InvoiceLifecycle:
             "irj_number": irj_number,
             "duplicate_of_invoice_id": None,
             "review_return_status": None,
+            **review_metadata,
         }
 
         if decision.route == "purchase_order":
@@ -513,6 +589,10 @@ class InvoiceLifecycle:
                 invoice_type="po",
                 status=decision.status,
                 review_reason=None,
+                routing_explanation=(
+                    f"PO number {purchase_order_number} was confirmed by "
+                    f"{recorded_by}; routed to PO Matching."
+                ),
             )
             self._send_stage_email_once(
                 invoice_id,
@@ -545,6 +625,10 @@ class InvoiceLifecycle:
             invoice_type="nominal",
             status="Awaiting Sage Registration",
             review_reason=None,
+            routing_explanation=(
+                f"No PO number was confirmed by {recorded_by}; routed as a "
+                "nominal invoice to Sage Registration."
+            ),
         )
         self.activity_feed.add_event(
             event_type="sage_registration_pending",
@@ -740,6 +824,7 @@ class InvoiceLifecycle:
                     f"{', '.join(missing_recipients)}."
                 )
         if missing_route_detail is not None:
+            self._move_to_flagged(invoice)
             record = self.invoice_store.update_fields(
                 invoice_id,
                 status="Needs Review",
@@ -1076,7 +1161,7 @@ class InvoiceLifecycle:
             self._filed_filename(invoice),
         )
         record = commit_decision(**fields)
-        # SOFTWARE_SPEC.md section 9: "Once fully approved... The Purchase
+        # SOFTWARE_SPEC.md: "Once fully approved... The Purchase
         # Ledger team should receive an email notification where
         # appropriate." Purchase Ledger isn't the one clicking approve here
         # (an approver is), so -- unlike the PO-matched branch above, where
@@ -1241,6 +1326,7 @@ class InvoiceLifecycle:
             )
         if not reason.strip():
             raise InvoiceLifecycleError("A review reason is required.")
+        self._move_to_flagged(invoice)
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Needs Review",
@@ -1271,10 +1357,11 @@ class InvoiceLifecycle:
             )
         return_status = invoice.review_return_status
         if accepted:
-            if return_status == "Awaiting PO Matching":
+            destination = self._folder_for_status(invoice, return_status)
+            if destination is not None:
                 self._move_pdf_in_sharepoint(
                     invoice,
-                    self._company_folders(invoice).po_match,
+                    destination,
                     self._filed_filename(invoice),
                 )
             record = self.invoice_store.update_fields(
@@ -1452,7 +1539,7 @@ class InvoiceLifecycle:
             self._company_folders(invoice).paid,
             self._filed_filename(invoice),
         )
-        # SOFTWARE_SPEC.md section 10: "Doing this should automatically:
+        # SOFTWARE_SPEC.md: "Doing this should automatically:
         # Record who marked the invoice as paid".
         record = self.invoice_store.update_fields(
             invoice_id,
@@ -1580,7 +1667,7 @@ class InvoiceLifecycle:
             self._company_folders(invoice).reconciled,
             self._filed_filename(invoice),
         )
-        # SOFTWARE_SPEC.md section 11: "The system should record: ...Who
+        # SOFTWARE_SPEC.md: "The system should record: ...Who
         # completed the reconciliation, where practical".
         # reconciliation_date is the date Purchase Ledger says the payment
         # appears on the bank statement; reconciled_at is the system
@@ -1665,6 +1752,7 @@ class InvoiceLifecycle:
         document: InvoiceRecord,
         classification: DocumentClassification,
     ) -> InvoiceRecord:
+        self._move_to_flagged(document)
         record = self.invoice_store.update_fields(
             document.id,
             document_type="statement",
@@ -1688,6 +1776,51 @@ class InvoiceLifecycle:
             invoice_id=document.id,
         )
         return record
+
+    def _move_to_flagged(self, invoice: InvoiceRecord) -> None:
+        destination = FLAGGED_INVOICES_FOLDER
+        if self.sharepoint_client is not None:
+            destination = getattr(
+                getattr(self.sharepoint_client, "settings", None),
+                "flagged_folder",
+                destination,
+            )
+        self._move_pdf_in_sharepoint(
+            invoice,
+            destination,
+            self._filed_filename(invoice),
+        )
+
+    def _folder_for_status(
+        self, invoice: InvoiceRecord, status: str
+    ) -> str | None:
+        if status == "Awaiting AI Extraction":
+            if self.sharepoint_client is None:
+                return None
+            return self.sharepoint_client.settings.incoming_folder
+        structure = self._company_folders(invoice)
+        destinations = {
+            "Awaiting Nominal Processing": structure.nominal_invoices,
+            "Awaiting PO Matching": structure.po_match,
+            "PO Query / Matching Issue": structure.po_match,
+            "Awaiting Approval 1": structure.nominal_approver_1,
+            "Awaiting Approval 2": structure.nominal_approver_2,
+            "Approval 1 Query / On Hold": structure.nominal_on_hold,
+            "Approval 2 Query / On Hold": structure.nominal_on_hold,
+            "Approved": structure.approved_for_payment,
+            "Approved for Payment - BACS": structure.approved_bacs,
+            "Approved for Payment - Bankline": structure.approved_bankline,
+            "Approved for Payment - Foreign POA": structure.approved_foreign_poa,
+            "Paid / Awaiting Bank Reconciliation": structure.paid,
+            "Reconciled / Complete": structure.reconciled,
+        }
+        if status == "Awaiting Sage Registration":
+            return (
+                structure.po_match
+                if invoice.invoice_type == "po"
+                else structure.nominal_invoices
+            )
+        return destinations.get(status)
 
     def _move_pdf_in_sharepoint(
         self,
@@ -1758,12 +1891,9 @@ class InvoiceLifecycle:
     @staticmethod
     def _filed_filename(invoice: InvoiceRecord) -> str:
         if not invoice.irj_number:
-            return invoice.original_filename
-        prefix = f"{invoice.irj_number}_"
-        return (
-            invoice.original_filename
-            if invoice.original_filename.startswith(prefix)
-            else f"{prefix}{invoice.original_filename}"
+            return clean_invoice_filename(invoice.original_filename)
+        return prefixed_invoice_filename(
+            invoice.irj_number, invoice.original_filename
         )
 
     @classmethod
@@ -1771,8 +1901,9 @@ class InvoiceLifecycle:
         if invoice.irj_number:
             return cls._filed_filename(invoice)
         prefix = f"invoice-{invoice.id}_"
+        original_filename = clean_invoice_filename(invoice.original_filename)
         return (
-            invoice.original_filename
-            if invoice.original_filename.startswith(prefix)
-            else f"{prefix}{invoice.original_filename}"
+            original_filename
+            if original_filename.startswith(prefix)
+            else f"{prefix}{original_filename}"
         )

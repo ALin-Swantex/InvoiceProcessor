@@ -7,6 +7,10 @@ from pathlib import Path
 
 SAFE_REFERENCE = re.compile(r"[^A-Za-z0-9._-]+")
 IRJ_NUMBER = re.compile(r"^[0-9]{6}$")
+OUTLOOK_STAGING_PREFIX = re.compile(
+    r"^outlook-[0-9a-f]{8,64}-(?P<filename>.+)$",
+    re.IGNORECASE,
+)
 
 
 class RoutingValidationError(ValueError):
@@ -55,9 +59,9 @@ def route_confirmed_invoice(invoice: ConfirmedInvoice) -> RoutingDecision:
             status="Awaiting PO Matching",
             destination_folder=str(invoice.po_matching_folder),
             destination_filename=(
-                invoice.original_filename
+                clean_invoice_filename(invoice.original_filename)
                 if invoice.defer_irj
-                else _prefixed_filename(
+                else prefixed_invoice_filename(
                     str(invoice.irj_number), invoice.original_filename
                 )
             ),
@@ -73,9 +77,9 @@ def route_confirmed_invoice(invoice: ConfirmedInvoice) -> RoutingDecision:
         status="Awaiting Nominal Processing",
         destination_folder=invoice.company_folder,
         destination_filename=(
-            invoice.original_filename
+            clean_invoice_filename(invoice.original_filename)
             if invoice.defer_irj
-            else _prefixed_filename(
+            else prefixed_invoice_filename(
                 str(invoice.irj_number), invoice.original_filename
             )
         ),
@@ -107,12 +111,21 @@ def _validate_common_fields(invoice: ConfirmedInvoice) -> None:
         )
 
 
-def _prefixed_filename(irj_number: str, original_filename: str) -> str:
+def prefixed_invoice_filename(irj_number: str, original_filename: str) -> str:
     safe_irj = SAFE_REFERENCE.sub("-", irj_number.strip()).strip("-._")
     if not safe_irj:
         raise RoutingValidationError("The IRJ number is not valid for a filename.")
 
     filename = Path(original_filename).name
-    if filename.casefold().startswith(f"{safe_irj}_".casefold()):
-        return filename
-    return f"{safe_irj}_{filename}"
+    prefix = f"{safe_irj}_"
+    if filename.casefold().startswith(prefix.casefold()):
+        filename = filename[len(prefix):]
+    return f"{prefix}{clean_invoice_filename(filename)}"
+
+
+def clean_invoice_filename(original_filename: str) -> str:
+    """Remove internal Outlook staging keys from a user-facing PDF name."""
+    filename = Path(original_filename).name
+    while match := OUTLOOK_STAGING_PREFIX.match(filename):
+        filename = match.group("filename")
+    return filename

@@ -101,6 +101,7 @@ def test_detected_statement_is_flagged_then_manually_filed(tmp_path: Path) -> No
     assert filed.company == "Acme Trading Ltd"
     assert filed.irj_number is None
     assert sharepoint.moves == [
+        ("item-1", "Invoices/Flagged Invoices", "statement.pdf"),
         ("item-1", "Statements/Acme Trading Ltd", "statement.pdf")
     ]
     assert store.get(document.id) == filed

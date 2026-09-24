@@ -96,17 +96,30 @@ class OutlookGraphClient:
         self.settings.download_directory.mkdir(parents=True, exist_ok=True)
 
     def list_invoice_emails(
-        self, *, limit: int = 20, unread_only: bool = True
+        self,
+        *,
+        limit: int = 20,
+        unread_only: bool = True,
+        received_since: datetime | None = None,
     ) -> list[dict[str, Any]]:
         if limit < 1 or limit > 100:
             raise OutlookGraphError("Email limit must be between 1 and 100.")
 
-        filters = ["hasAttachments eq true"]
+        filters: list[str] = []
+        if received_since is not None:
+            if received_since.utcoffset() is None:
+                raise OutlookGraphError("The Outlook received-since time must include a timezone.")
+            received_utc = received_since.astimezone(timezone.utc)
+            filters.append(
+                "receivedDateTime ge "
+                f"{received_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            )
+        filters.append("hasAttachments eq true")
         if unread_only:
             filters.append("isRead eq false")
 
         response = self._get(
-            f"/users/{quote(self.settings.mailbox, safe='')}/messages",
+            f"/users/{quote(self.settings.mailbox, safe='')}/mailFolders('inbox')/messages",
             params={
                 "$top": str(limit),
                 "$select": (
@@ -114,6 +127,7 @@ class OutlookGraphClient:
                     "hasAttachments,isRead,webLink"
                 ),
                 "$filter": " and ".join(filters),
+                "$orderby": "receivedDateTime desc",
             },
         )
         messages = response.json().get("value", [])

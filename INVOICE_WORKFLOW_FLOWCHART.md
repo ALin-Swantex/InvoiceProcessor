@@ -1,6 +1,6 @@
 # Invoice Processing Workflow Flowchart
 
-This flowchart represents the original end-to-end invoice logic, including:
+This flowchart represents the current end-to-end invoice logic, including:
 
 - Outlook and manual invoice intake
 - IRJ generation after Purchase Ledger confirmation (or at Sage for companies
@@ -94,7 +94,8 @@ flowchart TD
 - **Red:** exception, hold, rejection, or cancellation
 - **Green:** major lifecycle state
 
-The editable Mermaid-only source is available in `INVOICE_WORKFLOW_FLOWCHART.mmd`.
+The Mermaid block above is the editable source, so the workflow has one
+maintained representation.
 
 ## Implementation confirmation
 

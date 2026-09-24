@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 
 INVOICES_ROOT = "Invoices"
 INCOMING_INVOICES_FOLDER = "Invoices/Incoming Invoices"
+FLAGGED_INVOICES_FOLDER = "Invoices/Flagged Invoices"
 REJECTED_INVOICES_FOLDER = "Invoices/Rejected Invoices"
 STATEMENTS_ROOT = "Statements"
 
@@ -86,6 +87,7 @@ def discover_company_folder_structures(
     existing = frozenset(folder_paths)
     reserved = {
         INCOMING_INVOICES_FOLDER,
+        FLAGGED_INVOICES_FOLDER,
         REJECTED_INVOICES_FOLDER,
     }
     structures: list[CompanyFolderStructure] = []

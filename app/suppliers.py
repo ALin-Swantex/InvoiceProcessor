@@ -11,7 +11,7 @@ from app.invoice_number_validation import validate_invoice_number_pattern
 # ---------------------------------------------------------------------------
 # Suppliers — admin-maintained master data.
 #
-# SOFTWARE_SPEC.md section 7 requires the approval matrix (and by extension
+# SOFTWARE_SPEC.md requires the approval matrix (and by extension
 # the supplier list backing it) to be "easy for an authorised member of
 # staff to maintain". This mirrors app/companies.py: a SQLite-backed store
 # today, intended to become a SharePoint "Suppliers" List in production.

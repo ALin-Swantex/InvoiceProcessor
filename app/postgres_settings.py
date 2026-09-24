@@ -22,6 +22,7 @@ class PostgresSettings:
     port: int = 5432
     sslmode: str = "verify-full"
     sslrootcert: str | None = None
+    connect_timeout: int = 15
 
     def __post_init__(self) -> None:
         allowed_ssl_modes = {"require", "verify-ca", "verify-full"}
@@ -32,6 +33,8 @@ class PostgresSettings:
                 "PostgreSQL sslmode must be require, verify-ca, or verify-full. "
                 "The disable mode is allowed only for a local loopback host."
             )
+        if self.connect_timeout < 1:
+            raise ValueError("PostgreSQL connect timeout must be at least one second.")
 
     @classmethod
     def from_env(
@@ -52,6 +55,10 @@ class PostgresSettings:
             port = int(env.get("AZURE_POSTGRES_PORT", "5432"))
         except ValueError as error:
             raise ValueError("AZURE_POSTGRES_PORT must be an integer.") from error
+        try:
+            connect_timeout = int(env.get("POSTGRES_CONNECT_TIMEOUT_SECONDS", "15"))
+        except ValueError as error:
+            raise ValueError("POSTGRES_CONNECT_TIMEOUT_SECONDS must be an integer.") from error
         return cls(
             host=env["AZURE_POSTGRES_HOST"],
             database=env["AZURE_POSTGRES_DATABASE"],
@@ -60,6 +67,7 @@ class PostgresSettings:
             port=port,
             sslmode=env.get("AZURE_POSTGRES_SSLMODE", "verify-full"),
             sslrootcert=env.get("AZURE_POSTGRES_SSLROOTCERT") or None,
+            connect_timeout=connect_timeout,
         )
 
     @classmethod
@@ -82,6 +90,7 @@ class PostgresSettings:
             password=unquote(parsed.password) if parsed.password else None,
             sslmode=query.get("sslmode", "verify-full"),
             sslrootcert=query.get("sslrootcert"),
+            connect_timeout=int(query.get("connect_timeout", "15")),
         )
 
     def connection_kwargs(self, credential: object | None = None) -> dict[str, object]:
@@ -110,6 +119,7 @@ class PostgresSettings:
             "password": password,
             "port": self.port,
             "sslmode": self.sslmode,
+            "connect_timeout": self.connect_timeout,
         }
         if self.sslmode in {"verify-ca", "verify-full"}:
             if self.sslrootcert:
@@ -149,7 +159,7 @@ def postgres_connection_factory(
 ) -> ConnectionFactory:
     resolved = settings or PostgresSettings.from_env()
     pool_settings = (
-        _pool_size("POSTGRES_POOL_MIN_SIZE", 1),
+        _pool_size("POSTGRES_POOL_MIN_SIZE", 1, allow_zero=True),
         _pool_size("POSTGRES_POOL_MAX_SIZE", 10),
         _pool_timeout(),
         _pool_max_idle(),
@@ -258,13 +268,15 @@ class _NoPasswordCredential:
         return EmptyToken()
 
 
-def _pool_size(name: str, default: int) -> int:
+def _pool_size(name: str, default: int, *, allow_zero: bool = False) -> int:
     try:
         value = int(os.environ.get(name, str(default)))
     except ValueError as error:
         raise ValueError(f"{name} must be an integer.") from error
-    if value < 1:
-        raise ValueError(f"{name} must be greater than zero.")
+    minimum = 0 if allow_zero else 1
+    if value < minimum:
+        requirement = "zero or greater" if allow_zero else "greater than zero"
+        raise ValueError(f"{name} must be {requirement}.")
     return value
 
 

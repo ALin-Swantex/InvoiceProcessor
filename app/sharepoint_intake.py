@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
-from app.company_folders import REJECTED_INVOICES_FOLDER
+from app.company_folders import FLAGGED_INVOICES_FOLDER, REJECTED_INVOICES_FOLDER
 from app.invoice_lifecycle import InvoiceExtractionUnavailableError
 from app.invoices import InvoiceRecord
 from app.pdf_validation import InvalidPdfError, validate_pdf
@@ -146,6 +146,13 @@ class SharePointIncomingMonitor:
         if event_type == "outlook_intake":
             duplicate = self._find_identical_pdf(record, pdf_content)
             if duplicate is not None:
+                self.client.move_to_folder(
+                    item_id,
+                    self.client.settings.flagged_folder
+                    if hasattr(self.client, "settings")
+                    else FLAGGED_INVOICES_FOLDER,
+                    filename,
+                )
                 record = self.invoice_store.update_fields(
                     record.id,
                     status="Needs Review",

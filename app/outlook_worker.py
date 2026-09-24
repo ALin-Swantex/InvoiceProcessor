@@ -3,16 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from zoneinfo import ZoneInfo
 
-from app.activity_feed import ActivityFeedStore
-from app.config_db import configuration_backend
 from app.ai_extraction import ai_extraction_configured
-from app.environment import load_project_environment
+from app.environment import load_project_environment, project_path_from_environment
 from app.invoice_lifecycle import InvoiceLifecycle
 from app.invoices import InvoiceStore
-from app.irj import IrjNumberGenerator
 from app.outlook_graph import OutlookGraphClient, graph_client_from_environment
 from app.outlook_notifications import OutlookNotificationStore
 from app.pdf_validation import validate_pdf
@@ -25,7 +25,10 @@ load_project_environment()
 
 class OutlookRetriever(Protocol):
     async def list_invoice_emails(
-        self, limit: int = 20, unread_only: bool = True
+        self,
+        limit: int = 20,
+        unread_only: bool = True,
+        received_since: datetime | None = None,
     ) -> list[dict[str, object]]: ...
 
     async def get_invoice_email(self, message_id: str) -> dict[str, object]: ...
@@ -48,12 +51,16 @@ class OutlookGraphRetriever:
         self.graph_client = graph_client
 
     async def list_invoice_emails(
-        self, limit: int = 20, unread_only: bool = True
+        self,
+        limit: int = 20,
+        unread_only: bool = True,
+        received_since: datetime | None = None,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self.graph_client.list_invoice_emails,
             limit=limit,
             unread_only=unread_only,
+            received_since=received_since,
         )
 
     async def get_invoice_email(self, message_id: str) -> dict[str, Any]:
@@ -95,10 +102,18 @@ class OutlookInvoiceWorker:
         self.extraction_runner = extraction_runner
         self.incoming_monitor = incoming_monitor
 
-    async def enqueue_from_mailbox(self, limit: int = 20) -> int:
+    async def enqueue_from_mailbox(
+        self,
+        limit: int = 20,
+        *,
+        received_since: datetime | None = None,
+    ) -> int:
+        if received_since is None:
+            received_since = self._local_polling_start()
         messages = await self.retriever.list_invoice_emails(
             limit=limit,
             unread_only=True,
+            received_since=received_since,
         )
         queued = 0
         for message in messages:
@@ -112,6 +127,26 @@ class OutlookInvoiceWorker:
             ):
                 queued += 1
         return queued
+
+    @staticmethod
+    def _local_polling_start() -> datetime:
+        try:
+            lookback_days = int(
+                os.environ.get("OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS", "0")
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS must be a whole number."
+            ) from error
+        if lookback_days < 0:
+            raise RuntimeError(
+                "OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS cannot be negative."
+            )
+        local_now = datetime.now(ZoneInfo("Europe/London"))
+        local_start = (local_now - timedelta(days=lookback_days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return local_start.astimezone(timezone.utc)
 
     async def process_next(self) -> bool:
         notification = self.notification_store.claim_next()
@@ -149,9 +184,11 @@ class OutlookInvoiceWorker:
                 if not stored_path.is_file():
                     raise RuntimeError(
                         f"Microsoft Graph processing produced no PDF: {stored_path}"
-                    )
+                )
                 processed_attachment = dict(attachment)
-                processed_attachment["name"] = stored_path.name
+                processed_attachment["name"] = (
+                    Path(filename).with_suffix(".pdf").name
+                )
                 processed_attachment["contentType"] = "application/pdf"
                 processed_attachment["size"] = stored_path.stat().st_size
                 if self.incoming_monitor is not None:
@@ -220,62 +257,22 @@ class OutlookInvoiceWorker:
 
 
 def build_worker_from_environment() -> OutlookInvoiceWorker:
-    notification_store = OutlookNotificationStore(
-        Path(
-            os.environ.get(
-                "OUTLOOK_WEBHOOK_DB_PATH",
-                "runtime_data/outlook_notifications.db",
-            )
-        )
-    )
-    backend = os.environ.get("INVOICE_STORE_BACKEND", "sqlite").strip().lower()
-    companies_store = None
-    suppliers_store = None
-    approval_matrix_store = None
-    process_configuration_store = None
-    if backend == "postgres":
-        from app.postgres_invoices import create_postgres_invoice_store
-        from app.postgres_services import (
-            PostgresActivityFeedStore,
-            PostgresIrjNumberGenerator,
-        )
-        invoice_store = create_postgres_invoice_store()
-        irj_generator = PostgresIrjNumberGenerator()
-        activity_feed = PostgresActivityFeedStore()
-    elif backend == "sqlite":
-        invoice_store = InvoiceStore(
-            Path(os.environ.get("INVOICE_DB_PATH", "runtime_data/invoices.db"))
-        )
-        irj_generator = IrjNumberGenerator(invoice_store.database_path)
-        activity_feed = ActivityFeedStore(
-            Path(
-                os.environ.get(
-                    "ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"
-                )
-            )
-        )
-    else:
-        raise ValueError(
-            "The Outlook worker supports INVOICE_STORE_BACKEND=sqlite or postgres."
-        )
+    from app.postgres_config import postgres_config_stores
+    from app.postgres_invoices import create_postgres_invoice_store
+    from app.postgres_notifications import PostgresOutlookNotificationStore
+    from app.postgres_services import PostgresActivityFeedStore, PostgresIrjNumberGenerator
 
-    config_backend = configuration_backend(backend)
-    if config_backend == "postgres":
-        from app.postgres_config import postgres_config_stores
-
-        (
-            companies_store,
-            suppliers_store,
-            approval_matrix_store,
-            _supplier_terms_store,
-            process_configuration_store,
-        ) = postgres_config_stores()
-    else:
-        from app.config_db import SQLiteProcessConfigurationStore
-
-        process_configuration_store = SQLiteProcessConfigurationStore(
-            Path(os.environ.get("CONFIG_DB_PATH", "runtime_data/config.db"))
-        )
+    notification_store = PostgresOutlookNotificationStore()
+    invoice_store = create_postgres_invoice_store()
+    irj_generator = PostgresIrjNumberGenerator()
+    activity_feed = PostgresActivityFeedStore()
+    (
+        companies_store,
+        suppliers_store,
+        approval_matrix_store,
+        _supplier_terms_store,
+        process_configuration_store,
+    ) = postgres_config_stores()
     sharepoint_client = sharepoint_client_from_environment()
     lifecycle = InvoiceLifecycle(
         invoice_store,
@@ -295,11 +292,8 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
     incoming_monitor = SharePointIncomingMonitor(
         sharepoint_client,
         invoice_store,
-        cache_directory=Path(
-            os.environ.get(
-                "SHAREPOINT_INVOICE_CACHE_DIR",
-                "runtime_data/sharepoint_invoice_cache",
-            )
+        cache_directory=project_path_from_environment(
+            "SHAREPOINT_INVOICE_CACHE_DIR", "runtime_data/sharepoint_invoice_cache"
         ),
         extraction_runner=extraction_runner,
         activity_feed=activity_feed,
@@ -314,7 +308,21 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
 
 
 async def run_forever() -> None:
+    from app.postgres_monitoring import PostgresWorkerMonitor
+
     worker = build_worker_from_environment()
+    monitor = PostgresWorkerMonitor()
+    worker_name = "outlook-invoice-worker"
+
+    def report_heartbeat(**values: object) -> None:
+        try:
+            monitor.heartbeat(worker_name, **values)  # type: ignore[arg-type]
+        except Exception as error:
+            # Monitoring must never prevent the worker from processing invoices.
+            print(f"Outlook worker heartbeat failed: {error}", flush=True)
+
+    report_heartbeat(status="starting")
+    last_heartbeat = 0.0
     poll_seconds = float(
         os.environ.get(
             "SHAREPOINT_INCOMING_POLL_SECONDS",
@@ -332,8 +340,20 @@ async def run_forever() -> None:
                 processed = (await worker.enqueue_from_mailbox(local_polling_limit)) > 0
             ingested = await worker.scan_sharepoint_incoming()
             processed = processed or ingested > 0
+            now = time.monotonic()
+            if processed or now - last_heartbeat >= 30:
+                report_heartbeat(
+                    status="processed" if processed else "idle",
+                    success=True,
+                    details={"processed_work": processed},
+                )
+                last_heartbeat = now
         except Exception as error:
             print(f"Outlook invoice worker failed: {error}", flush=True)
+            report_heartbeat(
+                status="error",
+                error=str(error),
+            )
             processed = False
         if not processed:
             await asyncio.sleep(poll_seconds)

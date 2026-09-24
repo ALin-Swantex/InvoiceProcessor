@@ -11,6 +11,7 @@ from urllib.parse import quote
 import httpx
 
 from app.outlook_graph import MsalTokenProvider, OutlookSettings
+from app.company_folders import FLAGGED_INVOICES_FOLDER
 
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -29,12 +30,14 @@ class SharePointSettings:
     site_id: str
     drive_id: str
     incoming_folder: str
+    flagged_folder: str = FLAGGED_INVOICES_FOLDER
 
     def validate(self) -> None:
         values = {
             "SHAREPOINT_SITE_ID": self.site_id,
             "SHAREPOINT_DRIVE_ID": self.drive_id,
             "SHAREPOINT_INCOMING_FOLDER": self.incoming_folder,
+            "SHAREPOINT_FLAGGED_FOLDER": self.flagged_folder,
         }
         missing = [name for name, value in values.items() if not value.strip()]
         if missing:
@@ -570,6 +573,9 @@ def sharepoint_settings_from_environment() -> SharePointSettings:
         drive_id=os.environ.get("SHAREPOINT_DRIVE_ID", ""),
         incoming_folder=os.environ.get(
             "SHAREPOINT_INCOMING_FOLDER", "Invoices/Incoming Invoices"
+        ),
+        flagged_folder=os.environ.get(
+            "SHAREPOINT_FLAGGED_FOLDER", FLAGGED_INVOICES_FOLDER
         ),
     )
 

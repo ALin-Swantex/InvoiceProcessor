@@ -4,6 +4,7 @@ flow -- the behaviours added to implement MANUAL_VS_AUTOMATED.md end to end."""
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sqlite3
 from threading import Barrier, Lock
 
@@ -91,6 +92,57 @@ def test_manual_upload_runs_extraction_when_azure_is_configured(
     assert response.json()["supplier_invoice_number"] == "INV-AUTO-1"
     assert response.json()["ai_confidence"] == 0.96
     assert response.json()["status"] == "Needs Review"
+    assert response.json()["extraction_model"] == "prebuilt-invoice"
+    assert response.json()["routing_explanation"]
+
+    confirmed = client.post(
+        f"/api/invoices/{response.json()['id']}/confirm",
+        json={
+            "company": "Acme Trading Ltd",
+            "supplier": "Supplier Ltd",
+            "supplier_invoice_number": "INV-CORRECTED-1",
+            "invoice_date": "2026-09-08",
+            "invoice_value": 250.0,
+            "currency": "GBP",
+            "correction_reason": "The invoice number contained an OCR error.",
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    body = confirmed.json()
+    corrections = json.loads(body["corrected_fields_json"])
+    assert corrections["supplier_invoice_number"] == {
+        "original": "INV-AUTO-1",
+        "corrected": "INV-CORRECTED-1",
+    }
+    assert body["correction_reason"] == "The invoice number contained an OCR error."
+    assert body["reviewed_by"] == "Purchase Ledger"
+    assert "Sage Registration" in body["routing_explanation"]
+
+
+def test_admin_operations_shows_failed_queue_and_can_retry(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    assert client.app.state.notification_store.enqueue(
+        subscription_id="subscription-1",
+        message_id="message-1",
+        resource="messages/message-1",
+        change_type="created",
+        payload={},
+    )
+    queued = client.app.state.notification_store.claim_next()
+    assert queued is not None
+    notification_id = queued.id
+    client.app.state.notification_store.mark_failed(queued.id, "Temporary Graph error")
+    login(client, "admin", "ChangeMe-Admin1!")
+
+    operations = client.get("/api/admin/operations")
+    assert operations.status_code == 200
+    assert operations.json()["worker"] is None
+    assert operations.json()["queue"]["failed"][0]["id"] == notification_id
+    assert "Temporary Graph error" in operations.json()["queue"]["failed"][0]["last_error"]
+
+    retried = client.post(f"/api/admin/outlook-queue/{notification_id}/retry")
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +364,19 @@ def test_admin_can_manage_companies_suppliers_and_matrix(tmp_path: Path) -> None
     )
     assert matrix_entry.status_code == 200
     entry_id = matrix_entry.json()["id"]
+
+    saved_again = client.post(
+        "/api/admin/approval-matrix",
+        json={
+            "company": "New Co Ltd",
+            "supplier": "New Supplier",
+            "approver1_name": "Replacement Approver",
+            "approver1_email": "replacement.approver@example.test",
+        },
+    )
+    assert saved_again.status_code == 200
+    assert saved_again.json()["id"] == entry_id
+    assert saved_again.json()["approver1_email"] == "replacement.approver@example.test"
 
     updated = client.put(
         f"/api/admin/approval-matrix/{entry_id}",

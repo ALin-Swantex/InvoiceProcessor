@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -35,9 +36,11 @@ def test_lists_unread_messages_with_attachments(tmp_path: Path) -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer test-token"
         assert request.url.params["$filter"] == (
+            "receivedDateTime ge 2026-09-24T00:00:00Z and "
             "hasAttachments eq true and isRead eq false"
         )
-        assert "$orderby" not in request.url.params
+        assert request.url.params["$orderby"] == "receivedDateTime desc"
+        assert request.url.path.endswith("/mailFolders('inbox')/messages")
         return httpx.Response(
             200,
             json={
@@ -53,9 +56,22 @@ def test_lists_unread_messages_with_attachments(tmp_path: Path) -> None:
 
     client = graph_client(tmp_path, httpx.MockTransport(respond))
 
-    messages = client.list_invoice_emails(limit=10)
+    messages = client.list_invoice_emails(
+        limit=10,
+        received_since=datetime(2026, 9, 24, tzinfo=timezone.utc),
+    )
 
     assert messages[0]["id"] == "message-1"
+
+
+def test_rejects_naive_received_since_time(tmp_path: Path) -> None:
+    client = graph_client(
+        tmp_path,
+        httpx.MockTransport(lambda request: httpx.Response(200, json={"value": []})),
+    )
+
+    with pytest.raises(OutlookGraphError, match="must include a timezone"):
+        client.list_invoice_emails(received_since=datetime(2026, 9, 24))
 
 
 def test_gets_one_invoice_email_by_message_id(tmp_path: Path) -> None:

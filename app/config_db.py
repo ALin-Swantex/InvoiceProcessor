@@ -11,7 +11,7 @@ from pathlib import Path
 #
 # The specification requires these to be "easy for an authorised member of
 # staff to maintain... without having to change the underlying [workflow]
-# code" (SOFTWARE_SPEC.md section 7). Storing them in SQLite behind a CRUD
+# code. Storing them in SQLite behind a CRUD
 # API (see main.py's /api/admin/* endpoints, restricted to the admin role)
 # satisfies that requirement for the prototype.
 #
@@ -173,7 +173,7 @@ def configuration_backend(invoice_backend: str | None = None) -> str:
         selected_invoice_backend = (
             invoice_backend
             if invoice_backend is not None
-            else os.environ.get("INVOICE_STORE_BACKEND", "sqlite")
+            else os.environ.get("INVOICE_STORE_BACKEND", "postgres")
         ).strip().lower()
         backend = "postgres" if selected_invoice_backend == "postgres" else "sqlite"
     if backend not in {"sqlite", "postgres"}:

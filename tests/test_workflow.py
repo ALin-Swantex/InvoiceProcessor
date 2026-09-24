@@ -39,7 +39,7 @@ def test_po_invoice_routes_to_matching_and_plans_notification() -> None:
     assert decision.route == "purchase_order"
     assert decision.status == "Awaiting PO Matching"
     assert decision.destination_folder == "/Companies/Example/PO Matching"
-    # SOFTWARE_SPEC.md section 5: the IRJ number must be visible against the
+    # SOFTWARE_SPEC.md: the IRJ number must be visible against the
     # invoice in SharePoint throughout the whole process -- PO invoices are
     # no exception, so the filename must be reference-prefixed just like nominal
     # invoices are below.
@@ -64,6 +64,23 @@ def test_irj_prefix_is_idempotent() -> None:
             irj_number="001245",
             original_filename="001245_supplier-invoice.pdf",
         )
+    )
+
+    assert decision.destination_filename == "001245_supplier-invoice.pdf"
+
+
+@pytest.mark.parametrize(
+    "original_filename",
+    [
+        "outlook-a12bc34de56f7890abcd-supplier-invoice.pdf",
+        "001245_outlook-a12bc34de56f7890abcd-supplier-invoice.pdf",
+    ],
+)
+def test_irj_filename_removes_internal_outlook_staging_prefix(
+    original_filename: str,
+) -> None:
+    decision = route_confirmed_invoice(
+        confirmed_invoice(original_filename=original_filename)
     )
 
     assert decision.destination_filename == "001245_supplier-invoice.pdf"

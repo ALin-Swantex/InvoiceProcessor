@@ -89,6 +89,14 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "cancelled_at": "TEXT",
     "cancelled_by": "TEXT",
     "cancellation_reason": "TEXT",
+    "extraction_model": "TEXT",
+    "extraction_prompt_version": "TEXT",
+    "extracted_fields_json": "TEXT",
+    "routing_explanation": "TEXT",
+    "reviewed_at": "TEXT",
+    "reviewed_by": "TEXT",
+    "correction_reason": "TEXT",
+    "corrected_fields_json": "TEXT",
 }
 
 
@@ -164,6 +172,14 @@ class InvoiceRecord:
     cancelled_at: str | None = None
     cancelled_by: str | None = None
     cancellation_reason: str | None = None
+    extraction_model: str | None = None
+    extraction_prompt_version: str | None = None
+    extracted_fields_json: str | None = None
+    routing_explanation: str | None = None
+    reviewed_at: str | None = None
+    reviewed_by: str | None = None
+    correction_reason: str | None = None
+    corrected_fields_json: str | None = None
 
 
 class InvoiceStore:

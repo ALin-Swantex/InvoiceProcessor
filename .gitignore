@@ -9,3 +9,6 @@ runtime_data/
 manual_uploads/
 
 *.egg-info/
+.DS_Store
+outputs/**/*.inspect.ndjson
+outputs/**/*_preview.png

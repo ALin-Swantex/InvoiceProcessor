@@ -300,24 +300,15 @@ def test_lifecycle_persists_partial_extraction_and_warnings(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
-    ("has_po_number", "expected_folder", "expected_type"),
+    ("has_po_number", "expected_type"),
     [
-        (
-            False,
-            "Invoices/Acme Trading Ltd/Nominal Invoices/On hold",
-            "nominal",
-        ),
-        (
-            True,
-            "Invoices/Acme Trading Ltd/PO Invoices/On hold",
-            "po",
-        ),
+        (False, "nominal"),
+        (True, "po"),
     ],
 )
-def test_flagged_extraction_moves_to_company_on_hold_folder(
+def test_flagged_extraction_moves_to_shared_flagged_folder(
     tmp_path: Path,
     has_po_number: bool,
-    expected_folder: str,
     expected_type: str,
 ) -> None:
     class FakeSharePointClient:
@@ -370,7 +361,7 @@ def test_flagged_extraction_moves_to_company_on_hold_folder(
     assert extracted.status == "Needs Review"
     assert extracted.invoice_type == expected_type
     assert sharepoint.moves == [
-        ("drive-item-1", expected_folder, "invoice.pdf")
+        ("drive-item-1", "Invoices/Flagged Invoices", "invoice.pdf")
     ]
 
 

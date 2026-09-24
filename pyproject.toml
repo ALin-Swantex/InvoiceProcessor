@@ -30,6 +30,9 @@ test = [
     "pytest>=8,<9",
 ]
 
+[project.scripts]
+invoice-processor = "app.launcher:main"
+
 [tool.setuptools.packages.find]
 include = ["app*"]
 
