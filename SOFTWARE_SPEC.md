@@ -36,8 +36,7 @@ role per account. Local password login is for controlled tests and development.
 
 SharePoint owns document bytes. Azure PostgreSQL owns application metadata and
 runtime state. Local SQLite is not a production source of truth. SQLite classes
-remain as injected test doubles, and the importer is retained only to upgrade
-an older installation.
+remain only as isolated test doubles.
 
 ## Functional requirements
 

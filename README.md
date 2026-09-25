@@ -91,13 +91,6 @@ session, and configuration metadata are stored in PostgreSQL. The canonical PDF
 remains in SharePoint. For read-only Power BI reporting, see
 [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md).
 
-The retained compatibility importer is only for upgrading an older local
-installation. It is not part of the application runtime:
-
-```bash
-python3 -m scripts.migrate_sqlite_runtime_to_postgres
-```
-
 ## Run the application
 
 After installing the project, the easiest cross-platform option is:

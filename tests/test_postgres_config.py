@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-
 import pytest
 
 from app.postgres_config import (
@@ -12,7 +9,6 @@ from app.postgres_config import (
     PostgresSupplierStore,
     PostgresSupplierTermsStore,
 )
-from app.postgres_config_migrate import migrate_sqlite_configuration
 from app.config_db import configuration_backend
 
 
@@ -53,83 +49,6 @@ class RecordingConnection:
 
     def cursor(self) -> RecordingCursor:
         return self.recording_cursor
-
-
-def _source_database(path: Path) -> None:
-    connection = sqlite3.connect(path)
-    connection.executescript(
-        """
-        CREATE TABLE companies (
-            name TEXT, sharepoint_root_folder TEXT, company_folder TEXT,
-            po_matching_folder TEXT, aliases TEXT, vat_number TEXT, address TEXT
-        );
-        CREATE TABLE suppliers (
-            name TEXT, aliases TEXT, default_company TEXT, contact_email TEXT,
-            invoice_number_pattern TEXT
-        );
-        CREATE TABLE approval_matrix (
-            company TEXT, supplier TEXT, approver1_name TEXT,
-            approver1_email TEXT, approver2_name TEXT, approver2_email TEXT
-        );
-        CREATE TABLE supplier_terms (
-            company TEXT, supplier TEXT, supplier_account_number TEXT,
-            default_payment_method TEXT, payment_terms_notice TEXT,
-            bank_account TEXT
-        );
-        CREATE TABLE process_configuration (key TEXT, value TEXT);
-        INSERT INTO companies VALUES (
-            'SWAN', 'Invoices/SWAN', 'Invoices/SWAN/Nominal Invoices',
-            'Invoices/SWAN/PO Invoices/PO Match', 'Swantex', NULL, NULL
-        );
-        INSERT INTO suppliers VALUES (
-            'Supplier Ltd', 'Supplier Limited', 'SWAN', 'a@example.test', 'INV-####'
-        );
-        INSERT INTO approval_matrix VALUES (
-            'SWAN', 'Supplier Ltd', 'One', 'one@example.test', NULL, NULL
-        );
-        INSERT INTO supplier_terms VALUES (
-            'SWAN', 'Supplier Ltd', 'A001', 'BACS', '30 days', 'Main'
-        );
-        INSERT INTO supplier_terms VALUES (
-            '*', 'Supplier Ltd', NULL, 'BACS', 'Default terms', 'Main'
-        );
-        INSERT INTO process_configuration VALUES ('ai_confidence_threshold', '0.8');
-        """
-    )
-    connection.commit()
-    connection.close()
-
-
-def test_sqlite_configuration_import_copies_every_table(tmp_path: Path) -> None:
-    source = tmp_path / "config.db"
-    _source_database(source)
-    destination = RecordingConnection()
-
-    counts = migrate_sqlite_configuration(
-        source, connection_factory=lambda: destination
-    )
-
-    assert counts == {
-        "companies": 1,
-        "suppliers": 1,
-        "approval_matrix": 1,
-        "supplier_terms": 2,
-        "process_configuration": 1,
-    }
-    sql = "\n".join(call[0] for call in destination.recording_cursor.calls)
-    assert "ON CONFLICT (lower(name))" in sql
-    assert "ON CONFLICT (lower(company), lower(supplier))" in sql
-    assert "ON CONFLICT (company, supplier_account_number)" in sql
-    assert (
-        "ON CONFLICT (company, supplier) "
-        "WHERE supplier_account_number IS NULL"
-    ) in " ".join(sql.split())
-    assert destination.exited_with is None
-
-
-def test_configuration_import_requires_existing_source(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="not found"):
-        migrate_sqlite_configuration(tmp_path / "missing.db")
 
 
 def test_sharepoint_list_invoice_backend_keeps_sqlite_configuration(
