@@ -7,6 +7,7 @@ from typing import Callable, Protocol
 
 from app.activity_feed import ActivityFeedStore, ROLE_PURCHASE_LEDGER
 from app.company_folders import FLAGGED_INVOICES_FOLDER, REJECTED_INVOICES_FOLDER
+from app.duplicates import duplicate_reference
 from app.invoice_lifecycle import InvoiceExtractionUnavailableError
 from app.invoices import InvoiceRecord
 from app.pdf_validation import InvalidPdfError, validate_pdf
@@ -146,6 +147,7 @@ class SharePointIncomingMonitor:
         if event_type == "outlook_intake":
             duplicate = self._find_identical_pdf(record, pdf_content)
             if duplicate is not None:
+                reference = duplicate_reference(duplicate.id, duplicate.irj_number)
                 self.client.move_to_folder(
                     item_id,
                     self.client.settings.flagged_folder
@@ -158,9 +160,8 @@ class SharePointIncomingMonitor:
                     status="Needs Review",
                     duplicate_of_invoice_id=duplicate.id,
                     review_reason=(
-                        f"Possible duplicate of invoice #{duplicate.id} "
-                        f"(IRJ {duplicate.irj_number or 'not yet assigned'}, "
-                        f"status {duplicate.status}), matched on identical PDF "
+                        f"It's a duplicate of {reference} "
+                        f"(status {duplicate.status}), matched on identical PDF "
                         "content. Purchase Ledger must confirm whether this is "
                         "a genuinely separate invoice."
                     ),
@@ -170,8 +171,8 @@ class SharePointIncomingMonitor:
                         event_type="possible_duplicate",
                         target_role=ROLE_PURCHASE_LEDGER,
                         message=(
-                            f"'{filename}' is byte-for-byte identical to invoice "
-                            f"#{duplicate.id} and needs duplicate review."
+                            f"'{filename}' is byte-for-byte identical to "
+                            f"{reference} and needs duplicate review."
                         ),
                         invoice_id=record.id,
                     )

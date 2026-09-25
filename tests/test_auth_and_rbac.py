@@ -1353,7 +1353,8 @@ def test_po_invoice_can_be_rejected_from_matching(tmp_path: Path) -> None:
 
 def test_duplicate_invoice_is_flagged_for_review(tmp_path: Path) -> None:
     client = make_client(tmp_path)
-    _upload_and_confirm(client, supplier_invoice_number="DUP-1")
+    original_id = _upload_and_confirm(client, supplier_invoice_number="DUP-1")
+    original_irj = client.get(f"/api/invoices/{original_id}").json()["irj_number"]
 
     # A second invoice for the same company/supplier/supplier-invoice-number
     # combination should be flagged rather than routed.
@@ -1376,6 +1377,9 @@ def test_duplicate_invoice_is_flagged_for_review(tmp_path: Path) -> None:
     body = confirm2.json()
     assert body["status"] == "Needs Review"
     assert body["duplicate_of_invoice_id"] is not None
+    assert body["review_reason"].startswith(
+        f"It's a duplicate of IRJ {original_irj}"
+    )
 
     # Purchase Ledger can override once they've confirmed it's genuinely
     # a separate invoice.
@@ -1396,7 +1400,8 @@ def test_duplicate_invoice_is_flagged_for_review(tmp_path: Path) -> None:
 
 def test_confirmed_duplicate_can_be_cancelled(tmp_path: Path) -> None:
     client = make_client(tmp_path)
-    _upload_and_confirm(client, supplier_invoice_number="DUP-CANCEL")
+    original_id = _upload_and_confirm(client, supplier_invoice_number="DUP-CANCEL")
+    original_irj = client.get(f"/api/invoices/{original_id}").json()["irj_number"]
 
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     upload = client.post(
@@ -1419,6 +1424,9 @@ def test_confirmed_duplicate_can_be_cancelled(tmp_path: Path) -> None:
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "Cancelled - Duplicate"
     assert cancelled.json()["cancelled_by"] == "Purchase Ledger"
+    assert cancelled.json()["cancellation_reason"] == (
+        f"Confirmed duplicate of IRJ {original_irj}."
+    )
 
 
 def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
@@ -1470,4 +1478,7 @@ def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
     body = confirm2.json()
     assert body["status"] == "Needs Review"
     assert body["duplicate_of_invoice_id"] == invoice1_id
+    assert body["review_reason"].startswith(
+        f"It's a duplicate of IRJ {confirm1.json()['irj_number']}"
+    )
     assert "matched on matching filename and file size" in body["review_reason"]

@@ -1862,10 +1862,16 @@ def create_app(
               const deleteInvoiceButton = document.getElementById("delete-invoice-button");
               const retryApprovalRouteButton = document.getElementById("retry-approval-route-button");
               if (invoice.duplicate_of_invoice_id) {
+                const originalInvoice = invoices.find(
+                  (candidate) => candidate.id === invoice.duplicate_of_invoice_id
+                );
+                const duplicateReference = originalInvoice?.irj_number
+                  ? `IRJ ${originalInvoice.irj_number}`
+                  : `invoice #${invoice.duplicate_of_invoice_id} (IRJ not yet assigned)`;
                 duplicateWarning.style.display = "grid";
                 document.getElementById("duplicate-warning-text").textContent =
                   invoice.review_reason ||
-                  `Possible duplicate of invoice #${invoice.duplicate_of_invoice_id}.`;
+                  `It's a duplicate of ${duplicateReference}.`;
                 overrideButton.style.display = "";
                 cancelDuplicateButton.style.display = "";
               } else {

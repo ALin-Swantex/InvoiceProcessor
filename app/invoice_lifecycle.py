@@ -34,7 +34,7 @@ from app.document_classification import (
     DocumentClassification,
     classify_pdf_document,
 )
-from app.duplicates import find_possible_duplicate
+from app.duplicates import duplicate_reference, find_possible_duplicate
 from app.email_notifications import send_email_notification
 from app.invoices import InvoiceRecord, InvoiceStore
 from app.invoice_number_validation import invoice_number_warnings
@@ -415,10 +415,12 @@ class InvoiceLifecycle:
                 supplier_invoice_number=result.supplier_invoice_number,
             )
             if duplicate is not None:
+                reference = duplicate_reference(
+                    duplicate.invoice_id, duplicate.irj_number
+                )
                 warnings.append(
-                    f"Possible duplicate of invoice #{duplicate.invoice_id} "
-                    f"(IRJ {duplicate.irj_number or 'not yet assigned'}, "
-                    f"status {duplicate.status}), matched on "
+                    f"It's a duplicate of {reference} "
+                    f"(status {duplicate.status}), matched on "
                     f"{duplicate.match_basis}."
                 )
 
@@ -488,7 +490,8 @@ class InvoiceLifecycle:
                 message=(
                     (
                         f"Invoice {invoice.original_filename} looks like a possible "
-                        f"duplicate of invoice #{duplicate.invoice_id}."
+                        "duplicate of "
+                        f"{duplicate_reference(duplicate.invoice_id, duplicate.irj_number)}."
                     )
                     if duplicate is not None
                     else (
@@ -626,6 +629,9 @@ class InvoiceLifecycle:
                 supplier_invoice_number=supplier_invoice_number,
             )
             if duplicate is not None:
+                reference = duplicate_reference(
+                    duplicate.invoice_id, duplicate.irj_number
+                )
                 self._move_to_flagged(invoice)
                 record = self.invoice_store.update_fields(
                     invoice_id,
@@ -640,9 +646,8 @@ class InvoiceLifecycle:
                     review_return_status=None,
                     duplicate_of_invoice_id=duplicate.invoice_id,
                     review_reason=(
-                        f"Possible duplicate of invoice #{duplicate.invoice_id} "
-                        f"(IRJ {duplicate.irj_number or 'not yet assigned'}, "
-                        f"status {duplicate.status}), matched on "
+                        f"It's a duplicate of {reference} "
+                        f"(status {duplicate.status}), matched on "
                         f"{duplicate.match_basis}. Purchase Ledger must "
                         "confirm this is a genuinely separate invoice before it "
                         "can be routed."
@@ -658,7 +663,7 @@ class InvoiceLifecycle:
                     target_role=ROLE_PURCHASE_LEDGER,
                     message=(
                         f"Invoice {invoice.original_filename} looks like a possible "
-                        f"duplicate of invoice #{duplicate.invoice_id} "
+                        f"duplicate of {reference} "
                         f"(matched on {duplicate.match_basis})."
                     ),
                     invoice_id=invoice_id,
@@ -1069,7 +1074,12 @@ class InvoiceLifecycle:
                 "as a confirmed duplicate before Sage registration."
             )
         now = datetime.now(timezone.utc).isoformat()
-        reason = f"Confirmed duplicate of invoice #{invoice.duplicate_of_invoice_id}."
+        original = self.invoice_store.get(invoice.duplicate_of_invoice_id)
+        reference = duplicate_reference(
+            invoice.duplicate_of_invoice_id,
+            original.irj_number if original is not None else None,
+        )
+        reason = f"Confirmed duplicate of {reference}."
         self._move_pdf_in_sharepoint(
             invoice,
             REJECTED_INVOICES_FOLDER,

@@ -45,6 +45,14 @@ class DuplicateMatch:
     match_basis: str = "supplier invoice number"
 
 
+def duplicate_reference(invoice_id: int, irj_number: str | None) -> str:
+    """Return the user-facing reference for an existing duplicate invoice."""
+    normalized_irj = (irj_number or "").strip()
+    if normalized_irj:
+        return f"IRJ {normalized_irj}"
+    return f"invoice #{invoice_id} (IRJ not yet assigned)"
+
+
 def find_possible_duplicate(
     invoice_store: InvoiceStore,
     *,
