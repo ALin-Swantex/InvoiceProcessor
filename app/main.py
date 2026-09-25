@@ -413,6 +413,7 @@ def create_app(
         companies_store=app.state.companies_store,
         approval_matrix_store=app.state.approval_matrix_store,
         suppliers_store=app.state.suppliers_store,
+        supplier_terms_store=app.state.supplier_terms_store,
         configuration_getter=app.state.process_configuration_store.get,
     )
     app.state.sharepoint_attach_attempted = (
@@ -1383,7 +1384,7 @@ def create_app(
                     </div>
                   </div>
                   <div class="actions">
-                    <button class="danger" id="delete-invoice-button">Delete invoice</button>
+                    <button class="danger" id="delete-invoice-button" style="display:none">Delete duplicate</button>
                     <button class="secondary" id="flag-review-button">Flag for review</button>
                     <button class="danger" id="override-duplicate-button" style="display: none">This is not a duplicate — route anyway</button>
                     <button class="danger" id="cancel-duplicate-button" style="display: none">Confirmed duplicate — cancel</button>
@@ -1696,6 +1697,8 @@ def create_app(
                 "Approval Query / On Hold",
                 "Awaiting Approval 1",
                 "Awaiting Approval 2",
+                "Payment Routing Issue / On Hold",
+                "Workflow Issue / On Hold",
               ],
               "approved": ["Approved"],
               "payment-bacs": ["Approved for Payment - BACS"],
@@ -1876,13 +1879,10 @@ def create_app(
                 invoice.sage_registered_at
                   ? ""
                   : "none";
-              deleteInvoiceButton.disabled = ![
-                "Awaiting AI Extraction",
-                "Needs Review",
-                "Awaiting PO Matching",
-                "PO Query / Matching Issue",
-                "Awaiting Sage Registration",
-              ].includes(invoice.status);
+              const mayDeleteDuplicate =
+                invoice.status === "Needs Review" && Boolean(invoice.duplicate_of_invoice_id);
+              deleteInvoiceButton.style.display = mayDeleteDuplicate ? "" : "none";
+              deleteInvoiceButton.disabled = !mayDeleteDuplicate;
               if (displayedInvoiceId !== invoice.id) {
                 // Only (re)populate editable AI fields when the
                 // displayed invoice actually changes. showInvoice() is also
@@ -2223,7 +2223,7 @@ def create_app(
                   ? incomingInvoices().length
                   : invoices.filter(i =>
                       SECTION_STATUSES[tab].includes(i.status) &&
-                      (tab !== "on-hold" || i.status === "Approval Query / On Hold" || i.hold_level)
+                      (tab !== "on-hold" || i.status.includes("On Hold") || i.hold_level)
                     ).length;
                 const el = document.getElementById(`count-${tab}`);
                 if (el) el.textContent = String(count);
@@ -2938,22 +2938,28 @@ def create_app(
               renderSectionTable(
                 "on-hold-table",
                 SECTION_STATUSES["on-hold"],
-                BASE_COLUMNS,
+                [
+                  ...BASE_COLUMNS,
+                  { label: "Issue / payment note", value: i => i.hold_reason || "—" },
+                  { label: "Payment method", value: i => i.payment_method || "—" },
+                ],
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="resume" data-id="${invoice.id}">Resume approval</button>
+                  ${invoice.status === "Payment Routing Issue / On Hold"
+                    ? `<button data-action="retry-payment-route" data-id="${invoice.id}">Retry payment routing</button>`
+                    : `<button data-action="resume" data-id="${invoice.id}">${invoice.status === "Workflow Issue / On Hold" ? "Resolve issue" : "Resume approval"}</button>`}
                 `,
-                invoice => invoice.status === "Approval Query / On Hold" || Boolean(invoice.hold_level)
+                invoice => invoice.status.includes("On Hold") || Boolean(invoice.hold_level)
               );
               renderSectionTable(
                 "approved-table",
                 SECTION_STATUSES["approved"],
-                BASE_COLUMNS,
+                [
+                  ...BASE_COLUMNS,
+                  { label: "Payment method", value: i => i.payment_method || "Awaiting automatic routing" },
+                ],
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="select-payment-route" data-route="bacs" data-id="${invoice.id}">BACS</button>
-                  <button data-action="select-payment-route" data-route="bankline" data-id="${invoice.id}">Bankline</button>
-                  <button data-action="select-payment-route" data-route="foreign_poa" data-id="${invoice.id}">Foreign POA</button>
                 `
               );
               for (const [containerId, section] of [
@@ -3227,6 +3233,8 @@ def create_app(
                 } else if (action === "resume") {
                   const notes = window.prompt("Resolution notes for resuming approval (optional):");
                   await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
+                } else if (action === "retry-payment-route") {
+                  await postJson(`/api/invoices/${id}/retry-payment-route`, {});
                 } else if (action === "select-payment-route") {
                   await postJson(`/api/invoices/${id}/payment-route`, {
                     route: button.dataset.route,
@@ -3420,9 +3428,10 @@ def create_app(
                 const isAllowed = allowedTabs.includes(button.dataset.tab);
                 button.style.display = isAllowed ? "" : "none";
               });
-              const desiredTab = allowedTabs.includes(currentTab)
-                ? currentTab
-                : allowedTabs[0];
+              const linkedTab = new URLSearchParams(window.location.search).get("tab");
+              const desiredTab = linkedTab && allowedTabs.includes(linkedTab)
+                ? linkedTab
+                : allowedTabs.includes(currentTab) ? currentTab : allowedTabs[0];
               activateTab(desiredTab);
             }
 
@@ -5060,6 +5069,17 @@ def create_app(
                 route=request.route,
                 recorded_by=user.display_name,
             )
+        except InvoiceLifecycleError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return asdict(record)
+
+    @app.post("/api/invoices/{invoice_id}/retry-payment-route")
+    def retry_invoice_payment_route(
+        invoice_id: int,
+        user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+    ) -> dict[str, object]:
+        try:
+            record = _lifecycle().auto_route_for_payment(invoice_id)
         except InvoiceLifecycleError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return asdict(record)

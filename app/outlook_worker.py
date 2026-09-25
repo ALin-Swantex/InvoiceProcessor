@@ -95,12 +95,14 @@ class OutlookInvoiceWorker:
         retriever: OutlookRetriever,
         extraction_runner: Callable[[int], object] | None = None,
         incoming_monitor: SharePointIncomingMonitor | None = None,
+        scheduled_notification_runner: Callable[[], int] | None = None,
     ) -> None:
         self.notification_store = notification_store
         self.invoice_store = invoice_store
         self.retriever = retriever
         self.extraction_runner = extraction_runner
         self.incoming_monitor = incoming_monitor
+        self.scheduled_notification_runner = scheduled_notification_runner
 
     async def enqueue_from_mailbox(
         self,
@@ -240,6 +242,11 @@ class OutlookInvoiceWorker:
             return 0
         return await asyncio.to_thread(self.incoming_monitor.scan_once)
 
+    async def send_scheduled_notifications(self) -> int:
+        if self.scheduled_notification_runner is None:
+            return 0
+        return await asyncio.to_thread(self.scheduled_notification_runner)
+
     @staticmethod
     def _required_string(data: dict[str, object], key: str) -> str:
         value = data.get(key)
@@ -282,6 +289,7 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
         companies_store=companies_store,
         approval_matrix_store=approval_matrix_store,
         suppliers_store=suppliers_store,
+        supplier_terms_store=_supplier_terms_store,
         configuration_getter=process_configuration_store.get,
     )
     extraction_runner: Callable[[int], object] = (
@@ -304,6 +312,7 @@ def build_worker_from_environment() -> OutlookInvoiceWorker:
         OutlookGraphRetriever(graph_client_from_environment()),
         extraction_runner,
         incoming_monitor,
+        lifecycle.process_scheduled_notifications,
     )
 
 
@@ -333,6 +342,10 @@ async def run_forever() -> None:
         "OUTLOOK_LOCAL_POLLING_ENABLED", "false"
     ).lower() in {"1", "true", "yes"}
     local_polling_limit = int(os.environ.get("OUTLOOK_LOCAL_POLLING_LIMIT", "20"))
+    reminder_scan_seconds = float(
+        os.environ.get("APPROVAL_REMINDER_SCAN_SECONDS", "300")
+    )
+    last_reminder_scan = 0.0
     while True:
         try:
             processed = await worker.process_next()
@@ -341,6 +354,10 @@ async def run_forever() -> None:
             ingested = await worker.scan_sharepoint_incoming()
             processed = processed or ingested > 0
             now = time.monotonic()
+            if now - last_reminder_scan >= reminder_scan_seconds:
+                reminders = await worker.send_scheduled_notifications()
+                processed = processed or reminders > 0
+                last_reminder_scan = now
             if processed or now - last_heartbeat >= 30:
                 report_heartbeat(
                     status="processed" if processed else "idle",

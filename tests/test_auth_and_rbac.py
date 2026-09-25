@@ -470,6 +470,11 @@ def test_purchase_ledger_can_delete_invoice_before_approval(
     )
     invoice_id = upload.json()["id"]
     stored_path = Path(upload.json()["stored_path"])
+    client.app.state.invoice_store.update_fields(
+        invoice_id,
+        status="Needs Review",
+        duplicate_of_invoice_id=999,
+    )
 
     deleted = client.delete(f"/api/invoices/{invoice_id}")
 
@@ -490,7 +495,7 @@ def test_invoice_cannot_be_deleted_after_approval_starts(tmp_path: Path) -> None
     deleted = client.delete(f"/api/invoices/{invoice_id}")
 
     assert deleted.status_code == 422
-    assert "before they enter approval or payment" in deleted.json()["detail"]
+    assert "possible duplicate" in deleted.json()["detail"]
     assert client.get(f"/api/invoices/{invoice_id}").status_code == 200
 
 
@@ -750,7 +755,7 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
         json={"level": 2, "decision": "approved"},
     )
     assert approve2.status_code == 200
-    assert approve2.json()["status"] == "Approved"
+    assert approve2.json()["status"] == "Payment Routing Issue / On Hold"
 
     # Purchase Ledger selects BACS, then records payment.
     login(client, "purchase.ledger", "ChangeMe-PL1!")
@@ -865,7 +870,7 @@ def test_concurrent_final_approval_sends_one_email(
     with ThreadPoolExecutor(max_workers=2) as executor:
         outcomes = list(executor.map(lambda _: approve(), range(2)))
 
-    assert outcomes.count("Approved") == 1
+    assert outcomes.count("Payment Routing Issue / On Hold") == 1
     assert sum("is not Awaiting Approval 2" in outcome for outcome in outcomes) == 1
     assert moved_invoice_ids == [invoice_id]
     assert sent_subjects == ["Invoice (invoice.pdf) fully approved"]
@@ -1144,7 +1149,7 @@ def test_foreign_poa_payment_flows_through_bank_reconciliation(tmp_path: Path) -
         f"/api/invoices/{invoice_id}/approve",
         json={"level": 2, "decision": "approved"},
     )
-    assert approved.json()["status"] == "Approved"
+    assert approved.json()["status"] == "Payment Routing Issue / On Hold"
 
     login(client, "purchase.ledger", "ChangeMe-PL1!")
     client.app.state.invoice_store.update_fields(
@@ -1308,7 +1313,7 @@ def test_po_query_resolution_requires_sage_registration_before_approval(
         json={"irj_number": matched.json()["irj_number"]},
     )
     assert registered.status_code == 200
-    assert registered.json()["status"] == "Approved"
+    assert registered.json()["status"] == "Payment Routing Issue / On Hold"
     assert registered.json()["sage_registered_by"] == "Purchase Ledger"
 
 

@@ -49,6 +49,9 @@ an older installation.
 - Poll from today by default during local recovery.
 - Store queue errors, attempts, and worker heartbeat in PostgreSQL.
 - Store extracted fields, confidence, warnings, model, and prompt version.
+- For invoices longer than three pages, send only the first and final pages to
+  Azure extraction; the first page supplies identity fields and the final page
+  supplies the invoice total.
 - Route missing, ambiguous, invalid, unknown, or low-confidence results to
   review.
 - Show PDF evidence beside editable fields and a clear routing explanation.
@@ -65,7 +68,13 @@ an older installation.
 - Restrict each approver's invoice list, detail, PDF, search, activity, and
   decisions to rows assigned to their verified Entra email.
 - Send each successful stage notification at most once per invoice.
-- Separate payment routing, payment, foreign allocation, and reconciliation.
+- Remind the assigned approver every seven calendar days while pending and
+  every 30 calendar days while their approval is on hold.
+- Notify Purchase Ledger when an invoice is rejected.
+- Route approved invoices automatically from the supplier payment setting;
+  missing, unsupported, or conflicting settings place the invoice on hold.
+- Allow permanent deletion only for a possible duplicate in Incoming review.
+- Separate payment, foreign allocation, and reconciliation.
 - Record each meaningful action in the audit trail.
 
 ### Search, administration, and reporting
@@ -95,6 +104,8 @@ an older installation.
 - Extraction review, correction feedback, and routing explanation
 - Duplicate review, IRJs, and clean final filenames
 - PO, approval, payment, reconciliation, and audit workflows
+- Recurring approval reminders, rejection notifications, and email queue links
+- Automatic supplier payment routing with visible exception holds
 - Entra roles, worker visibility, retries, and approval-matrix editing
 - Three Power BI reporting views and a cross-platform launcher
 - Automated tests with mocked external services

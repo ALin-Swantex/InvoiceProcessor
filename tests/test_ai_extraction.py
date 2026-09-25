@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO
 
 import pytest
+from pypdf import PdfReader, PdfWriter
 
 from app.activity_feed import ActivityFeedStore
 from app.ai_extraction import (
@@ -75,6 +77,23 @@ def complete_fields() -> dict[str, Field]:
             attribute="value_currency",
         ),
     }
+
+
+def test_long_invoice_sends_only_first_and_last_pages_to_azure(tmp_path: Path) -> None:
+    pdf = tmp_path / "long-invoice.pdf"
+    writer = PdfWriter()
+    for _ in range(5):
+        writer.add_blank_page(width=612, height=792)
+    with pdf.open("wb") as stream:
+        writer.write(stream)
+    client = FakeClient(complete_fields())
+
+    AzureInvoiceExtractor(
+        DocumentIntelligenceSettings("https://documents.example.test/"),
+        client=client,
+    ).extract(pdf)
+
+    assert len(PdfReader(BytesIO(client.calls[0][1])).pages) == 2
 
 
 def test_maps_prebuilt_invoice_fields_and_confidence(

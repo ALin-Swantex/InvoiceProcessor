@@ -77,6 +77,10 @@ LIFECYCLE_COLUMNS: dict[str, str] = {
     "duplicate_of_invoice_id": "INTEGER",
     "hold_reason": "TEXT",
     "hold_level": "INTEGER",
+    "approval_requested_at": "TEXT",
+    "approval_reminder_sent_at": "TEXT",
+    "approval_hold_started_at": "TEXT",
+    "approval_hold_reminder_sent_at": "TEXT",
     "sage_registered_at": "TEXT",
     "sage_reference": "TEXT",
     "sage_registered_by": "TEXT",
@@ -160,6 +164,10 @@ class InvoiceRecord:
     duplicate_of_invoice_id: int | None = None
     hold_reason: str | None = None
     hold_level: int | None = None
+    approval_requested_at: str | None = None
+    approval_reminder_sent_at: str | None = None
+    approval_hold_started_at: str | None = None
+    approval_hold_reminder_sent_at: str | None = None
     sage_registered_at: str | None = None
     sage_reference: str | None = None
     sage_registered_by: str | None = None

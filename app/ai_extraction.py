@@ -10,6 +10,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from pypdf import PdfReader, PdfWriter
+
 from app.document_classification import classify_document_text
 
 
@@ -146,10 +148,11 @@ class AzureInvoiceExtractor:
         if not pdf_bytes.startswith(b"%PDF-"):
             raise DocumentIntelligenceError("The invoice is not a valid PDF.")
 
+        analysis_bytes = self._pages_for_analysis(pdf_bytes)
         try:
             poller = self.client.begin_analyze_document(
                 self.settings.model_id,
-                body=BytesIO(pdf_bytes),
+                body=BytesIO(analysis_bytes),
             )
             analysis = poller.result()
         except Exception as error:
@@ -195,6 +198,25 @@ class AzureInvoiceExtractor:
                 "document_classification_reason": classification.reason,
             }
         )
+
+    @staticmethod
+    def _pages_for_analysis(pdf_bytes: bytes) -> bytes:
+        """For long invoices send only page 1 and the final page to Azure."""
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+            if len(reader.pages) <= 3:
+                return pdf_bytes
+            writer = PdfWriter()
+            writer.add_page(reader.pages[0])
+            writer.add_page(reader.pages[-1])
+            output = BytesIO()
+            writer.write(output)
+            return output.getvalue()
+        except Exception:
+            # Azure remains the authoritative PDF validator. Keeping the
+            # original bytes here also preserves compatibility with PDFs
+            # that Azure accepts but pypdf cannot parse.
+            return pdf_bytes
 
     @staticmethod
     def _build_client(settings: DocumentIntelligenceSettings) -> AnalysisClient:

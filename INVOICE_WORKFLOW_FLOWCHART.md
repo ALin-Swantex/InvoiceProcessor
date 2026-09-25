@@ -48,24 +48,26 @@ flowchart TD
     N2 --> N3{Company + supplier approval route found?}
     N3 -->|No| NR3[Needs Review: configure approver route]
     NR3 --> N3
-    N3 -->|Yes| A1[Send one request to Approver 1]
+    N3 -->|Yes| A1[Send request to Approver 1<br/>7-day recurring reminders]
     A1 --> A1D{Approver 1 decision}
     A1D -->|Reject| REJ([Rejected])
-    A1D -->|Query / On Hold| HOLD1[Record query; remain at Approval 1]
+    A1D -->|Query / On Hold| HOLD1[Record query; remain at Approval 1<br/>30-day recurring reminders]
     HOLD1 --> HOLD1R[Purchase Ledger resolves query and resumes]
     HOLD1R -->|No repeat stage email| A1D
     A1D -->|Approve| A2Q{Second approval required?}
     A2Q -->|No| APPR
-    A2Q -->|Yes| A2[Send one request to Approver 2]
+    A2Q -->|Yes| A2[Send request to Approver 2<br/>7-day recurring reminders]
     A2 --> A2D{Approver 2 decision}
     A2D -->|Reject| REJ
-    A2D -->|Query / On Hold| HOLD2[Record query; remain at Approval 2]
+    A2D -->|Query / On Hold| HOLD2[Record query; remain at Approval 2<br/>30-day recurring reminders]
     HOLD2 --> HOLD2R[Purchase Ledger resolves query and resumes]
     HOLD2R -->|No repeat stage email| A2D
     A2D -->|Approve| APPR
 
     APPR[Approved] --> APPR1[Notify Purchase Ledger once<br/>Show in Approved for Payment]
-    APPR1 --> ROUTE{Choose payment route}
+    APPR1 --> ROUTE{Supplier default payment method valid?}
+    ROUTE -->|No| PAYHOLD[Payment routing issue / On Hold]
+    PAYHOLD --> ROUTE
     ROUTE -->|BACS / Bankline| PAY[Purchase Ledger deliberately records payment<br/>date, method and reference]
     ROUTE -->|Foreign POA| ALLOC[Record foreign payment allocation]
     ALLOC --> PAY
@@ -82,7 +84,7 @@ flowchart TD
     class C,E,F,G,PO1,PO2,N1,A1,A2,APPR1 automated;
     class D,NR1,NR2,CONF,PO3,POQ1,POQ2,PO5,N2,HOLD1R,HOLD2R,ALLOC,PAY,REC human;
     class B,H,DUP,R,PO4,N3,A1D,A2Q,A2D,ROUTE decision;
-    class NR,NR3,POQ,HOLD1,HOLD2,REJ,STOP1 exception;
+    class NR,NR3,POQ,HOLD1,HOLD2,PAYHOLD,REJ,STOP1 exception;
     class A,APPR,PAID,DONE complete;
 ```
 

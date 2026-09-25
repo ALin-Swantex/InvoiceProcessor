@@ -512,6 +512,11 @@ def test_delete_invoice_removes_sharepoint_drive_item(
         files={"file": ("supplier-invoice.pdf", VALID_PDF_BYTES, "application/pdf")},
     )
     invoice_id = upload.json()["id"]
+    client.app.state.invoice_store.update_fields(
+        invoice_id,
+        status="Needs Review",
+        duplicate_of_invoice_id=999,
+    )
 
     deleted = client.delete(f"/api/invoices/{invoice_id}")
 

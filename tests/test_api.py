@@ -161,7 +161,7 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert 'window.addEventListener("beforeunload"' in home.text
     assert "/api/invoice-search/filter?${params}" in home.text
     assert "Purchase Ledger: confirm invoice" in home.text
-    assert '<button class="danger" id="delete-invoice-button">' in home.text
+    assert 'id="delete-invoice-button" style="display:none">Delete duplicate' in home.text
     assert 'sendJson(`/api/invoices/${invoice.id}`, "DELETE")' in home.text
     assert "Manually add an invoice to Incoming Invoices" in home.text
     assert "Confirmation and automatic routing" not in home.text

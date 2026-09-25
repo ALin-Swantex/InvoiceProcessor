@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -42,6 +42,7 @@ from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
 from app.suppliers import get_supplier as _default_get_supplier
+from app.supplier_terms import SupplierTermsStore
 from app.workflow import (
     ConfirmedInvoice,
     RoutingValidationError,
@@ -103,6 +104,7 @@ class InvoiceLifecycle:
         companies_store: CompanyStore | None = None,
         approval_matrix_store: ApprovalMatrixStore | None = None,
         suppliers_store: SupplierStore | None = None,
+        supplier_terms_store: SupplierTermsStore | None = None,
         configuration_getter: Callable[[str, str | None], str | None] | None = None,
         extraction_runner: Callable[[Path], ExtractionResult] = run_ai_extraction,
         classification_runner: Callable[[Path], DocumentClassification] = (
@@ -116,6 +118,7 @@ class InvoiceLifecycle:
         self.companies_store = companies_store
         self.approval_matrix_store = approval_matrix_store
         self.suppliers_store = suppliers_store
+        self.supplier_terms_store = supplier_terms_store
         self.configuration_getter = configuration_getter
         self.extraction_runner = extraction_runner
         self.classification_runner = classification_runner
@@ -165,6 +168,130 @@ class InvoiceLifecycle:
             message=f"Stage email '{stage}' sent to {recipient}.",
             invoice_id=invoice_id,
         )
+
+    @staticmethod
+    def _app_url(tab: str) -> str:
+        base = os.environ.get("APP_PUBLIC_URL", "http://127.0.0.1:8000").rstrip("/")
+        return f"{base}/?tab={tab}"
+
+    def _approval_email_body(self, invoice: InvoiceRecord, level: int, *, reminder: bool) -> str:
+        prefix = "Reminder: " if reminder else ""
+        return (
+            f"{prefix}invoice {invoice.irj_number or invoice.original_filename} "
+            f"({invoice.supplier or 'supplier unknown'}) is waiting for your approval.\n\n"
+            f"View all pending invoices: {self._app_url(f'approver{level}')}"
+        )
+
+    def _notify_purchase_ledger_rejection(self, invoice: InvoiceRecord) -> None:
+        try:
+            self._send_stage_email_once(
+                invoice.id,
+                "rejected_purchase_ledger",
+                recipient=os.environ.get(
+                    "PURCHASE_LEDGER_NOTIFICATION_EMAIL",
+                    "purchase-ledger@example.test",
+                ),
+                subject=f"Invoice ({invoice.original_filename}) rejected",
+                body=(
+                    f"Invoice {invoice.irj_number or invoice.original_filename} "
+                    f"({invoice.supplier or 'supplier unknown'}) was rejected.\n"
+                    f"Reason: {invoice.rejection_reason or 'No reason recorded.'}\n\n"
+                    f"View rejected invoices: {self._app_url('rejected')}"
+                ),
+            )
+        except Exception as error:
+            self.activity_feed.add_event(
+                event_type="email_notification_failed",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=f"Purchase Ledger rejection email failed: {error}",
+                invoice_id=invoice.id,
+            )
+
+    @staticmethod
+    def _as_utc(value: str | datetime | None) -> datetime | None:
+        if not value:
+            return None
+        parsed = (
+            value
+            if isinstance(value, datetime)
+            else datetime.fromisoformat(value.replace("Z", "+00:00"))
+        )
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+    def process_scheduled_notifications(self, *, now: datetime | None = None) -> int:
+        """Send due recurring approval reminders and retry rejection notices."""
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        sent = 0
+        for invoice in self.invoice_store.list_all():
+            if invoice.status == "Rejected":
+                self._notify_purchase_ledger_rejection(invoice)
+                continue
+            if invoice.status not in ("Awaiting Approval 1", "Awaiting Approval 2"):
+                continue
+            level = 1 if invoice.status.endswith("1") else 2
+            recipient = getattr(invoice, f"approver{level}_email")
+            if not recipient:
+                continue
+            on_hold = invoice.hold_level == level
+            if on_hold:
+                anchor = self._as_utc(
+                    invoice.approval_hold_reminder_sent_at
+                    or invoice.approval_hold_started_at
+                )
+                interval = timedelta(days=30)
+                timestamp_field = "approval_hold_reminder_sent_at"
+                stage_prefix = "approval_hold_reminder"
+            else:
+                anchor = self._as_utc(
+                    invoice.approval_reminder_sent_at or invoice.approval_requested_at
+                )
+                interval = timedelta(days=7)
+                timestamp_field = "approval_reminder_sent_at"
+                stage_prefix = "approval_reminder"
+            if anchor is None or current < anchor + interval:
+                continue
+            due_at = anchor + interval
+            stage = f"{stage_prefix}_{level}_{due_at.date().isoformat()}"
+            before = self.activity_feed.claim_email_stage(invoice.id, stage)
+            if not before:
+                continue
+            try:
+                did_send = send_email_notification(
+                    recipient=str(recipient),
+                    subject=(
+                        f"{'On-hold ' if on_hold else ''}invoice approval reminder: "
+                        f"{invoice.irj_number or invoice.original_filename}"
+                    ),
+                    body=self._approval_email_body(invoice, level, reminder=True),
+                )
+            except Exception as error:
+                self.activity_feed.release_email_stage(invoice.id, stage)
+                self.activity_feed.add_event(
+                    event_type="email_notification_failed",
+                    target_role=(
+                        ROLE_APPROVER_1 if level == 1 else ROLE_APPROVER_2
+                    ),
+                    message=f"Approval reminder email failed: {error}",
+                    invoice_id=invoice.id,
+                )
+                continue
+            if not did_send:
+                self.activity_feed.release_email_stage(invoice.id, stage)
+                continue
+            self.invoice_store.update_fields(
+                invoice.id, **{timestamp_field: current.isoformat()}
+            )
+            self.activity_feed.add_event(
+                event_type="approval_reminder_sent",
+                target_role=ROLE_APPROVER_1 if level == 1 else ROLE_APPROVER_2,
+                message=(
+                    f"{'30-day on-hold' if on_hold else '7-day'} approval reminder "
+                    f"sent to {recipient}."
+                ),
+                invoice_id=invoice.id,
+            )
+            sent += 1
+        return sent
 
     # ------------------------------------------------------------------
     # Stage 1: AI extraction
@@ -794,7 +921,7 @@ class InvoiceLifecycle:
                 ),
                 invoice_id=invoice_id,
             )
-            return record
+            return self.auto_route_for_payment(record.id)
 
         entry = self._find_approvers(str(invoice.company), str(invoice.supplier))
         missing_route_detail = None
@@ -855,6 +982,10 @@ class InvoiceLifecycle:
             approver2_name=entry.approver2.name if entry.approver2 else None,
             approver2_email=entry.approver2.email if entry.approver2 else None,
             review_reason=None,
+            approval_requested_at=now,
+            approval_reminder_sent_at=None,
+            approval_hold_started_at=None,
+            approval_hold_reminder_sent_at=None,
         )
         self._send_stage_email_once(
             invoice_id,
@@ -863,11 +994,7 @@ class InvoiceLifecycle:
             subject=(
                 f"New invoice ({invoice.original_filename}) waiting for approval"
             ),
-            body=(
-                f"New invoice ({invoice.original_filename}) is waiting for your "
-                f"approval. IRJ: {invoice.irj_number}. Supplier: "
-                f"{invoice.supplier}."
-            ),
+            body=self._approval_email_body(record, 1, reminder=False),
         )
         self.activity_feed.add_event(
             event_type="approval_pending",
@@ -925,6 +1052,7 @@ class InvoiceLifecycle:
             ),
             invoice_id=invoice_id,
         )
+        self._notify_purchase_ledger_rejection(record)
         return record
 
     def cancel_confirmed_duplicate(
@@ -1049,6 +1177,10 @@ class InvoiceLifecycle:
                 "status": expected_status,
                 "hold_level": level,
                 "hold_reason": history,
+                "approval_hold_started_at": (
+                    invoice.approval_hold_started_at or now
+                ),
+                "approval_hold_reminder_sent_at": None,
                 f"approver{level}_comments": getattr(
                     invoice, f"approver{level}_comments"
                 ),
@@ -1081,6 +1213,10 @@ class InvoiceLifecycle:
                 "status": "Rejected",
                 "hold_level": None,
                 "rejection_reason": comments,
+                "approval_requested_at": None,
+                "approval_reminder_sent_at": None,
+                "approval_hold_started_at": None,
+                "approval_hold_reminder_sent_at": None,
             }
             move_pdf(
                 REJECTED_INVOICES_FOLDER,
@@ -1093,6 +1229,7 @@ class InvoiceLifecycle:
                 message=f"Invoice {invoice.irj_number} rejected by {recorded_by}.",
                 invoice_id=invoice_id,
             )
+            self._notify_purchase_ledger_rejection(record)
             return record
 
         if level == 1 and invoice.approver2_name:
@@ -1110,6 +1247,10 @@ class InvoiceLifecycle:
                 ),
                 "status": "Awaiting Approval 2",
                 "hold_level": None,
+                "approval_requested_at": now,
+                "approval_reminder_sent_at": None,
+                "approval_hold_started_at": None,
+                "approval_hold_reminder_sent_at": None,
             }
             move_pdf(
                 self._company_folders(invoice).nominal_approver_2,
@@ -1124,11 +1265,7 @@ class InvoiceLifecycle:
                     f"New invoice ({invoice.original_filename}) waiting for "
                     "approval"
                 ),
-                body=(
-                    f"New invoice ({invoice.original_filename}) is waiting for "
-                    f"your approval. IRJ: {invoice.irj_number}. Supplier: "
-                    f"{invoice.supplier}."
-                ),
+                body=self._approval_email_body(record, 2, reminder=False),
             )
             self.activity_feed.add_event(
                 event_type="approval_pending",
@@ -1155,6 +1292,10 @@ class InvoiceLifecycle:
             ),
             "status": "Approved",
             "hold_level": None,
+            "approval_requested_at": None,
+            "approval_reminder_sent_at": None,
+            "approval_hold_started_at": None,
+            "approval_hold_reminder_sent_at": None,
         }
         move_pdf(
             self._company_folders(invoice).approved_for_payment,
@@ -1187,7 +1328,7 @@ class InvoiceLifecycle:
             message=f"Invoice {invoice.irj_number} fully approved and ready for payment.",
             invoice_id=invoice_id,
         )
-        return record
+        return self.auto_route_for_payment(record.id)
 
     def resume_approval(
         self,
@@ -1198,6 +1339,33 @@ class InvoiceLifecycle:
     ) -> InvoiceRecord:
         """Clear an approval query without advancing the invoice."""
         invoice = self._require_invoice(invoice_id)
+        if invoice.status == "Workflow Issue / On Hold" and invoice.review_return_status:
+            return_status = invoice.review_return_status
+            destination = self._folder_for_status(invoice, return_status)
+            if destination is not None:
+                self._move_pdf_in_sharepoint(
+                    invoice, destination, self._filed_filename(invoice)
+                )
+            record = self.invoice_store.update_fields(
+                invoice_id,
+                status=return_status,
+                review_return_status=None,
+                hold_reason=_append_history_entry(
+                    invoice.hold_reason,
+                    f"{recorded_by} resolved workflow issue",
+                    resolution_notes or "Resolved without additional notes.",
+                ),
+            )
+            self.activity_feed.add_event(
+                event_type="workflow_resumed",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Invoice {invoice.irj_number or invoice.original_filename} issue "
+                    f"resolved; returned to {return_status}."
+                ),
+                invoice_id=invoice_id,
+            )
+            return record
         legacy_hold = invoice.status == "Approval Query / On Hold"
         level = invoice.hold_level or (1 if legacy_hold else None)
         expected_status = f"Awaiting Approval {level}" if level in (1, 2) else None
@@ -1227,6 +1395,10 @@ class InvoiceLifecycle:
                 f"{recorded_by} resolved approval query",
                 resolution_notes or "Resolved without additional notes.",
             ),
+            approval_requested_at=datetime.now(timezone.utc).isoformat(),
+            approval_reminder_sent_at=None,
+            approval_hold_started_at=None,
+            approval_hold_reminder_sent_at=None,
         )
         self.activity_feed.add_event(
             event_type="approval_resumed",
@@ -1326,11 +1498,26 @@ class InvoiceLifecycle:
             )
         if not reason.strip():
             raise InvoiceLifecycleError("A review reason is required.")
-        self._move_to_flagged(invoice)
+        initial_stage = invoice.status in ("Awaiting AI Extraction", "Needs Review")
+        if initial_stage:
+            self._move_to_flagged(invoice)
+        else:
+            self._move_pdf_in_sharepoint(
+                invoice,
+                self._company_folders(invoice).nominal_on_hold,
+                self._filed_filename(invoice),
+            )
         record = self.invoice_store.update_fields(
             invoice_id,
-            status="Needs Review",
-            review_reason=reason.strip(),
+            status="Needs Review" if initial_stage else "Workflow Issue / On Hold",
+            review_reason=reason.strip() if initial_stage else invoice.review_reason,
+            hold_reason=(
+                invoice.hold_reason
+                if initial_stage
+                else _append_history_entry(
+                    invoice.hold_reason, "Workflow issue recorded", reason
+                )
+            ),
             review_return_status=invoice.status,
         )
         self.activity_feed.add_event(
@@ -1404,6 +1591,7 @@ class InvoiceLifecycle:
             ),
             invoice_id=invoice_id,
         )
+        self._notify_purchase_ledger_rejection(record)
         return record
 
     def reject_flagged_invoice(
@@ -1437,15 +1625,16 @@ class InvoiceLifecycle:
             ),
             invoice_id=invoice_id,
         )
+        self._notify_purchase_ledger_rejection(record)
         return record
 
     def route_for_payment(
         self, invoice_id: int, *, route: str, recorded_by: str
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
-        if invoice.status != "Approved":
+        if invoice.status not in ("Approved", "Payment Routing Issue / On Hold"):
             raise InvoiceLifecycleError(
-                f"Only Approved invoices can be routed for payment "
+                f"Only approved invoices can be routed for payment "
                 f"(status: {invoice.status})."
             )
         routes = {
@@ -1491,6 +1680,7 @@ class InvoiceLifecycle:
             foreign_allocation_date=None,
             foreign_allocation_reference=None,
             foreign_allocated_by=None,
+            hold_reason=None,
         )
         self.activity_feed.add_event(
             event_type="payment_route_selected",
@@ -1498,6 +1688,80 @@ class InvoiceLifecycle:
             message=(
                 f"Invoice {invoice.irj_number} routed to {payment_method} "
                 f"by {recorded_by}."
+            ),
+            invoice_id=invoice_id,
+        )
+        return record
+
+    @staticmethod
+    def _normalize_payment_route(value: str | None) -> str | None:
+        normalized = (value or "").strip().casefold().replace("_", " ").replace("-", " ")
+        normalized = " ".join(normalized.split())
+        aliases = {
+            "bacs": "bacs",
+            "bankline": "bankline",
+            "foreign poa": "foreign_poa",
+            "foreign": "foreign_poa",
+        }
+        return aliases.get(normalized)
+
+    def auto_route_for_payment(self, invoice_id: int) -> InvoiceRecord:
+        invoice = self._require_invoice(invoice_id)
+        if invoice.status not in ("Approved", "Payment Routing Issue / On Hold"):
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} is not ready for payment routing "
+                f"(status: {invoice.status})."
+            )
+        reason: str | None = None
+        route: str | None = None
+        if self.supplier_terms_store is None:
+            reason = "Supplier payment settings are unavailable."
+        else:
+            profiles = self.supplier_terms_store.list_for_supplier(
+                str(invoice.company or ""), str(invoice.supplier or "")
+            )
+            configured = {
+                self._normalize_payment_route(profile.default_payment_method)
+                for profile in profiles
+                if profile.default_payment_method
+            }
+            invalid = [
+                profile.default_payment_method
+                for profile in profiles
+                if profile.default_payment_method
+                and self._normalize_payment_route(profile.default_payment_method) is None
+            ]
+            if not profiles or not configured:
+                reason = (
+                    "No supported default payment method is configured for this "
+                    "company and supplier."
+                )
+            elif invalid:
+                reason = f"Unsupported supplier payment method: {invalid[0]}."
+            elif len(configured) > 1:
+                reason = "Supplier account profiles contain conflicting payment methods."
+            else:
+                route = next(iter(configured))
+        if route is not None:
+            return self.route_for_payment(
+                invoice_id,
+                route=route,
+                recorded_by="Automatic supplier payment routing",
+            )
+        record = self.invoice_store.update_fields(
+            invoice_id,
+            status="Payment Routing Issue / On Hold",
+            payment_method=None,
+            hold_reason=reason,
+            payment_route_decided_at=None,
+            payment_route_decided_by=None,
+        )
+        self.activity_feed.add_event(
+            event_type="payment_routing_on_hold",
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=(
+                f"Invoice {invoice.irj_number or invoice.original_filename} is on hold: "
+                f"{reason}"
             ),
             invoice_id=invoice_id,
         )
@@ -1690,17 +1954,9 @@ class InvoiceLifecycle:
 
     def delete_invoice(self, invoice_id: int, *, recorded_by: str) -> None:
         invoice = self._require_invoice(invoice_id)
-        deletable_statuses = {
-            "Awaiting AI Extraction",
-            "Needs Review",
-            "Awaiting PO Matching",
-            "PO Query / Matching Issue",
-            "Awaiting Sage Registration",
-        }
-        if invoice.status not in deletable_statuses:
+        if invoice.status != "Needs Review" or invoice.duplicate_of_invoice_id is None:
             raise InvoiceLifecycleError(
-                "Invoices can only be deleted before they enter approval or "
-                "payment processing."
+                "Only a possible duplicate in Incoming review can be permanently deleted."
             )
 
         if invoice.sharepoint_item_id:
@@ -1808,6 +2064,8 @@ class InvoiceLifecycle:
             "Approval 1 Query / On Hold": structure.nominal_on_hold,
             "Approval 2 Query / On Hold": structure.nominal_on_hold,
             "Approved": structure.approved_for_payment,
+            "Payment Routing Issue / On Hold": structure.approved_for_payment,
+            "Workflow Issue / On Hold": structure.nominal_on_hold,
             "Approved for Payment - BACS": structure.approved_bacs,
             "Approved for Payment - Bankline": structure.approved_bankline,
             "Approved for Payment - Foreign POA": structure.approved_foreign_poa,
