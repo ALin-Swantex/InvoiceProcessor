@@ -3,9 +3,16 @@ import os
 import pytest
 
 
-# Test modules import app.main during collection. Define these before those
-# imports so load_dotenv() cannot activate real Entra credentials or initiate
-# tenant discovery during an offline test run.
+# Isolate the whole suite from the developer's real configuration. The flag
+# stops load_project_environment() reading .env, and any credentials already
+# exported in the shell are removed so tests never reach live services.
+os.environ["INVOICE_PROCESSOR_SKIP_DOTENV"] = "1"
+for _name in list(os.environ):
+    if _name.startswith(
+        ("OUTLOOK_MCP_", "AZURE_POSTGRES_", "SHAREPOINT_", "EXCEL_CONVERSION_")
+    ) or _name in {"DATABASE_URL", "INVOICE_EXTRACTION_MODEL", "AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID"}:
+        del os.environ[_name]
+
 os.environ["AUTH_ENTRA_TENANT_ID"] = ""
 os.environ["AUTH_ENTRA_CLIENT_ID"] = ""
 os.environ["AUTH_ENTRA_CLIENT_SECRET"] = ""

@@ -77,8 +77,6 @@ from app.workflow import (
     route_confirmed_invoice,
 )
 
-load_project_environment()
-
 logger = logging.getLogger("invoice_processor")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -6089,4 +6087,16 @@ def create_app(
     return app
 
 
-app = create_app()
+def __getattr__(name: str) -> object:
+    """Build the default application lazily.
+
+    ``uvicorn app.main:app`` resolves ``app`` through this hook, so importing
+    this module (for example from tests) no longer loads ``.env`` or connects
+    store configuration as a side effect.
+    """
+    if name == "app":
+        load_project_environment()
+        default_app = create_app()
+        globals()["app"] = default_app
+        return default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
