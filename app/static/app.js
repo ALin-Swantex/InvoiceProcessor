@@ -82,6 +82,128 @@
               }
             }
 
+            // ---------------------------------------------------------
+            // Theme, navigation drawer and page header
+            // ---------------------------------------------------------
+            const THEME_STORAGE_KEY = "invoice-processor-theme";
+            const SIDEBAR_STORAGE_KEY = "invoice-processor-sidebar-collapsed";
+            const themeQuery = window.matchMedia
+              ? window.matchMedia("(prefers-color-scheme: dark)")
+              : null;
+            const drawerQuery = window.matchMedia
+              ? window.matchMedia("(max-width: 960px)")
+              : null;
+            const sidebar = document.querySelector(".sidebar");
+            const navToggle = document.getElementById("nav-toggle");
+
+            function effectiveTheme() {
+              const chosen = document.documentElement.dataset.theme;
+              if (chosen === "light" || chosen === "dark") return chosen;
+              return themeQuery && themeQuery.matches ? "dark" : "light";
+            }
+
+            function syncThemeControls() {
+              const theme = effectiveTheme();
+              document.documentElement.dataset.effectiveTheme = theme;
+              const label = theme === "dark"
+                ? "Switch to light theme"
+                : "Switch to dark theme";
+              document.querySelectorAll("[data-theme-toggle]").forEach(button => {
+                button.setAttribute("aria-label", label);
+                button.title = label;
+              });
+            }
+
+            document.querySelectorAll("[data-theme-toggle]").forEach(button => {
+              button.addEventListener("click", () => {
+                const next = effectiveTheme() === "dark" ? "light" : "dark";
+                document.documentElement.dataset.theme = next;
+                storeValue(THEME_STORAGE_KEY, next);
+                syncThemeControls();
+              });
+            });
+            if (themeQuery && themeQuery.addEventListener) {
+              themeQuery.addEventListener("change", syncThemeControls);
+            }
+
+            function isDrawerLayout() {
+              return Boolean(drawerQuery && drawerQuery.matches);
+            }
+
+            function syncNavigationState() {
+              const drawer = isDrawerLayout();
+              const open = drawer
+                ? appRoot.classList.contains("nav-open")
+                : !appRoot.classList.contains("sidebar-collapsed");
+              navToggle.setAttribute("aria-expanded", String(open));
+              navToggle.setAttribute(
+                "aria-label",
+                open ? "Hide navigation" : "Show navigation"
+              );
+              // A hidden sidebar must not be reachable with the keyboard.
+              sidebar.inert = !open;
+              document.body.style.overflow = drawer && open ? "hidden" : "";
+            }
+
+            function closeDrawer({ restoreFocus = true } = {}) {
+              if (!appRoot.classList.contains("nav-open")) return;
+              appRoot.classList.remove("nav-open");
+              syncNavigationState();
+              if (restoreFocus) navToggle.focus();
+            }
+
+            navToggle.addEventListener("click", () => {
+              if (isDrawerLayout()) {
+                appRoot.classList.toggle("nav-open");
+                syncNavigationState();
+                if (appRoot.classList.contains("nav-open")) {
+                  (sidebar.querySelector("button.active") ||
+                    sidebar.querySelector("#section-nav button"))?.focus();
+                }
+              } else {
+                const collapsed = appRoot.classList.toggle("sidebar-collapsed");
+                storeValue(SIDEBAR_STORAGE_KEY, collapsed ? "1" : "0");
+                syncNavigationState();
+              }
+            });
+            document.getElementById("nav-close").addEventListener(
+              "click",
+              () => closeDrawer()
+            );
+            document.getElementById("nav-scrim").addEventListener(
+              "click",
+              () => closeDrawer()
+            );
+            document.addEventListener("keydown", event => {
+              if (event.key === "Escape" && appRoot.classList.contains("nav-open")) {
+                closeDrawer();
+              }
+            });
+            if (drawerQuery && drawerQuery.addEventListener) {
+              drawerQuery.addEventListener("change", () => {
+                appRoot.classList.remove("nav-open");
+                syncNavigationState();
+              });
+            }
+            if (storedValue(SIDEBAR_STORAGE_KEY) === "1") {
+              appRoot.classList.add("sidebar-collapsed");
+            }
+            syncThemeControls();
+            syncNavigationState();
+
+            function updatePageHeader(button) {
+              const label = [...button.childNodes]
+                .filter(node => node.nodeType === Node.TEXT_NODE)
+                .map(node => node.textContent)
+                .join("")
+                .trim();
+              const group = button.closest(".nav-group")
+                ?.querySelector(".nav-group-label")?.textContent || "";
+              document.getElementById("page-title").textContent = label;
+              document.getElementById("page-group").textContent = group;
+              document.title = `${label} · Swantex Invoice Processing`;
+            }
+
             function activateTab(tab) {
               const button = document.querySelector(
                 `#section-nav button[data-tab="${tab}"]`
@@ -91,7 +213,13 @@
               storeValue(ACTIVE_TAB_STORAGE_KEY, tab);
               document.querySelectorAll("#section-nav button").forEach(item => {
                 item.classList.toggle("active", item === button);
+                if (item === button) {
+                  item.setAttribute("aria-current", "page");
+                } else {
+                  item.removeAttribute("aria-current");
+                }
               });
+              updatePageHeader(button);
               document.querySelectorAll(".tab-panel").forEach(panel => {
                 panel.classList.toggle("active", panel.dataset.tabPanel === tab);
               });
@@ -132,18 +260,67 @@
                 element.title = confidence == null
                   ? "No field confidence was recorded."
                   : `AI confidence: ${Math.round(Number(confidence) * 100)}%`;
-                element.style.outline = confidence != null && Number(confidence) < 0.8
-                  ? "2px solid #d97706"
-                  : "";
+                markFieldConfidence(element, confidence);
+              }
+            }
+
+            // Low-confidence fields get a warning style plus a text badge
+            // so the cue does not rely on colour alone.
+            function markFieldConfidence(element, confidence) {
+              const label = element.closest("label");
+              if (!label) return;
+              const low = confidence != null && Number(confidence) < 0.8;
+              label.classList.toggle("low-confidence", low);
+              let note = label.querySelector(".confidence-note");
+              if (low) {
+                if (!note) {
+                  note = document.createElement("span");
+                  note.className = "confidence-note";
+                  note.id = `${element.id}-confidence-note`;
+                  label.appendChild(note);
+                }
+                note.textContent =
+                  `Low AI confidence (${Math.round(Number(confidence) * 100)}%) — please check`;
+                element.setAttribute("aria-describedby", note.id);
+              } else {
+                if (note) note.textContent = "";
+                element.removeAttribute("aria-describedby");
               }
             }
 
             function showToast(message, isError) {
               const toast = document.createElement("div");
               toast.className = "toast" + (isError ? " error" : "");
-              toast.textContent = message;
+              const icon = document.createElement("span");
+              icon.className = "toast-icon";
+              icon.setAttribute("aria-hidden", "true");
+              icon.textContent = isError ? "!" : "✓";
+              const text = document.createElement("div");
+              text.className = "toast-message";
+              if (isError) {
+                const prefix = document.createElement("span");
+                prefix.className = "visually-hidden";
+                prefix.textContent = "Error: ";
+                text.appendChild(prefix);
+              }
+              text.appendChild(document.createTextNode(message));
+              const close = document.createElement("button");
+              close.type = "button";
+              close.className = "toast-close";
+              close.setAttribute("aria-label", "Dismiss notification");
+              close.textContent = "×";
+              toast.append(icon, text, close);
+              let removed = false;
+              const dismiss = () => {
+                if (removed) return;
+                removed = true;
+                toast.classList.add("leaving");
+                window.setTimeout(() => toast.remove(), 180);
+              };
+              close.addEventListener("click", dismiss);
               toastContainer.appendChild(toast);
-              setTimeout(() => toast.remove(), 5000);
+              // Errors stay a little longer so they can be read.
+              window.setTimeout(dismiss, isError ? 8000 : 5000);
             }
 
             async function showInvoice(invoice) {
@@ -271,6 +448,10 @@
               document.getElementById("delete-invoice-button").disabled = true;
               document.getElementById("supplier-match-prompt").style.display = "none";
               document.getElementById("confirm-supplier-match").dataset.supplier = "";
+              document.querySelectorAll(".review-card label.low-confidence").forEach(label => {
+                const control = label.querySelector("input, select");
+                if (control) markFieldConfidence(control, null);
+              });
               pdfFrame.removeAttribute("src");
               pdfFrame.style.display = "none";
               pdfEmpty.style.display = "grid";
@@ -328,6 +509,7 @@
                 );
                 if (!response.ok) {
                   showToast("Received invoices could not be loaded.", true);
+                  replaceLoadingSkeletons();
                   return;
                 }
                 const refreshedInvoices = await response.json();
@@ -344,7 +526,28 @@
                   "Received invoices could not be loaded. Retrying automatically.",
                   true
                 );
+                replaceLoadingSkeletons();
               }
+            }
+
+            // Tables show skeleton rows until their first render. If the very
+            // first load fails, swap them for an explanation instead of
+            // leaving a loading state on screen indefinitely.
+            function replaceLoadingSkeletons() {
+              document.querySelectorAll(".tab-panel .content > .skeleton").forEach(skeleton => {
+                skeleton.parentElement.innerHTML = emptyStateHtml(
+                  "Invoices could not be loaded",
+                  "The list will refresh automatically. Check your connection if this persists."
+                );
+              });
+            }
+
+            function emptyStateHtml(title, detail) {
+              return '<div class="empty-state">' +
+                '<span class="empty-state-icon" aria-hidden="true"><svg><use href="#icon-inbox"/></svg></span>' +
+                `<strong>${escapeHtml(title)}</strong>` +
+                (detail ? `<p>${escapeHtml(detail)}</p>` : "") +
+                "</div>";
             }
 
             async function loadCompanies() {
@@ -544,7 +747,10 @@
                       (tab !== "on-hold" || i.status.includes("On Hold") || i.hold_level)
                     ).length;
                 const el = document.getElementById(`count-${tab}`);
-                if (el) el.textContent = String(count);
+                if (el) {
+                  el.textContent = String(count);
+                  el.classList.toggle("has-items", count > 0);
+                }
               }
             }
 
@@ -588,7 +794,8 @@
             function analysisField(label, value, confidence = null) {
               const confidenceBadge = confidence === null || confidence === undefined
                 ? ""
-                : `<span class="field-confidence">${Math.round(Number(confidence) * 100)}%</span>`;
+                : `<span class="field-confidence${Number(confidence) < 0.8 ? " low" : ""}" ` +
+                  `title="AI confidence">${Math.round(Number(confidence) * 100)}%</span>`;
               return `<dt>${escapeHtml(label)}</dt><dd>${analysisValue(value)}${confidenceBadge}</dd>`;
             }
 
@@ -780,15 +987,38 @@
               ]);
             }
 
+            // One consistent colour per lifecycle stage for status pills.
+            function statusTone(status) {
+              const value = String(status || "");
+              if (/^(Rejected|Cancelled)/.test(value)) return "danger";
+              if (/On Hold|Query|Issue|Needs Review/.test(value)) return "warn";
+              if (/^(Reconciled|Statement Filed)/.test(value)) return "neutral";
+              if (/^(Approved|Paid)/.test(value)) return "success";
+              if (/PO Matching|Sage Registration/.test(value)) return "violet";
+              return "info";
+            }
+
+            function statusPillHtml(status) {
+              return `<span class="status-pill" data-tone="${statusTone(status)}">` +
+                `${escapeHtml(status)}</span>`;
+            }
+
             function invoiceRowHtml(invoice, columns, actionsFn) {
               const expanded = expandedInvoiceIds.has(String(invoice.id));
               let html = `<tr class="invoice-summary-row" data-expand-invoice="${invoice.id}" ` +
                 `tabindex="0" aria-expanded="${expanded}" title="Click to view invoice analysis">`;
               for (const column of columns) {
+                const label = escapeHtml(column.label);
                 const value = escapeHtml(column.value(invoice));
-                html += column.boxed
-                  ? `<td class="invoice-description-cell"><div class="mini-description">${value}</div></td>`
-                  : `<td>${value}</td>`;
+                if (column.boxed) {
+                  html += `<td class="invoice-description-cell" data-label="${label}">` +
+                    `<div class="mini-description">${value}</div></td>`;
+                } else if (column.pill) {
+                  html += `<td data-label="${label}">${statusPillHtml(column.value(invoice))}</td>`;
+                } else {
+                  html += `<td${column.className ? ` class="${column.className}"` : ""} ` +
+                    `data-label="${label}">${value}</td>`;
+                }
               }
               html += `<td class="row-actions"><div class="row-action-buttons">` +
                 `${actionsFn(invoice)}</div>` +
@@ -867,7 +1097,9 @@
               const previous = renderedSectionState.get(containerId);
               if (previous && previous.signature === signature) return;
               if (!rows.length) {
-                container.innerHTML = '<div class="empty-state">No documents in this section.</div>';
+                const [emptyTitle, emptyDetail] = SECTION_EMPTY_COPY[containerId] ||
+                  ["No documents in this section.", ""];
+                container.innerHTML = emptyStateHtml(emptyTitle, emptyDetail);
                 renderedSectionState.set(containerId, { signature, tbody: null, rows: new Map() });
                 return;
               }
@@ -916,13 +1148,13 @@
                 });
                 return;
               }
-              let html = '<table class="section-table"><thead><tr>';
-              for (const column of columns) html += `<th>${column.label}</th>`;
-              html += "<th>Actions</th></tr></thead><tbody>";
+              let html = '<div class="table-wrap"><table class="section-table invoice-table"><thead><tr>';
+              for (const column of columns) html += `<th scope="col">${column.label}</th>`;
+              html += '<th scope="col">Actions</th></tr></thead><tbody>';
               for (const invoice of rows) {
                 html += invoiceRowHtml(invoice, columns, actionsFn);
               }
-              html += "</tbody></table>";
+              html += "</tbody></table></div>";
               container.innerHTML = html;
               bindInvoiceRowEvents(container, containerId);
               const tbody = container.querySelector("tbody");
@@ -984,13 +1216,29 @@
 
             const BASE_COLUMNS = [
               { label: "Type", value: i => i.document_type === "statement" ? "Statement" : "Invoice" },
-              { label: "IRJ", value: i => i.irj_number || "—" },
+              { label: "IRJ", value: i => i.irj_number || "—", className: "cell-irj" },
               { label: "Company", value: i => i.company || "—" },
               { label: "Supplier", value: i => i.supplier || "—" },
-              { label: "File", value: i => i.original_filename },
-              { label: "Status", value: i => i.status },
+              { label: "File", value: i => i.original_filename, className: "cell-file" },
+              { label: "Status", value: i => i.status, pill: true },
               { label: "Description", value: invoiceDescription, boxed: true },
             ];
+
+            const SECTION_EMPTY_COPY = {
+              "needs-review-table": ["Nothing flagged", "Documents the AI cannot route confidently, or that someone flags, will appear here for Purchase Ledger review."],
+              "po-matching-table": ["No invoices awaiting PO matching", "Invoices with a purchase order number arrive here after confirmation."],
+              "sage-registration-table": ["Nothing to register in Sage", "Confirmed nominal invoices appear here until their Sage registration and IRJ are confirmed."],
+              "approver1-table": ["No approvals waiting", "Invoices routed to you as first approver will appear here."],
+              "approver2-table": ["No approvals waiting", "Invoices that need a second approval will appear here."],
+              "on-hold-table": ["Nothing on hold", "Approval queries and routing issues will appear here until they are resolved."],
+              "approved-table": ["No approved invoices waiting", "Approved invoices pass through here on their way to a payment run."],
+              "payment-bacs-table": ["No BACS payments due", "Invoices routed for BACS payment will appear here."],
+              "payment-bankline-table": ["No Bankline payments due", "Invoices routed for Bankline payment will appear here."],
+              "payment-foreign-poa-table": ["No foreign payments due", "Foreign currency invoices awaiting payment or allocation will appear here."],
+              "reconciliation-table": ["Nothing to reconcile", "Paid invoices wait here until they appear on a bank statement."],
+              "complete-table": ["No completed documents yet", "Reconciled invoices and filed statements will appear here."],
+              "rejected-table": ["No rejected documents", "Rejected invoices and cancelled duplicates will appear here."],
+            };
 
             function pdfLinkButton(invoice) {
               return `<a class="action-link" href="/api/invoices/${invoice.id}/pdf" ` +
@@ -1581,6 +1829,144 @@
               });
             }
 
+            // ---------------------------------------------------------
+            // In-page dialogs replacing window.prompt / window.confirm.
+            // formDialog() resolves to an object of field values, or null
+            // when cancelled (Cancel button, Escape, or closing the dialog).
+            // ---------------------------------------------------------
+            const uiDialog = document.getElementById("ui-dialog");
+            let uiDialogPending = null;
+
+            function formDialog({
+              title,
+              message = "",
+              fields = [],
+              confirmLabel = "OK",
+              cancelLabel = "Cancel",
+              tone = "default",
+              scrollMessage = false,
+            }) {
+              if (uiDialogPending) uiDialogPending(null);
+              const form = document.getElementById("ui-dialog-form");
+              const fieldContainer = document.getElementById("ui-dialog-fields");
+              const messageEl = document.getElementById("ui-dialog-message");
+              const errorEl = document.getElementById("ui-dialog-error");
+              const confirmButton = document.getElementById("ui-dialog-confirm");
+              const cancelButton = document.getElementById("ui-dialog-cancel");
+              const opener = document.activeElement;
+              document.getElementById("ui-dialog-title").textContent = title;
+              messageEl.textContent = message;
+              messageEl.hidden = !message;
+              messageEl.classList.toggle("scroll", scrollMessage);
+              errorEl.textContent = "";
+              confirmButton.textContent = confirmLabel;
+              cancelButton.textContent = cancelLabel;
+              confirmButton.className = tone === "danger" ? "danger-solid" : "primary";
+              form.classList.toggle("dialog-tone-danger", tone === "danger");
+              fieldContainer.replaceChildren();
+              fieldContainer.hidden = !fields.length;
+              const controls = [];
+              fields.forEach((field, index) => {
+                const label = document.createElement("label");
+                const caption = document.createElement("span");
+                caption.textContent = field.label;
+                if (field.required) {
+                  const mark = document.createElement("span");
+                  mark.className = "required-mark";
+                  mark.setAttribute("aria-hidden", "true");
+                  mark.textContent = " *";
+                  caption.appendChild(mark);
+                }
+                label.appendChild(caption);
+                const control = document.createElement(
+                  field.multiline ? "textarea" : "input"
+                );
+                if (!field.multiline) control.type = field.type || "text";
+                control.id = `ui-dialog-field-${index}`;
+                control.value = field.value ?? "";
+                control.required = Boolean(field.required);
+                control.placeholder = field.placeholder || "";
+                control.autocomplete = "off";
+                if (field.required) control.setAttribute("aria-required", "true");
+                label.appendChild(control);
+                fieldContainer.appendChild(label);
+                controls.push([field.name, control]);
+              });
+
+              return new Promise(resolve => {
+                const finish = value => {
+                  if (uiDialogPending !== finish) return;
+                  uiDialogPending = null;
+                  form.onsubmit = null;
+                  cancelButton.onclick = null;
+                  uiDialog.onclose = null;
+                  if (uiDialog.open) uiDialog.close();
+                  // Return focus to whatever opened the dialog when it is
+                  // still on the page; otherwise leave focus where it lands.
+                  if (opener && opener.isConnected && typeof opener.focus === "function") {
+                    window.requestAnimationFrame(() => {
+                      if (!opener.disabled) opener.focus();
+                    });
+                  }
+                  resolve(value);
+                };
+                uiDialogPending = finish;
+                form.onsubmit = event => {
+                  event.preventDefault();
+                  for (const [, control] of controls) {
+                    if (control.required && !control.value) {
+                      errorEl.textContent = "Please complete the required field.";
+                      control.focus();
+                      return;
+                    }
+                  }
+                  const values = {};
+                  for (const [name, control] of controls) values[name] = control.value;
+                  finish(values);
+                };
+                cancelButton.onclick = () => finish(null);
+                uiDialog.onclose = () => finish(null);
+                uiDialog.showModal();
+                const firstControl = controls.length ? controls[0][1] : null;
+                if (firstControl) {
+                  firstControl.focus();
+                } else if (tone === "danger") {
+                  cancelButton.focus();
+                } else {
+                  confirmButton.focus();
+                }
+              });
+            }
+
+            // Resolves true when confirmed, false when cancelled.
+            async function confirmDialog(options) {
+              return (await formDialog({ ...options, fields: [] })) !== null;
+            }
+
+            // Resolves to the entered text, or null when cancelled. A required
+            // prompt cannot be submitted empty.
+            async function promptDialog({
+              title,
+              message = "",
+              label,
+              value = "",
+              required = false,
+              multiline = true,
+              type = "text",
+              placeholder = "",
+              confirmLabel = "OK",
+              tone = "default",
+            }) {
+              const result = await formDialog({
+                title,
+                message,
+                confirmLabel,
+                tone,
+                fields: [{ name: "value", label, value, required, multiline, type, placeholder }],
+              });
+              return result === null ? null : result.value;
+            }
+
             async function handleRowAction(button) {
               const action = button.dataset.action;
               const id = button.dataset.id;
@@ -1613,16 +1999,37 @@
                     reason: null,
                   });
                 } else if (action === "reject-flagged") {
-                  const reason = window.prompt("Reason for rejecting this invoice:");
+                  const reason = await promptDialog({
+                    title: "Reject invoice",
+                    label: "Reason for rejecting this invoice",
+                    required: true,
+                    confirmLabel: "Reject invoice",
+                    tone: "danger",
+                  });
                   if (!reason) return;
                   await postJson(`/api/invoices/${id}/reject-flagged`, { reason });
                 } else if (action === "po-query") {
-                  const notes = window.prompt("Describe the PO matching issue:");
-                  if (notes === null) return;
-                  const queryCategory = window.prompt(
-                    "Query category (e.g. price discrepancy, missing PO, quantity mismatch):"
-                  );
-                  const purchasingContact = window.prompt("Purchasing contact to route this query to (optional):");
+                  const query = await formDialog({
+                    title: "Record PO query",
+                    message: "The query is routed back for resolution before the invoice can be matched.",
+                    confirmLabel: "Record query",
+                    fields: [
+                      { name: "notes", label: "Describe the PO matching issue", multiline: true },
+                      {
+                        name: "category",
+                        label: "Query category",
+                        placeholder: "e.g. price discrepancy, missing PO, quantity mismatch",
+                      },
+                      {
+                        name: "contact",
+                        label: "Purchasing contact to route this query to (optional)",
+                      },
+                    ],
+                  });
+                  if (query === null) return;
+                  const notes = query.notes;
+                  const queryCategory = query.category;
+                  const purchasingContact = query.contact;
                   await postJson(`/api/invoices/${id}/po-match`, {
                     matched: false,
                     notes,
@@ -1630,7 +2037,13 @@
                     purchasing_contact: purchasingContact || null,
                   });
                 } else if (action === "po-reject") {
-                  const reason = window.prompt("Reason for rejecting this PO invoice:");
+                  const reason = await promptDialog({
+                    title: "Reject PO invoice",
+                    label: "Reason for rejecting this PO invoice",
+                    required: true,
+                    confirmLabel: "Reject invoice",
+                    tone: "danger",
+                  });
                   if (!reason) return;
                   await postJson(`/api/invoices/${id}/reject`, { reason });
                 } else if (action === "register-sage") {
@@ -1642,17 +2055,31 @@
                     irj_number: irjNumber,
                   });
                 } else if (action === "approve" || action === "reject") {
-                  const comments = window.prompt(
-                    action === "reject" ? "Reason for rejection:" : "Approval comments (optional):"
-                  );
-                  if (comments === null && action === "reject") return;
+                  const comments = await promptDialog(action === "reject"
+                    ? {
+                        title: "Reject invoice",
+                        label: "Reason for rejection",
+                        confirmLabel: "Reject invoice",
+                        tone: "danger",
+                      }
+                    : {
+                        title: "Approve invoice",
+                        label: "Approval comments (optional)",
+                        confirmLabel: "Approve",
+                      });
+                  if (comments === null) return;
                   await postJson(`/api/invoices/${id}/approve`, {
                     level: Number(button.dataset.level),
                     decision: action === "approve" ? "approved" : "rejected",
                     comments: comments || null,
                   });
                 } else if (action === "hold") {
-                  const comments = window.prompt("Reason for placing this invoice on hold / query (required):");
+                  const comments = await promptDialog({
+                    title: "Place on hold / record query",
+                    label: "Reason for placing this invoice on hold / query",
+                    required: true,
+                    confirmLabel: "Place on hold",
+                  });
                   if (!comments) return;
                   await postJson(`/api/invoices/${id}/approve`, {
                     level: Number(button.dataset.level),
@@ -1660,7 +2087,12 @@
                     comments,
                   });
                 } else if (action === "resume") {
-                  const notes = window.prompt("Resolution notes for resuming approval (optional):");
+                  const notes = await promptDialog({
+                    title: originalText.trim() || "Resume approval",
+                    label: "Resolution notes for resuming approval (optional)",
+                    confirmLabel: "Resume",
+                  });
+                  if (notes === null) return;
                   await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
                 } else if (action === "retry-payment-route") {
                   await postJson(`/api/invoices/${id}/retry-payment-route`, {});
@@ -1675,9 +2107,24 @@
                   if (!payment) return;
                   await postJson(`/api/invoices/${id}/pay`, payment);
                 } else if (action === "reconcile") {
-                  const reconciliationDate = window.prompt("Date shown on bank statement (YYYY-MM-DD):", new Date().toISOString().slice(0, 10));
+                  const reconciliation = await formDialog({
+                    title: "Mark reconciled",
+                    confirmLabel: "Mark reconciled",
+                    fields: [
+                      {
+                        name: "date",
+                        label: "Date shown on bank statement",
+                        type: "date",
+                        value: new Date().toISOString().slice(0, 10),
+                        required: true,
+                      },
+                      { name: "notes", label: "Reconciliation notes (optional)", multiline: true },
+                    ],
+                  });
+                  if (reconciliation === null) return;
+                  const reconciliationDate = reconciliation.date;
                   if (!reconciliationDate) return;
-                  const notes = window.prompt("Reconciliation notes (optional):");
+                  const notes = reconciliation.notes;
                   await postJson(`/api/invoices/${id}/reconcile`, {
                     reconciliation_date: reconciliationDate,
                     notes: notes || null,
@@ -1691,6 +2138,9 @@
                   button.disabled = false;
                   button.removeAttribute("aria-busy");
                   button.textContent = originalText;
+                  // A dialog may have taken focus; give it back to the row
+                  // action unless the user has already moved elsewhere.
+                  if (document.activeElement === document.body) button.focus();
                 }
               }
             }
@@ -1698,7 +2148,12 @@
             document.getElementById("flag-review-button").addEventListener("click", async () => {
               const invoiceId = picker.value;
               if (!invoiceId) return;
-              const reason = window.prompt("Reason for flagging this invoice for review:");
+              const reason = await promptDialog({
+                title: "Flag for review",
+                label: "Reason for flagging this invoice for review",
+                required: true,
+                confirmLabel: "Flag for review",
+              });
               if (!reason) return;
               try {
                 await postJson(`/api/invoices/${invoiceId}/flag-review`, { reason });
@@ -1711,10 +2166,14 @@
             document.getElementById("delete-invoice-button").addEventListener("click", async () => {
               const invoice = invoices.find(item => String(item.id) === picker.value);
               if (!invoice) return;
-              if (!window.confirm(
-                `Permanently delete "${invoice.original_filename}" from the application ` +
-                "and SharePoint? This cannot be undone."
-              )) return;
+              if (!await confirmDialog({
+                title: "Delete duplicate invoice?",
+                message:
+                  `Permanently delete "${invoice.original_filename}" from the application ` +
+                  "and SharePoint? This cannot be undone.",
+                confirmLabel: "Delete permanently",
+                tone: "danger",
+              })) return;
               try {
                 await sendJson(`/api/invoices/${invoice.id}`, "DELETE");
                 displayedInvoiceId = null;
@@ -1738,7 +2197,13 @@
 
             document.getElementById("cancel-duplicate-button").addEventListener("click", async () => {
               const invoiceId = picker.value;
-              if (!invoiceId || !window.confirm("Confirm this invoice is a duplicate and cancel it?")) return;
+              if (!invoiceId || !await confirmDialog({
+                title: "Cancel duplicate invoice?",
+                message: "Confirm this invoice is a duplicate and cancel it?",
+                confirmLabel: "Cancel invoice",
+                cancelLabel: "Keep invoice",
+                tone: "danger",
+              })) return;
               try {
                 await postJson(`/api/invoices/${invoiceId}/cancel-duplicate`, {});
                 showToast("Duplicate invoice cancelled.");
@@ -1849,6 +2314,7 @@
               if (!button) return;
               storeValue(`${SCROLL_STORAGE_PREFIX}${currentTab}`, String(window.scrollY));
               activateTab(button.dataset.tab);
+              if (isDrawerLayout()) closeDrawer({ restoreFocus: false });
             });
 
             function applyRoleVisibility(role) {
@@ -1857,6 +2323,16 @@
                 const isAllowed = allowedTabs.includes(button.dataset.tab);
                 button.style.display = isAllowed ? "" : "none";
               });
+              // Hide section headings whose queues are all hidden for this role.
+              document.querySelectorAll("#section-nav .nav-group").forEach(group => {
+                const visible = [...group.querySelectorAll("button[data-tab]")]
+                  .some(button => button.style.display !== "none");
+                group.hidden = !visible;
+              });
+              // Purchasing can view PO Matching, but only Purchase Ledger and
+              // admin may record matches, so explain why there are no actions.
+              document.getElementById("po-matching-readonly-note").hidden =
+                role !== "purchasing";
               const linkedTab = new URLSearchParams(window.location.search).get("tab");
               const desiredTab = linkedTab && allowedTabs.includes(linkedTab)
                 ? linkedTab
@@ -2613,7 +3089,7 @@
                     <tr>
                       <td>${escapeHtml(setting.company)}</td>
                       <td>
-                        <select data-irj-mode="${escapeHtml(setting.company)}">
+                        <select data-irj-mode="${escapeHtml(setting.company)}" aria-label="IRJ mode for ${escapeHtml(setting.company)}">
                           <option value="automatic" ${setting.mode === "automatic" ? "selected" : ""}>Automatic</option>
                           <option value="manual" ${setting.mode === "manual" ? "selected" : ""}>Manual at Sage</option>
                         </select>
@@ -2621,6 +3097,7 @@
                       <td>
                         <input
                           data-irj-current="${escapeHtml(setting.company)}"
+                          aria-label="Latest paper IRJ for ${escapeHtml(setting.company)}"
                           inputmode="numeric"
                           pattern="[0-9]{6}"
                           maxlength="6"
@@ -2629,7 +3106,7 @@
                           ${setting.mode === "manual" ? "disabled" : ""}
                         >
                       </td>
-                      <td><button data-save-irj="${escapeHtml(setting.company)}">Save</button></td>
+                      <td><button data-save-irj="${escapeHtml(setting.company)}" aria-label="Save IRJ settings for ${escapeHtml(setting.company)}">Save</button></td>
                     </tr>
                   `).join("") + '</tbody></table>';
                 document.querySelectorAll("[data-irj-mode]").forEach(select => {
@@ -2695,14 +3172,17 @@
                       `${item.row_numbers.join(", ")})`
                     )
                     .join("\n");
-                  const replace = window.confirm(
-                    `The following supplier companies already exist:
+                  const replace = await confirmDialog({
+                    title: "Replace existing suppliers?",
+                    message: `The following supplier companies already exist:
 
 ${duplicates}
 
 ` +
-                    `Replace their configured values with the spreadsheet rows?`
-                  );
+                    `Replace their configured values with the spreadsheet rows?`,
+                    confirmLabel: "Replace existing values",
+                    scrollMessage: true,
+                  });
                   if (!replace) {
                     resultBox.innerHTML = "<p>Import cancelled; no records were changed.</p>";
                     return;
@@ -2864,6 +3344,8 @@ ${duplicates}
               invoicePollTimer = null;
               activityEventSource = null;
               currentUser = null;
+              appRoot.classList.remove("nav-open");
+              syncNavigationState();
               appRoot.classList.add("hidden");
               loginScreen.classList.remove("hidden");
             });
@@ -2918,6 +3400,15 @@ ${duplicates}
               loginScreen.classList.add("hidden");
               appRoot.classList.remove("hidden");
               document.getElementById("user-chip-label").textContent =
+                `${currentUser.display_name} (${currentUser.role})`;
+              document.getElementById("user-avatar").textContent =
+                String(currentUser.display_name || currentUser.username || "?")
+                  .split(/\s+/)
+                  .filter(part => /^[A-Za-z]/.test(part))
+                  .slice(0, 2)
+                  .map(part => part[0].toUpperCase())
+                  .join("") || "?";
+              document.getElementById("user-chip").title =
                 `${currentUser.display_name} (${currentUser.role})`;
               applyRoleVisibility(currentUser.role);
               await Promise.all([
