@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from app.outlook_notifications import QueuedNotification
+from app.outlook_notifications import DEFAULT_MAX_ATTEMPTS, QueuedNotification
 from app.postgres_settings import ConnectionFactory, PostgresSettings, postgres_connection_factory
 
 
@@ -83,7 +83,10 @@ class PostgresOutlookNotificationStore:
                     UPDATE outlook_notifications AS notification
                     SET status = 'processing',
                         attempts = notification.attempts + 1,
-                        last_error = NULL
+                        last_error = NULL,
+                        payload = jsonb_set(
+                            notification.payload, '{claimed_at}', to_jsonb(now())
+                        )
                     FROM next_notification
                     WHERE notification.id = next_notification.id
                     RETURNING notification.id, notification.subscription_id,
@@ -115,6 +118,46 @@ class PostgresOutlookNotificationStore:
 
     def retry_failed(self, notification_id: int) -> None:
         self._set_status(notification_id, "pending")
+
+    # The claim time lives in payload->>'claimed_at' (no schema change); rows
+    # claimed before this existed fall back to received_at. Mirrors the SQLite
+    # store. NOTE: not yet exercised against a live PostgreSQL database.
+    def touch_claim(self, notification_id: int) -> None:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE outlook_notifications
+                    SET payload = jsonb_set(payload, '{claimed_at}', to_jsonb(now()))
+                    WHERE id = %s AND status = 'processing'
+                    """,
+                    (notification_id,),
+                )
+
+    def reclaim_stale(
+        self,
+        older_than_seconds: float,
+        *,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    ) -> int:
+        note = (
+            "Reclaimed: the worker processing this item stopped responding "
+            f"for more than {int(older_than_seconds)} seconds."
+        )
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE outlook_notifications
+                    SET status = CASE WHEN attempts >= %s THEN 'failed' ELSE 'pending' END,
+                        last_error = %s
+                    WHERE status = 'processing'
+                      AND COALESCE((payload->>'claimed_at')::timestamptz, received_at)
+                          < now() - make_interval(secs => %s)
+                    """,
+                    (max_attempts, note, float(older_than_seconds)),
+                )
+                return cursor.rowcount
 
     def _set_status(self, notification_id: int, status: str) -> None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
