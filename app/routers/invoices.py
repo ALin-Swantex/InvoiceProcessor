@@ -706,7 +706,10 @@ def reconcile_invoice(
 
 
 @router.post("/api/workflow/confirm")
-def confirm_invoice(request: ConfirmationRequest) -> dict[str, str | None]:
+def confirm_invoice(
+    request: ConfirmationRequest,
+    user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+) -> dict[str, str | None]:
     try:
         decision = route_confirmed_invoice(ConfirmedInvoice(**request.model_dump()))
     except RoutingValidationError as error:
