@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import tempfile
 from pathlib import Path
 from typing import Sequence
@@ -291,6 +292,26 @@ def build_demo_app(data_dir: Path) -> FastAPI:
     )
 
 
+def port_in_use(port: int) -> bool:
+    """True if anything already accepts connections on this port.
+
+    Checks by connecting, not binding: another server (for example Docker) can
+    hold the same port on a different address, and the operating system would
+    still let a second server bind quietly. Then ``localhost`` in the browser
+    reaches the wrong one.
+    """
+    for host in ("127.0.0.1", "::1"):
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                if probe.connect_ex((host, port)) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def _print_banner(url: str, data_dir: Path, keep: bool) -> None:
     from app.auth import SEED_USERS
 
@@ -321,6 +342,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535.")
+
+    if port_in_use(args.port):
+        print(
+            f"\n  Port {args.port} is already in use (for example by the Docker stack),\n"
+            f"  so http://localhost:{args.port} would open that program, not the demo.\n"
+            f"  Stop it, or pick another port:  python -m app.demo --port {args.port + 10}\n"
+        )
+        return 2
 
     import uvicorn
 
