@@ -42,6 +42,10 @@
             const appRoot = document.getElementById("app-root");
             let invoices = [];
             let displayedInvoiceId = null;
+            // The company the review form should show. Remembered separately
+            // because the invoice can render before /api/companies has filled
+            // the dropdown, and rebuilding the options would otherwise blank it.
+            let previewCompanyWanted = "";
             const ACTIVE_TAB_STORAGE_KEY = "invoice-processor-active-tab";
             const SCROLL_STORAGE_PREFIX = "invoice-processor-scroll-";
             let currentTab = storedValue(ACTIVE_TAB_STORAGE_KEY) || "search";
@@ -385,7 +389,8 @@
                 // 5s); without this guard it would keep stomping on
                 // whatever the user is actively typing into these fields
                 // with the invoice's last-saved (often blank) values.
-                setValue("preview-company", invoice.company || "");
+                previewCompanyWanted = invoice.company || "";
+                setValue("preview-company", previewCompanyWanted);
                 displayedInvoiceId = invoice.id;
                 await loadSuppliers(invoice.company || "", invoice.supplier || "");
                 if (displayedInvoiceId !== invoice.id) return;
@@ -556,8 +561,10 @@
               const companies = await response.json();
               invoiceCompanies = companies;
               const select = document.getElementById("preview-company");
-              select.innerHTML = '<option value="">Select company…</option>';
+              const keepCompany = select.value || previewCompanyWanted;
               const searchSelect = document.getElementById("invoice-search-company");
+              const keepSearchCompany = searchSelect.value;
+              select.innerHTML = '<option value="">Select company…</option>';
               searchSelect.innerHTML = '<option value="">All companies</option>';
               for (const company of companies) {
                 const option = document.createElement("option");
@@ -567,6 +574,9 @@
                 const searchOption = option.cloneNode(true);
                 searchSelect.appendChild(searchOption);
               }
+              // Restore selections that existed before the options were rebuilt.
+              if (keepCompany) select.value = keepCompany;
+              if (keepSearchCompany) searchSelect.value = keepSearchCompany;
             }
 
             async function loadSearchSuppliers(company = "") {
@@ -646,7 +656,10 @@
 
             document.getElementById("preview-company").addEventListener(
               "change",
-              event => loadSuppliers(event.target.value, "")
+              event => {
+                previewCompanyWanted = event.target.value;
+                return loadSuppliers(event.target.value, "");
+              }
             );
             document.getElementById("preview-supplier").addEventListener(
               "change",
@@ -2429,7 +2442,9 @@
               const body = rows
                 .map((row, index) => {
                   const cells = columns
-                    .map(c => `<td>${escapeHtml(c.value(row) ?? "—")}</td>`)
+                    .map(c => c.html
+                      ? `<td>${c.value(row) ?? "—"}</td>`
+                      : `<td>${escapeHtml(c.value(row) ?? "—")}</td>`)
                     .join("");
                   const actionCell = hasActions
                     ? `<td><div class="row-actions">` +
@@ -2450,8 +2465,17 @@
                 `</table></div>`;
               if (onDelete) {
                 container.querySelectorAll("[data-delete-index]").forEach(button => {
-                  button.addEventListener("click", () => {
+                  button.addEventListener("click", async () => {
                     const row = rows[Number(button.dataset.deleteIndex)];
+                    const label = String(columns[0].value(row) ?? "").trim();
+                    if (!await confirmDialog({
+                      title: "Delete this entry?",
+                      message:
+                        `Delete ${label ? `"${label}"` : "this entry"}? ` +
+                        "This cannot be undone.",
+                      confirmLabel: "Delete",
+                      tone: "danger",
+                    })) return;
                     onDelete(row[idKey]);
                   });
                 });
@@ -2870,6 +2894,8 @@
                     { label: "SharePoint company folder", value: c => c.sharepoint_root_folder },
                     {
                       label: "Workflow destinations",
+                      // Trusted markup: every label and path is escaped below.
+                      html: true,
                       value: c => `<div class="path-list">${[
                           ["Nominal", c.folder_structure.nominal_invoices],
                           ["PO Match", c.folder_structure.po_match],
