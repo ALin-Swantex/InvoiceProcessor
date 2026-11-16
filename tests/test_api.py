@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import cast
 
 from fastapi.testclient import TestClient
@@ -33,8 +34,16 @@ def client_for(tmp_path) -> TestClient:
 def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     client = client_for(tmp_path)
 
-    home = client.get("/")
-    assert home.status_code == 200
+    page = client.get("/")
+    assert page.status_code == 200
+    stylesheet = client.get("/static/app.css")
+    script = client.get("/static/app.js")
+    assert stylesheet.status_code == 200
+    assert script.status_code == 200
+    assert '<link rel="stylesheet" href="/static/app.css">' in page.text
+    assert '<script src="/static/app.js"></script>' in page.text
+    # The page, stylesheet and script together make up the interface.
+    home = SimpleNamespace(text=page.text + stylesheet.text + script.text)
     assert "<h1>Swantex</h1>" in home.text
     assert "Continue with Microsoft 365" in home.text
     assert "Protected by Microsoft Entra ID" in home.text
