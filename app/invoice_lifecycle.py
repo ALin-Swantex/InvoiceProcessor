@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -55,6 +56,13 @@ from app.workflow import (
 class InvoiceLifecycleError(ValueError):
     """Raised for business-rule violations (invalid state transitions,
     unknown company, etc.). Callers should map this to HTTP 422/409."""
+
+
+def _is_unique_violation(error: BaseException) -> bool:
+    """True for a unique-constraint failure from SQLite or PostgreSQL (psycopg)."""
+    if isinstance(error, sqlite3.IntegrityError):
+        return True
+    return type(error).__name__ == "UniqueViolation"
 
 
 class InvoiceExtractionUnavailableError(InvoiceLifecycleError):
@@ -162,6 +170,7 @@ class InvoiceLifecycle:
         if sent is False:
             self.activity_feed.release_email_stage(invoice_id, stage)
             return
+        self.activity_feed.mark_email_stage_sent(invoice_id, stage)
         self.activity_feed.add_event(
             event_type="stage_email_sent",
             target_role=ROLE_PURCHASE_LEDGER,
@@ -278,6 +287,7 @@ class InvoiceLifecycle:
             if not did_send:
                 self.activity_feed.release_email_stage(invoice.id, stage)
                 continue
+            self.activity_feed.mark_email_stage_sent(invoice.id, stage)
             self.invoice_store.update_fields(
                 invoice.id, **{timestamp_field: current.isoformat()}
             )
@@ -673,11 +683,18 @@ class InvoiceLifecycle:
         manual_irj = self._uses_manual_irj(company_profile.name)
         irj_number = (
             invoice.irj_number
-            if invoice.irj_number
+            if self._irj_belongs_to_company(invoice, company_profile.name)
             else None
             if manual_irj
             else self.irj_generator.generate(company_profile.name)
         )
+        if irj_number and irj_number != invoice.irj_number:
+            # Record the allocation straight away. If routing or SharePoint
+            # filing fails below, a retry reuses this number instead of
+            # allocating another one and leaving a gap in the sequence.
+            invoice = self.invoice_store.update_fields(
+                invoice_id, irj_number=irj_number, company=company_profile.name
+            )
         try:
             decision = route_confirmed_invoice(
                 ConfirmedInvoice(
@@ -900,13 +917,24 @@ class InvoiceLifecycle:
 
         now = datetime.now(timezone.utc).isoformat()
         if not retrying_missing_route:
-            invoice = self.invoice_store.update_fields(
-                invoice_id,
-                irj_number=normalized_irj,
-                sage_registered_at=now,
-                sage_reference=None,
-                sage_registered_by=recorded_by,
-            )
+            try:
+                invoice = self.invoice_store.update_fields(
+                    invoice_id,
+                    irj_number=normalized_irj,
+                    sage_registered_at=now,
+                    sage_reference=None,
+                    sage_registered_by=recorded_by,
+                )
+            except Exception as error:
+                # Two requests can pass the check above together; the unique
+                # (company, IRJ) index then rejects the second. Report that as
+                # a normal lifecycle error, not an unhandled database error.
+                if _is_unique_violation(error):
+                    raise InvoiceLifecycleError(
+                        f"IRJ number {normalized_irj} is already assigned to "
+                        "another invoice."
+                    ) from error
+                raise
 
         if invoice.invoice_type == "po":
             self._move_pdf_in_sharepoint(
@@ -1011,6 +1039,22 @@ class InvoiceLifecycle:
             invoice_id=invoice_id,
         )
         return record
+
+    def _irj_belongs_to_company(
+        self, invoice: InvoiceRecord, company_name: str
+    ) -> bool:
+        """True when the invoice's existing IRJ came from this company's sequence.
+
+        IRJ numbers are allocated per company, so a number issued for one company
+        must not be reused if the invoice is re-confirmed under another.
+        """
+        if not invoice.irj_number:
+            return False
+        if not invoice.company:
+            return True
+        existing = self._get_company(invoice.company)
+        existing_name = existing.name if existing is not None else invoice.company
+        return existing_name.strip().casefold() == company_name.strip().casefold()
 
     def _uses_manual_irj(self, company: str) -> bool:
         default = (
