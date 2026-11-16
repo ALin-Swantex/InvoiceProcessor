@@ -667,3 +667,192 @@ def test_default_runner_passes_the_configured_names_to_extraction(
     assert isinstance(reference, ReferenceData)
     assert "Acme Trading Ltd" in reference.known_company_names()
     assert "Acme" in reference.known_company_names()
+
+
+# --- escalation to a stronger model -----------------------------------------
+
+FIRST = "claude-sonnet-5-5"
+SECOND = "claude-opus-5-5"
+
+
+class RoutedClient:
+    """Answers per model, so a first and a second model can differ."""
+
+    def __init__(self, answers: dict[str, dict[str, Any] | Exception]) -> None:
+        self.answers = answers
+        self.messages = self
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> object:
+        self.calls.append(kwargs)
+        answer = self.answers[kwargs["model"]]
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=json.dumps(answer))],
+        )
+
+    def models_called(self) -> list[str]:
+        return [call["model"] for call in self.calls]
+
+
+def cascade(
+    first: dict[str, Any] | Exception, second: dict[str, Any] | Exception | None = None
+) -> tuple[ClaudeInvoiceExtractor, RoutedClient]:
+    answers: dict[str, dict[str, Any] | Exception] = {FIRST: first}
+    if second is not None:
+        answers[SECOND] = second
+    client = RoutedClient(answers)
+    settings = ExtractionSettings(model=FIRST, escalation_model=SECOND)
+    return ClaudeInvoiceExtractor(settings, client=client), client
+
+
+def test_confident_first_answer_never_calls_the_stronger_model(tmp_path: Path) -> None:
+    extractor, client = cascade(llm_data(), llm_data())
+
+    result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert client.models_called() == [FIRST]
+    assert result.model == FIRST
+    assert result.needs_review is False
+
+
+def test_difficult_invoice_is_escalated_and_the_stronger_answer_is_used(
+    tmp_path: Path,
+) -> None:
+    unsure = llm_data(supplier_invoice_number=field("INV-10O1", "low"))
+    extractor, client = cascade(unsure, llm_data())
+
+    result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert client.models_called() == [FIRST, SECOND]
+    assert client.calls[0]["output_config"]["effort"] == "medium"
+    assert client.calls[1]["output_config"]["effort"] == "high"
+    assert result.supplier_invoice_number == "INV-1001"
+    assert result.model == f"{FIRST} -> {SECOND}"
+    assert result.needs_review is False  # a low-certainty first read is not a conflict
+
+
+def test_missing_field_filled_in_by_the_stronger_model(tmp_path: Path) -> None:
+    extractor, client = cascade(
+        llm_data(invoice_date=field(None, "low", None)), llm_data()
+    )
+
+    result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert client.models_called() == [FIRST, SECOND]
+    assert result.invoice_date == "2026-09-08"
+    assert result.needs_review is False
+
+
+def test_confident_disagreement_between_the_models_needs_review(
+    tmp_path: Path,
+) -> None:
+    # Medium certainty triggers the escalation; the stronger model then reads the
+    # total differently, which is a conflict worth a person's attention.
+    first = llm_data(invoice_value=field(1250.75, "medium"))
+    second = llm_data(invoice_value=field(1520.75, "high"))
+    extractor, _ = cascade(first, second)
+
+    result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert result.invoice_value == 1520.75  # the stronger model's reading
+    assert result.needs_review is True
+    assert any(
+        "1250.75" in warning and "1520.75" in warning for warning in result.warnings
+    )
+    assert result.field_confidences["invoice_value"] <= 0.60
+
+
+def test_unreadable_first_answer_is_escalated(tmp_path: Path) -> None:
+    client = RoutedClient({FIRST: llm_data(), SECOND: llm_data()})
+    original = client.create
+
+    def first_answer_is_cut_off(**kwargs: Any) -> object:
+        if kwargs["model"] == FIRST:
+            client.calls.append(kwargs)
+            return SimpleNamespace(stop_reason="max_tokens", content=[])
+        return original(**kwargs)
+
+    client.create = first_answer_is_cut_off  # type: ignore[method-assign]
+    extractor = ClaudeInvoiceExtractor(
+        ExtractionSettings(model=FIRST, escalation_model=SECOND), client=client
+    )
+
+    result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert client.models_called() == [FIRST, SECOND]
+    assert result.needs_review is False
+    assert result.model == f"{FIRST} -> {SECOND}"
+
+
+def test_temporary_failure_of_the_first_model_is_retried_not_escalated(
+    tmp_path: Path,
+) -> None:
+    extractor, client = cascade(RateLimitError("busy"), llm_data())
+
+    with pytest.raises(ExtractionServiceError):
+        extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert client.models_called() == [FIRST]
+
+
+def test_unavailable_stronger_model_keeps_the_first_answer_for_review(
+    tmp_path: Path,
+) -> None:
+    unsure = llm_data(supplier_invoice_number=field("INV-10O1", "low"))
+    extractor, client = cascade(unsure, InternalServerError("overloaded"))
+
+    result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert client.models_called() == [FIRST, SECOND]
+    assert result.supplier_invoice_number == "INV-10O1"
+    assert result.model == FIRST
+    assert result.needs_review is True
+    assert any(SECOND in warning and "not available" in warning for warning in result.warnings)
+
+
+def test_both_models_failing_raises(tmp_path: Path) -> None:
+    extractor, _ = cascade(BadRequestError("bad"), BadRequestError("still bad"))
+
+    with pytest.raises(ExtractionError):
+        extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+
+def test_statements_and_credit_notes_are_not_escalated(tmp_path: Path) -> None:
+    for kind in ("statement", "credit_note"):
+        extractor, client = cascade(
+            llm_data(document_type=kind, document_type_reason="because"), llm_data()
+        )
+        extractor.extract(write_pdf(tmp_path / f"{kind}.pdf"))
+        assert client.models_called() == [FIRST], kind
+
+
+def test_escalation_is_off_unless_a_different_model_is_named() -> None:
+    assert not ExtractionSettings().escalation_enabled
+    assert not ExtractionSettings(escalation_model=" ").escalation_enabled
+    assert not ExtractionSettings(escalation_model="claude-opus-5-5").escalation_enabled
+    assert ExtractionSettings(
+        model=FIRST, escalation_model=SECOND
+    ).escalation_enabled
+
+
+def test_escalation_settings_come_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.ai_extraction import settings_from_environment
+
+    monkeypatch.setenv("EXTRACTION_MODEL", FIRST)
+    monkeypatch.setenv("EXTRACTION_ESCALATION_MODEL", SECOND)
+    monkeypatch.setenv("EXTRACTION_ESCALATION_EFFORT", "max")
+
+    settings = settings_from_environment()
+
+    assert (settings.model, settings.escalation_model) == (FIRST, SECOND)
+    assert settings.escalation_effort == "max"
+    with pytest.raises(ExtractionConfigurationError):
+        ClaudeInvoiceExtractor(
+            ExtractionSettings(escalation_effort="extreme"),
+            client=FakeClient(llm_data()),
+        )
