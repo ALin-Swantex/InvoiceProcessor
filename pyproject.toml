@@ -32,6 +32,7 @@ test = [
 
 [project.scripts]
 invoice-processor = "app.launcher:main"
+invoice-processor-demo = "app.demo:main"
 
 [tool.setuptools.packages.find]
 include = ["app*"]

@@ -39,6 +39,16 @@ services:
       web:
         condition: service_healthy
 
+  # Sample data and local sign-in only: no .env, no secrets, no Azure.
+  #   docker compose --profile demo up demo      then open http://localhost:8001
+  demo:
+    build: .
+    image: invoice-processor:local
+    command: ["python", "-m", "app.demo", "--host", "0.0.0.0", "--port", "8000", "--public-url", "http://localhost:8001"]
+    ports:
+      - "8001:8000"
+    profiles: ["demo"]
+
   # One-shot job; needs a database identity with schema-change permission.
   migrate:
     <<: *app
