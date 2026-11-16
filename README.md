@@ -2,7 +2,7 @@
 
 Internal invoice-processing application built with FastAPI and Microsoft 365.
 It receives invoice files from Outlook or manual upload, stores PDFs in
-SharePoint, extracts invoice data with Azure Document Intelligence, and manages
+SharePoint, extracts invoice data with an AI model (Claude), and manages
 review, PO matching, approval, payment, reconciliation, and audit history.
 
 ## Current workflow
@@ -63,7 +63,7 @@ cp .env.example .env
 ```
 
 Configure `.env` with the required Entra, Microsoft Graph, SharePoint, Azure
-PostgreSQL, and Document Intelligence settings. Never commit `.env` or secrets.
+PostgreSQL, and `ANTHROPIC_API_KEY` settings. Never commit `.env` or secrets.
 
 The application runtime uses PostgreSQL for invoices, configuration, sessions,
 activity, IRJ sequences, and the Outlook processing queue:
@@ -122,8 +122,9 @@ docker compose --profile tools run --rm migrate   # apply database migrations
 
 Open <http://localhost:8000>. Notes:
 
-- The containers must be able to resolve and reach Azure PostgreSQL and
-  Document Intelligence (VPN, private network or an allowed IP).
+- The containers must be able to resolve and reach Azure PostgreSQL (VPN,
+  private network or an allowed IP) and make outbound HTTPS calls to the
+  Anthropic API for invoice extraction.
 - Run exactly one `worker` per mailbox; do not scale it.
 - Working files live on the `invoice-data` volume (`/data`). SharePoint stays
   the canonical PDF store, so the volume can be rebuilt.
@@ -197,7 +198,25 @@ pytest -q
 
 The suite uses local and mocked services; passing tests do not establish live
 Azure connectivity. Run `python -m scripts.check_live_azure` for read-only
-PostgreSQL, Outlook, SharePoint, and Document Intelligence smoke checks.
+PostgreSQL, Outlook, and SharePoint smoke checks. Add `--extraction` to also
+make one small paid AI extraction call on a generated sample invoice.
+
+## AI invoice extraction
+
+Invoice PDFs are read by Claude, which returns the supplier, customer, invoice
+number, PO, date, total and currency with a quoted piece of evidence and a
+certainty for each. Deterministic checks then verify the values against the
+PDF's text (is the invoice number really in the document?), the arithmetic (net
+plus tax equals the total), the date and the configured company names. Anything
+uncertain or failing a check goes to Needs Review, and the Admin confidence
+threshold applies as before. The model and prompt version are recorded with each
+extraction.
+
+Set `ANTHROPIC_API_KEY` and, if you want, `EXTRACTION_MODEL` (default
+`claude-opus-5-5`) and `EXTRACTION_EFFORT`. With no key the application does
+not guess: invoices wait in Needs Review. Invoice PDFs are sent to the Anthropic
+API (first and last page only for invoices over three pages), so confirm your
+data-handling terms before enabling it.
 
 ## Authentication and roles
 

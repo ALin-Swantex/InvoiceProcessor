@@ -7,6 +7,7 @@ No mailbox messages, files, invoices, or credentials are printed.
 from __future__ import annotations
 
 import os
+import sys
 import socket
 from urllib.parse import quote
 
@@ -93,22 +94,37 @@ def _check_sharepoint(token: str) -> str:
     return "document-library root readable"
 
 
-def _check_document_intelligence() -> str:
-    from azure.ai.documentintelligence import DocumentIntelligenceAdministrationClient
-    from azure.identity import ClientSecretCredential
+def _check_extraction() -> str:
+    """One small, paid request: extract a generated sample invoice."""
+    import tempfile
+    from pathlib import Path
 
-    credential = ClientSecretCredential(
-        os.environ["GRAPH_TENANT_ID"],
-        os.environ["GRAPH_CLIENT_ID"],
-        os.environ["GRAPH_CLIENT_SECRET"],
-    )
-    with credential:
-        with DocumentIntelligenceAdministrationClient(
-            endpoint=os.environ["AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"],
-            credential=credential,
-        ) as client:
-            client.get_resource_details()
-    return "resource readable (invoice analysis requires a sample PDF)"
+    from app.ai_extraction import ai_extraction_configured, run_ai_extraction
+    from app.demo import sample_pdf
+
+    if not ai_extraction_configured():
+        raise SchemaCheckError("not configured (set ANTHROPIC_API_KEY)")
+    with tempfile.TemporaryDirectory() as folder:
+        pdf = Path(folder) / "sample.pdf"
+        pdf.write_bytes(
+            sample_pdf(
+                "Check Supplier Ltd tax invoice",
+                [
+                    "Supplier: Check Supplier Ltd",
+                    "Customer: Check Customer Ltd",
+                    "Invoice no.: CHK-0001",
+                    "Date: 2026-01-15",
+                    "Total payable: 120.00 GBP",
+                ],
+            )
+        )
+        result = run_ai_extraction(pdf)
+    found = [
+        name
+        for name in ("company", "supplier", "supplier_invoice_number", "invoice_date", "invoice_value", "currency")
+        if getattr(result, name) is not None
+    ]
+    return f"{result.model} read {len(found)}/6 fields from a sample invoice"
 
 
 def main() -> int:
@@ -127,7 +143,10 @@ def main() -> int:
                 ("SharePoint", lambda: _check_sharepoint(token)),
             ]
         )
-    checks.append(("Document Intelligence", _check_document_intelligence))
+    if "--extraction" in sys.argv[1:]:
+        checks.append(("AI extraction", _check_extraction))
+    else:
+        print("AI extraction: skipped (add --extraction; makes one small paid API call)")
     failed = token is None
     for name, check in checks:
         try:

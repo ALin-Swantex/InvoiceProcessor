@@ -18,7 +18,11 @@ for _name in list(os.environ):
             "SHAREPOINT_",
             "EXCEL_CONVERSION_",
         )
-    ) or _name in {"DATABASE_URL", "INVOICE_EXTRACTION_MODEL", "AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID"}:
+    ) or _name.startswith(("ANTHROPIC_", "EXTRACTION_", "OPENAI_")) or _name in {
+        "DATABASE_URL",
+        "INVOICE_EXTRACTION_MODEL",
+        "INVOICE_EXTRACTION_PROMPT_VERSION",
+    }:
         del os.environ[_name]
 
 os.environ["AUTH_ENTRA_TENANT_ID"] = ""
@@ -32,7 +36,8 @@ os.environ["AUTH_LOCAL_LOGIN_ENABLED"] = "true"
 def isolate_optional_azure_configuration(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    monkeypatch.delenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", raising=False)
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "EXTRACTION_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("EMAIL_NOTIFICATIONS_ENABLED", "false")
     monkeypatch.setenv("AUTH_LOCAL_LOGIN_ENABLED", "true")
     monkeypatch.setenv("CONFIG_STORE_BACKEND", "sqlite")

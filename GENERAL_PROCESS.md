@@ -13,7 +13,8 @@ Processor. The detailed state diagram is in `INVOICE_WORKFLOW_FLOWCHART.md`.
 - Microsoft Graph reads the shared mailbox, receives webhook events, stores
   files in SharePoint, and sends configured notifications.
 - Microsoft Entra authenticates users and supplies application roles.
-- The extraction service proposes fields and confidence. Purchase Ledger
+- The AI extraction (Claude plus deterministic checks) proposes fields and
+  confidence. Purchase Ledger
   remains responsible for corrections and confirmation.
 
 ## 1. Intake
@@ -99,8 +100,8 @@ reporting views through a dedicated read-only identity.
 
 ## Remaining integrations
 
-- Select and configure the production extraction model. Azure Document
-  Intelligence custom extraction is the identified next training option.
+- Measure extraction accuracy on a labelled invoice set to choose the production
+  model and tune the confidence mapping.
 - Connect Sage 200 posting and remittance APIs.
 - Deploy and validate the Power BI semantic model and service refresh.
 - Add production alert delivery and agreed retention policies.

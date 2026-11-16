@@ -16,15 +16,17 @@ from app.activity_feed import (
     ActivityFeedStore,
 )
 from app.ai_extraction import (
-    DocumentIntelligenceConfigurationError,
-    DocumentIntelligenceServiceError,
+    ExtractionConfigurationError,
     ExtractionResult,
+    ExtractionServiceError,
+    ReferenceData,
     run_ai_extraction,
 )
 from app.approval_matrix import ApprovalMatrixStore
 from app.approval_matrix import find_approvers as _default_find_approvers
 from app.companies import CompanyStore
 from app.companies import get_company as _default_get_company
+from app.companies import list_companies as _default_list_companies
 from app.company_folders import (
     FLAGGED_INVOICES_FOLDER,
     REJECTED_INVOICES_FOLDER,
@@ -43,6 +45,7 @@ from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
 from app.suppliers import get_supplier as _default_get_supplier
+from app.suppliers import list_suppliers as _default_list_suppliers
 from app.supplier_terms import SupplierTermsStore
 from app.workflow import (
     ConfirmedInvoice,
@@ -114,7 +117,7 @@ class InvoiceLifecycle:
         suppliers_store: SupplierStore | None = None,
         supplier_terms_store: SupplierTermsStore | None = None,
         configuration_getter: Callable[[str, str | None], str | None] | None = None,
-        extraction_runner: Callable[[Path], ExtractionResult] = run_ai_extraction,
+        extraction_runner: Callable[[Path], ExtractionResult] | None = None,
         classification_runner: Callable[[Path], DocumentClassification] = (
             classify_pdf_document
         ),
@@ -128,8 +131,33 @@ class InvoiceLifecycle:
         self.suppliers_store = suppliers_store
         self.supplier_terms_store = supplier_terms_store
         self.configuration_getter = configuration_getter
-        self.extraction_runner = extraction_runner
+        # By default extraction is given the configured companies and suppliers
+        # so the model can return exactly the names the application knows.
+        self.extraction_runner = extraction_runner or self._extract_with_reference_data
         self.classification_runner = classification_runner
+
+    def _extract_with_reference_data(self, pdf_path: Path) -> ExtractionResult:
+        return run_ai_extraction(pdf_path, reference=self._reference_data())
+
+    def _reference_data(self) -> ReferenceData | None:
+        """Companies and suppliers (with aliases) for the extraction prompt."""
+        try:
+            companies = (
+                self.companies_store.list()
+                if self.companies_store is not None
+                else _default_list_companies()
+            )
+            suppliers = (
+                self.suppliers_store.list()
+                if self.suppliers_store is not None
+                else _default_list_suppliers()
+            )
+        except Exception:
+            return None  # extraction still works, just without name hints
+        return ReferenceData(
+            companies=tuple((c.name, tuple(c.aliases)) for c in companies),
+            suppliers=tuple((s.name, tuple(s.aliases)) for s in suppliers),
+        )
 
     def _get_company(self, name: str):
         if self.companies_store is not None:
@@ -340,8 +368,8 @@ class InvoiceLifecycle:
                 )
             result = self.extraction_runner(Path(invoice.stored_path))
         except (
-            DocumentIntelligenceConfigurationError,
-            DocumentIntelligenceServiceError,
+            ExtractionConfigurationError,
+            ExtractionServiceError,
         ) as error:
             self.activity_feed.add_event(
                 event_type="extraction_unavailable",
@@ -445,14 +473,15 @@ class InvoiceLifecycle:
             "currency": result.currency,
         }
         extraction_metadata = {
-            "extraction_model": os.environ.get(
-                "INVOICE_EXTRACTION_MODEL",
-                os.environ.get(
-                    "AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID", "prebuilt-invoice"
-                ),
+            "extraction_model": (
+                result.model
+                or os.environ.get("INVOICE_EXTRACTION_MODEL", "").strip()
+                or "unspecified"
             ),
-            "extraction_prompt_version": os.environ.get(
-                "INVOICE_EXTRACTION_PROMPT_VERSION", "v1"
+            "extraction_prompt_version": (
+                result.prompt_version
+                or os.environ.get("INVOICE_EXTRACTION_PROMPT_VERSION", "").strip()
+                or "unspecified"
             ),
             "extracted_fields_json": json.dumps(
                 extracted_fields, sort_keys=True, separators=(",", ":")

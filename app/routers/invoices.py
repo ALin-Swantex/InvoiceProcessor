@@ -76,7 +76,7 @@ def manual_upload_invoice(
 
     In the connected deployment, the PDF is uploaded to SharePoint
     Incoming first and registered from its DriveItem identity. A local
-    cache is retained only for Document Intelligence and PDF preview.
+    cache is retained only for AI extraction and PDF preview.
 
     This is a plain (sync) handler so FastAPI runs it in its threadpool:
     the SharePoint upload, AI extraction and store writes below are all
