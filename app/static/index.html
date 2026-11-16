@@ -20,6 +20,7 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <div id="toast-container" aria-live="polite" aria-relevant="additions" aria-label="Notifications"></div>
 
   <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
@@ -80,7 +81,7 @@
         <label>Payment method
           <input id="payment-method" disabled>
         </label>
-        <label>Supplier account
+        <label class="full">Supplier account
           <select id="payment-supplier-account"></select>
         </label>
         <label class="full">Payment reference
@@ -130,6 +131,7 @@
       <h2 id="admin-edit-title">Edit record</h2>
       <p>Update the fields below, then save your changes.</p>
       <div id="admin-edit-fields" class="admin-edit-fields"></div>
+      <div id="admin-edit-error" class="dialog-error" role="alert"></div>
       <div class="actions">
         <button type="button" class="secondary" id="admin-edit-cancel">Cancel</button>
         <button type="submit" class="primary">Save changes</button>
@@ -141,6 +143,7 @@
   <dialog id="ui-dialog" aria-labelledby="ui-dialog-title" aria-describedby="ui-dialog-message">
     <form id="ui-dialog-form" class="dialog-content">
       <h2 id="ui-dialog-title">Confirm</h2>
+      <p id="ui-dialog-context" class="dialog-context" hidden></p>
       <p id="ui-dialog-message" class="dialog-message"></p>
       <div id="ui-dialog-fields" class="dialog-fields"></div>
       <div id="ui-dialog-error" class="dialog-error" role="alert"></div>
@@ -231,7 +234,7 @@
       </div>
     </header>
 
-    <div class="page">
+    <div class="page" id="main-content" tabindex="-1">
     <div class="tab-panel" data-tab-panel="incoming">
       <details class="card manual-upload">
         <summary>Manually add an invoice to Incoming Invoices</summary>
@@ -296,7 +299,7 @@
               <h3 class="section-title">Invoice details (AI-extracted — review and correct before confirming)</h3>
               <div class="grid">
                 <label>IRJ number
-                  <input id="preview-irj" disabled placeholder="Assigned before final filing">
+                  <input id="preview-irj" disabled placeholder="Assigned at filing">
                 </label>
                 <label>Company being invoiced
                   <select id="preview-company">
@@ -318,19 +321,19 @@
                   </div>
                 </div>
                 <label>Supplier invoice number
-                  <input id="preview-supplier-invoice" placeholder="Extracted invoice number">
+                  <input id="preview-supplier-invoice" placeholder="e.g. INV-10442">
                 </label>
                 <label>Purchase Order number
-                  <input id="preview-po" placeholder="Enter a PO number if one applies">
+                  <input id="preview-po" placeholder="If one applies">
                 </label>
                 <label>Invoice date
                   <input id="preview-invoice-date" type="date">
                 </label>
                 <label>Invoice value
-                  <input id="preview-value" type="number" step="0.01" placeholder="0.00">
+                  <input id="preview-value" type="number" step="0.01" inputmode="decimal" placeholder="0.00">
                 </label>
                 <label>Currency
-                  <input id="preview-currency" value="GBP" placeholder="Currency">
+                  <input id="preview-currency" value="GBP" placeholder="GBP" maxlength="3" autocapitalize="characters">
                 </label>
                 <label class="full">Correction reason
                   <textarea id="correction-reason" placeholder="Describe why any extracted values were changed (optional)."></textarea>
@@ -428,7 +431,12 @@
 
     <div class="tab-panel" data-tab-panel="statements">
       <section class="card">
-        <div class="card-header"><h2>Company statements</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Company statements</h2>
+            <p class="card-subtitle">Supplier statements filed for each company.</p>
+          </div>
+        </div>
         <div class="content">
           <p class="admin-help">
             Statements are read directly from each SharePoint
@@ -488,70 +496,120 @@
 
     <div class="tab-panel" data-tab-panel="approver1">
       <section class="card">
-        <div class="card-header"><h2>Approver 1 — Pending Approvals</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Approver 1 — Pending Approvals</h2>
+            <p class="card-subtitle">Approve, query or reject invoices routed to you as first approver.</p>
+          </div>
+        </div>
         <div class="content" id="approver1-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="approver2">
       <section class="card">
-        <div class="card-header"><h2>Approver 2 — Pending Approvals</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Approver 2 — Pending Approvals</h2>
+            <p class="card-subtitle">Invoices that need a second approval after Approver 1.</p>
+          </div>
+        </div>
         <div class="content" id="approver2-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="on-hold">
       <section class="card">
-        <div class="card-header"><h2>On Hold / Approval Queries</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>On Hold / Approval Queries</h2>
+            <p class="card-subtitle">Approval queries and routing issues waiting to be resolved and resumed.</p>
+          </div>
+        </div>
         <div class="content" id="on-hold-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="approved">
       <section class="card">
-        <div class="card-header"><h2>Approved — Ready for Payment</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Approved — Ready for Payment</h2>
+            <p class="card-subtitle">Approved invoices waiting to be routed to a payment run.</p>
+          </div>
+        </div>
         <div class="content" id="approved-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="payment-bacs">
       <section class="card">
-        <div class="card-header"><h2>Approved for Payment — BACS</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Approved for Payment — BACS</h2>
+            <p class="card-subtitle">Record each payment once it has been made by BACS.</p>
+          </div>
+        </div>
         <div class="content" id="payment-bacs-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="payment-bankline">
       <section class="card">
-        <div class="card-header"><h2>Approved for Payment — Bankline</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Approved for Payment — Bankline</h2>
+            <p class="card-subtitle">Record each payment once it has been made through Bankline.</p>
+          </div>
+        </div>
         <div class="content" id="payment-bankline-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="payment-foreign-poa">
       <section class="card">
-        <div class="card-header"><h2>Approved for Payment — Foreign POA</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Approved for Payment — Foreign POA</h2>
+            <p class="card-subtitle">Foreign currency invoices awaiting payment or allocation.</p>
+          </div>
+        </div>
         <div class="content" id="payment-foreign-poa-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="reconciliation">
       <section class="card">
-        <div class="card-header"><h2>Bank Reconciliation</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Bank Reconciliation</h2>
+            <p class="card-subtitle">Mark paid invoices reconciled once they appear on a bank statement.</p>
+          </div>
+        </div>
         <div class="content" id="reconciliation-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="complete">
       <section class="card">
-        <div class="card-header"><h2>Complete / Filed</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Complete / Filed</h2>
+            <p class="card-subtitle">Reconciled invoices and filed statements.</p>
+          </div>
+        </div>
         <div class="content" id="complete-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
 
     <div class="tab-panel" data-tab-panel="rejected">
       <section class="card">
-        <div class="card-header"><h2>Rejected</h2></div>
+        <div class="card-header">
+          <div>
+            <h2>Rejected</h2>
+            <p class="card-subtitle">Rejected invoices and cancelled duplicates.</p>
+          </div>
+        </div>
         <div class="content" id="rejected-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
       </section>
     </div>
@@ -559,6 +617,17 @@
     <div class="tab-panel" data-tab-panel="admin">
       <section class="card">
         <div class="content" id="admin-panel">
+          <nav class="admin-section-nav" id="admin-section-nav" aria-label="Admin sections">
+            <button type="button" data-admin-section="admin-bi-metrics">Metrics</button>
+            <button type="button" data-admin-section="admin-operations">Monitoring</button>
+            <button type="button" data-admin-section="admin-irj-settings">IRJ numbering</button>
+            <button type="button" data-admin-section="admin-import-form">Bulk import</button>
+            <button type="button" data-admin-section="admin-companies-config">Companies</button>
+            <button type="button" data-admin-section="admin-supplier-form">Suppliers</button>
+            <button type="button" data-admin-section="admin-supplier-terms-table">Payment settings</button>
+            <button type="button" data-admin-section="admin-matrix-form">Approval matrix</button>
+            <button type="button" data-admin-section="admin-threshold-form">AI threshold</button>
+          </nav>
           <details class="admin-block admin-collapsible" id="admin-bi-metrics">
             <summary>Reporting metrics</summary>
             <div class="admin-collapsible-content">
@@ -572,7 +641,7 @@
                 </label>
               </div>
               <div id="metrics-dashboard" class="empty-state">
-                Open this section to load metrics.
+                Metrics load when this section is opened.
               </div>
             </div>
           </details>
@@ -580,7 +649,9 @@
           <details class="admin-block admin-collapsible" id="admin-operations">
             <summary>Worker and production monitoring</summary>
             <div class="admin-collapsible-content">
-              <button type="button" id="refresh-operations" class="secondary">Refresh status</button>
+              <div class="section-toolbar">
+                <button type="button" id="refresh-operations" class="secondary">Refresh status</button>
+              </div>
               <div id="operations-dashboard" class="empty-state">
                 Open this section to load worker and queue status.
               </div>
@@ -651,6 +722,7 @@
 
           <div class="admin-block">
             <h3>Suppliers</h3>
+            <p class="admin-help">Supplier names and aliases are used to match the supplier the AI extracts from each invoice.</p>
             <form class="admin-form" id="admin-supplier-form">
               <label>Supplier name
                 <input id="admin-supplier-name" placeholder="Supplier name" required>
@@ -680,22 +752,14 @@
 
           <div class="admin-block">
             <h3>Supplier payment settings</h3>
+            <p class="admin-help">Account numbers, payment methods and terms per invoice company, created by the bulk import.</p>
             <div id="admin-supplier-terms-table"></div>
           </div>
 
           <div class="admin-block">
             <h3>Approval matrix</h3>
-            <div class="metrics-toolbar">
-              <label>Filter routes
-                <input id="admin-matrix-filter" type="search" placeholder="Company, supplier or approver">
-              </label>
-              <label>Show
-                <select id="admin-matrix-email-filter">
-                  <option value="all">All routes</option>
-                  <option value="missing">Missing approver email</option>
-                </select>
-              </label>
-            </div>
+            <p class="admin-help">Who approves invoices for each invoice company and supplier. Routes without an approver email cannot notify the approver.</p>
+            <p class="form-heading">Add an approval route</p>
             <form class="admin-form" id="admin-matrix-form">
               <label>Invoice company
                 <select id="admin-matrix-company" required>
@@ -720,8 +784,19 @@
               <label>Approver 2 email
                 <input id="admin-matrix-approver2-email" type="email" placeholder="Optional">
               </label>
-              <button type="submit" class="primary">Save entry</button>
+              <button type="submit" class="primary">Add route</button>
             </form>
+            <div class="metrics-toolbar table-toolbar">
+              <label>Filter routes
+                <input id="admin-matrix-filter" type="search" placeholder="Company, supplier or approver">
+              </label>
+              <label>Show
+                <select id="admin-matrix-email-filter">
+                  <option value="all">All routes</option>
+                  <option value="missing">Missing approver email</option>
+                </select>
+              </label>
+            </div>
             <div id="admin-matrix-table"></div>
           </div>
 

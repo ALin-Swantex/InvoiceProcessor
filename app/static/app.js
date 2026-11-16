@@ -144,8 +144,10 @@
                 "aria-label",
                 open ? "Hide navigation" : "Show navigation"
               );
-              // A hidden sidebar must not be reachable with the keyboard.
+              // A hidden sidebar must not be reachable with the keyboard, and
+              // while the drawer is open the page behind it is not either.
               sidebar.inert = !open;
+              document.querySelector("main").inert = drawer && open;
               document.body.style.overflow = drawer && open ? "hidden" : "";
             }
 
@@ -284,7 +286,7 @@
                   label.appendChild(note);
                 }
                 note.textContent =
-                  `Low AI confidence (${Math.round(Number(confidence) * 100)}%) — please check`;
+                  `Low AI confidence ${Math.round(Number(confidence) * 100)}% — check`;
                 element.setAttribute("aria-describedby", note.id);
               } else {
                 if (note) note.textContent = "";
@@ -323,8 +325,22 @@
               };
               close.addEventListener("click", dismiss);
               toastContainer.appendChild(toast);
-              // Errors stay a little longer so they can be read.
-              window.setTimeout(dismiss, isError ? 8000 : 5000);
+              // Keep the stack short: drop the oldest beyond four.
+              const live = [...toastContainer.querySelectorAll(".toast:not(.leaving)")];
+              live.slice(0, Math.max(0, live.length - 4)).forEach(old => old.querySelector(".toast-close")?.click());
+              // Errors stay a little longer so they can be read; hovering or
+              // focusing a toast pauses its timer.
+              const lifetime = isError ? 8000 : 5000;
+              let timer = window.setTimeout(dismiss, lifetime);
+              const pause = () => window.clearTimeout(timer);
+              const resume = () => {
+                window.clearTimeout(timer);
+                timer = window.setTimeout(dismiss, 2500);
+              };
+              toast.addEventListener("mouseenter", pause);
+              toast.addEventListener("mouseleave", resume);
+              toast.addEventListener("focusin", pause);
+              toast.addEventListener("focusout", resume);
             }
 
             async function showInvoice(invoice) {
@@ -547,12 +563,20 @@
               });
             }
 
-            function emptyStateHtml(title, detail) {
-              return '<div class="empty-state">' +
-                '<span class="empty-state-icon" aria-hidden="true"><svg><use href="#icon-inbox"/></svg></span>' +
+            function emptyStateHtml(title, detail, tone = "") {
+              const icon = tone === "error"
+                ? '<span class="empty-state-icon" aria-hidden="true">!</span>'
+                : '<span class="empty-state-icon" aria-hidden="true"><svg><use href="#icon-inbox"/></svg></span>';
+              return `<div class="empty-state${tone === "error" ? " is-error" : ""}"${tone === "error" ? ' role="alert"' : ""}>` +
+                icon +
                 `<strong>${escapeHtml(title)}</strong>` +
                 (detail ? `<p>${escapeHtml(detail)}</p>` : "") +
                 "</div>";
+            }
+
+            function loadingStateHtml(message) {
+              return '<div class="loading-state" role="status">' +
+                `<span class="spinner" aria-hidden="true"></span>${escapeHtml(message)}</div>`;
             }
 
             async function loadCompanies() {
@@ -773,6 +797,65 @@
               return div.innerHTML;
             }
 
+            // escapeHtml() leaves quotes alone, which is fine for element
+            // text but not for attribute values built from file names or
+            // supplier names. Use this for every title / aria-label.
+            function escapeAttr(value) {
+              return escapeHtml(value).replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+            }
+
+            // Date-only values (YYYY-MM-DD) are shown as DD/MM/YYYY to match
+            // formatUkTimestamp(). Anything else is shown unchanged.
+            function formatUkDate(value) {
+              if (!value) return "—";
+              const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value));
+              return match ? `${match[3]}/${match[2]}/${match[1]}` : String(value);
+            }
+
+            function formatMoney(value, currency) {
+              if (value === null || value === undefined || value === "") return "—";
+              if (!Number.isFinite(Number(value))) return String(value);
+              return formatMetricMoney(value, currency);
+            }
+
+            // Short, unique description of an invoice for screen-reader
+            // labels, e.g. "IRJ 004514, Bright Paper Co".
+            function invoiceAccessibleName(invoice) {
+              if (!invoice) return "";
+              return [
+                invoice.irj_number ? `IRJ ${invoice.irj_number}` : invoice.original_filename,
+                invoice.supplier,
+              ].filter(Boolean).join(", ");
+            }
+
+            // Disables a button and shows a spinner while an async task runs.
+            async function withBusyButton(button, task) {
+              if (!button) return task();
+              if (button.getAttribute("aria-busy") === "true") return undefined;
+              const wasDisabled = button.disabled;
+              button.disabled = true;
+              button.setAttribute("aria-busy", "true");
+              try {
+                return await task();
+              } finally {
+                button.removeAttribute("aria-busy");
+                button.disabled = wasDisabled;
+              }
+            }
+
+            // Inline error under an admin form; cleared on the next submit.
+            function setFormError(form, message) {
+              let box = form.nextElementSibling;
+              if (!box || !box.classList.contains("form-error")) {
+                box = document.createElement("p");
+                box.className = "form-error";
+                box.setAttribute("role", "alert");
+                form.after(box);
+              }
+              box.textContent = message || "";
+              box.hidden = !message;
+            }
+
             function fieldConfidences(invoice) {
               if (!invoice.ai_field_confidences) return {};
               try {
@@ -908,7 +991,7 @@
                   <iframe
                     class="invoice-analysis-pdf"
                     src="/api/invoices/${invoice.id}/pdf"
-                    title="${invoice.document_type === "statement" ? "Statement" : "Invoice"} ${escapeHtml(invoice.irj_number || invoice.original_filename)} PDF"
+                    title="${invoice.document_type === "statement" ? "Statement" : "Invoice"} ${escapeAttr(invoice.irj_number || invoice.original_filename)} PDF"
                   ></iframe>
                   <section class="invoice-analysis-fields" aria-label="Invoice analysis">
                     <h3>${invoice.document_type === "statement" ? "Statement classification" : "Extracted invoice analysis"}</h3>
@@ -935,8 +1018,8 @@
                       ${analysisField("Supplier", invoice.supplier, confidences.supplier)}
                       ${analysisField("Supplier invoice no.", invoice.supplier_invoice_number, confidences.supplier_invoice_number)}
                       ${analysisField("PO number", invoice.po_number, confidences.purchase_order_number)}
-                      ${analysisField("Invoice date", invoice.invoice_date, confidences.invoice_date)}
-                      ${analysisField("Invoice value", invoice.invoice_value, confidences.invoice_value)}
+                      ${analysisField("Invoice date", invoice.invoice_date ? formatUkDate(invoice.invoice_date) : null, confidences.invoice_date)}
+                      ${analysisField("Invoice value", invoice.invoice_value == null || invoice.invoice_value === "" ? null : formatMoney(invoice.invoice_value, invoice.currency), confidences.invoice_value)}
                       ${analysisField("Currency", invoice.currency, confidences.currency)}
                     </dl>
                     ${correctionFeedbackHtml(invoice)}
@@ -966,11 +1049,11 @@
                     ${invoice.payment_date || invoice.reconciliation_date || invoice.reconciled_at ? `
                       <h4>Payment and reconciliation</h4>
                       <dl class="invoice-analysis-list">
-                        ${analysisField("Payment date", invoice.payment_date)}
+                        ${analysisField("Payment date", invoice.payment_date ? formatUkDate(invoice.payment_date) : null)}
                         ${analysisField("Payment method", invoice.payment_method)}
                         ${analysisField("Payment reference", invoice.payment_reference)}
                         ${analysisField("Paid by", invoice.paid_by)}
-                        ${analysisField("Bank statement date", invoice.reconciliation_date)}
+                        ${analysisField("Bank statement date", invoice.reconciliation_date ? formatUkDate(invoice.reconciliation_date) : null)}
                         ${analysisField("Marked reconciled", formatUkTimestamp(invoice.reconciled_at))}
                         ${analysisField("Reconciled by", invoice.reconciled_by)}
                       </dl>
@@ -1021,16 +1104,33 @@
               let html = `<tr class="invoice-summary-row" data-expand-invoice="${invoice.id}" ` +
                 `tabindex="0" aria-expanded="${expanded}" title="Click to view invoice analysis">`;
               for (const column of columns) {
-                const label = escapeHtml(column.label);
-                const value = escapeHtml(column.value(invoice));
-                if (column.boxed) {
+                const label = escapeAttr(column.label);
+                const raw = column.value(invoice);
+                const value = escapeHtml(raw);
+                if (column.boxed && (!raw || raw === "—")) {
                   html += `<td class="invoice-description-cell" data-label="${label}">` +
-                    `<div class="mini-description">${value}</div></td>`;
+                    `<span class="cell-empty" aria-label="None">—</span></td>`;
+                } else if (column.boxed) {
+                  // Clamped to a few lines in the table; the full text is in
+                  // the expanded row and the tooltip.
+                  html += `<td class="invoice-description-cell" data-label="${label}">` +
+                    `<div class="mini-description"${raw && raw !== "—" ? ` title="${escapeAttr(raw)}"` : ""}>` +
+                    `<span class="clamp-lines">${value}</span></div></td>`;
                 } else if (column.pill) {
-                  html += `<td data-label="${label}">${statusPillHtml(column.value(invoice))}</td>`;
+                  html += `<td class="cell-status" data-label="${label}">${statusPillHtml(raw)}</td>`;
                 } else {
+                  const secondary = column.secondary ? column.secondary(invoice) : "";
+                  const tag = column.tag ? column.tag(invoice) : "";
+                  const body = column.clamp
+                    ? `<span class="cell-clamp" title="${escapeAttr(raw)}">${value}</span>`
+                    : column.mono
+                      ? `<span class="${column.mono(invoice) ? "cell-mono" : "cell-muted"}">${value}</span>`
+                      : value;
                   html += `<td${column.className ? ` class="${column.className}"` : ""} ` +
-                    `data-label="${label}">${value}</td>`;
+                    `data-label="${label}">${body}` +
+                    (secondary ? `<span class="cell-secondary" title="${escapeAttr(secondary)}">${escapeHtml(secondary)}</span>` : "") +
+                    (tag ? `<span class="cell-tag">${escapeHtml(tag)}</span>` : "") +
+                    `</td>`;
                 }
               }
               html += `<td class="row-actions"><div class="row-action-buttons">` +
@@ -1051,6 +1151,23 @@
             }
 
             function bindInvoiceRowEvents(root, containerId) {
+              // Every row repeats "View PDF", "Approve", "Reject"…; name the
+              // invoice so each control makes sense out of context.
+              elementsMatching(root, "tr[data-expand-invoice]").forEach(row => {
+                const invoice = invoices.find(
+                  item => String(item.id) === String(row.dataset.expandInvoice)
+                );
+                const name = invoiceAccessibleName(invoice);
+                if (!name) return;
+                row.querySelectorAll(".row-action-buttons button, .row-action-buttons a").forEach(control => {
+                  const newTab = control.tagName === "A" && control.target === "_blank"
+                    ? " (opens in a new tab)" : "";
+                  control.setAttribute("aria-label", `${control.textContent.trim()} — ${name}${newTab}`);
+                });
+                row.querySelectorAll(".row-action-buttons select").forEach(select => {
+                  select.setAttribute("aria-label", `Statement company for ${name}`);
+                });
+              });
               elementsMatching(root, "[data-action]").forEach(button => {
                 button.addEventListener("click", () => handleRowAction(button));
               });
@@ -1161,9 +1278,16 @@
                 });
                 return;
               }
-              let html = '<div class="table-wrap"><table class="section-table invoice-table"><thead><tr>';
-              for (const column of columns) html += `<th scope="col">${column.label}</th>`;
-              html += '<th scope="col">Actions</th></tr></thead><tbody>';
+              const tableName = container.closest(".card")
+                ?.querySelector(".card-header h2")?.textContent.trim() || "Invoices";
+              let html = '<div class="table-wrap"><table class="section-table invoice-table" ' +
+                `aria-label="${escapeAttr(tableName)}"><thead><tr>`;
+              for (const column of columns) {
+                const headerClass = column.pill ? "cell-status" : column.boxed
+                  ? "invoice-description-cell" : column.className;
+                html += `<th scope="col"${headerClass ? ` class="${headerClass}"` : ""}>${column.label}</th>`;
+              }
+              html += '<th scope="col" class="col-actions">Actions</th></tr></thead><tbody>';
               for (const invoice of rows) {
                 html += invoiceRowHtml(invoice, columns, actionsFn);
               }
@@ -1227,15 +1351,37 @@
               return notes.length ? notes.join("\n\n") : "—";
             }
 
+            // IRJ and file name share a cell, as do supplier and company, and
+            // the document type is a tag, so the Actions column fits beside
+            // the data on laptop screens.
             const BASE_COLUMNS = [
-              { label: "Type", value: i => i.document_type === "statement" ? "Statement" : "Invoice" },
-              { label: "IRJ", value: i => i.irj_number || "—", className: "cell-irj" },
-              { label: "Company", value: i => i.company || "—" },
-              { label: "Supplier", value: i => i.supplier || "—" },
-              { label: "File", value: i => i.original_filename, className: "cell-file" },
+              {
+                label: "IRJ / File",
+                value: i => i.irj_number || "No IRJ yet",
+                secondary: i => i.original_filename,
+                tag: i => i.document_type === "statement" ? "Statement" : "",
+                className: "cell-id",
+                mono: i => Boolean(i.irj_number),
+              },
+              {
+                label: "Supplier / Company",
+                value: i => i.supplier || "—",
+                secondary: i => i.company || "",
+                className: "cell-party",
+                clamp: true,
+              },
               { label: "Status", value: i => i.status, pill: true },
               { label: "Description", value: invoiceDescription, boxed: true },
             ];
+
+            // Queues that only ever hold one status do not need a Status
+            // column; the status is still shown in the expanded row.
+            function sectionColumns(section, extra = []) {
+              const base = SECTION_STATUSES[section].length > 1
+                ? BASE_COLUMNS
+                : BASE_COLUMNS.filter(column => !column.pill);
+              return [...base, ...extra];
+            }
 
             const SECTION_EMPTY_COPY = {
               "needs-review-table": ["Nothing flagged", "Documents the AI cannot route confidently, or that someone flags, will appear here for Purchase Ledger review."],
@@ -1266,8 +1412,11 @@
                 const company = document.getElementById("invoice-search-company").value;
                 const supplier = document.getElementById("invoice-search-supplier").value;
                 const result = document.getElementById("invoice-search-result");
+                const submitButton = event.target.querySelector('button[type="submit"]');
                 result.className = "empty-state";
-                result.textContent = "Searching…";
+                result.innerHTML = loadingStateHtml("Searching invoices…");
+                submitButton.disabled = true;
+                submitButton.setAttribute("aria-busy", "true");
                 try {
                   if (!query && !company && !supplier) {
                     throw new Error("Select a company or supplier, or enter an IRJ number.");
@@ -1288,17 +1437,30 @@
                   }
                   const matches = await response.json();
                   if (!matches.length) {
-                    result.textContent = "No matching invoices were found.";
+                    result.innerHTML = emptyStateHtml(
+                      "No matching invoices",
+                      "Try a different company or supplier, or check the IRJ number."
+                    );
                     return;
                   }
                   result.className = "";
-                  result.innerHTML = matches.map(invoice =>
-                    `<div class="metric-panel"><div class="actions">${pdfLinkButton(invoice)}</div>` +
-                    `${invoiceAnalysisHtml(invoice)}</div>`
-                  ).join("");
+                  result.innerHTML =
+                    `<p class="search-summary" role="status">${matches.length} ` +
+                    `invoice${matches.length === 1 ? "" : "s"} found</p>` +
+                    matches.map(invoice =>
+                      `<div class="metric-panel search-result">` +
+                      `<div class="actions search-result-header">` +
+                      `<div class="search-result-title"><strong>${escapeHtml(invoice.irj_number ? `IRJ ${invoice.irj_number}` : invoice.original_filename)}</strong>` +
+                      `<span>${escapeHtml([invoice.supplier, invoice.company].filter(Boolean).join(" · ") || "Supplier not recorded")}</span></div>` +
+                      `${statusPillHtml(invoice.status)}${pdfLinkButton(invoice)}</div>` +
+                      `${invoiceAnalysisHtml(invoice)}</div>`
+                    ).join("");
                 } catch (error) {
-                  result.textContent = error.message;
-                  showToast(error.message, true);
+                  result.className = "empty-state";
+                  result.innerHTML = emptyStateHtml(error.message, "", "error");
+                } finally {
+                  submitButton.disabled = false;
+                  submitButton.removeAttribute("aria-busy");
                 }
               }
             );
@@ -1308,42 +1470,58 @@
             function renderStatementList(company) {
               const container = document.getElementById("statement-list");
               if (!company) {
-                container.className = "empty-state";
-                container.textContent = "Select a company to view its statements.";
+                container.className = "";
+                container.innerHTML = emptyStateHtml(
+                  "Choose a company",
+                  "Select a company above to list the PDF statements in its SharePoint Statements folder."
+                );
                 return;
               }
               const statements = statementLibrary[company] || [];
               if (!statements.length) {
-                container.className = "empty-state";
-                container.textContent = `No PDF statements were found for ${company}.`;
+                container.className = "";
+                container.innerHTML = emptyStateHtml(
+                  `No statements for ${company}`,
+                  "Statements filed from the Flagged queue, or saved to its SharePoint Statements folder, will appear here."
+                );
                 return;
               }
               container.className = "";
               container.innerHTML =
-                '<table class="section-table"><thead><tr>' +
-                "<th>Statement</th><th>Modified</th><th>Size</th><th>Action</th>" +
+                `<div class="admin-table-wrap"><table class="section-table statement-table" aria-label="Statements for ${escapeAttr(company)}"><thead><tr>` +
+                '<th scope="col">Statement</th><th scope="col">Modified</th><th scope="col" class="num">Size</th><th scope="col"><span class="visually-hidden">Actions</span></th>' +
                 "</tr></thead><tbody>" +
                 statements.map(statement => `
                   <tr>
-                    <td>${escapeHtml(statement.name)}</td>
-                    <td>${escapeHtml(statement.lastModifiedDateTime || statement.createdDateTime || "—")}</td>
-                    <td>${statement.size == null ? "—" : `${Math.ceil(Number(statement.size) / 1024)} KB`}</td>
-                    <td><a class="action-link" href="/api/statements/${encodeURIComponent(statement.id)}/pdf" target="_blank" rel="noopener">View PDF</a></td>
+                    <td class="cell-file"><span class="cell-clamp" title="${escapeAttr(statement.name)}">${escapeHtml(statement.name)}</span></td>
+                    <td class="cell-date">${escapeHtml(formatUkTimestamp(statement.lastModifiedDateTime || statement.createdDateTime))}</td>
+                    <td class="num">${statement.size == null ? "—" : `${Math.ceil(Number(statement.size) / 1024).toLocaleString("en-GB")} KB`}</td>
+                    <td class="col-actions"><a class="action-link" href="/api/statements/${encodeURIComponent(statement.id)}/pdf" target="_blank" rel="noopener" aria-label="View PDF — ${escapeAttr(statement.name)} (opens in a new tab)">View PDF</a></td>
                   </tr>
                 `).join("") +
-                "</tbody></table>";
+                "</tbody></table></div>";
             }
 
             async function loadStatements() {
               const companySelect = document.getElementById("statement-company");
               const container = document.getElementById("statement-list");
-              container.className = "empty-state";
-              container.textContent = "Loading statements from SharePoint…";
-              const response = await fetch("/api/statements");
-              if (!response.ok) {
-                const body = await response.json().catch(() => ({}));
-                container.textContent =
-                  body.detail || "Statements could not be loaded from SharePoint.";
+              container.className = "";
+              container.innerHTML = loadingStateHtml("Loading statements from SharePoint…");
+              let response;
+              try {
+                response = await fetch("/api/statements");
+              } catch (error) {
+                response = null;
+              }
+              if (!response || !response.ok) {
+                const body = response ? await response.json().catch(() => ({})) : {};
+                container.innerHTML = emptyStateHtml(
+                  "Statements could not be loaded",
+                  typeof body.detail === "string"
+                    ? body.detail
+                    : "SharePoint did not respond. Open this page again to retry.",
+                  "error"
+                );
                 return;
               }
               statementLibrary = await response.json();
@@ -1393,33 +1571,33 @@
             }
 
             function metricValueTable(rows, firstHeading) {
-              if (!rows.length) return '<div class="empty-state">No matching invoices.</div>';
+              if (!rows.length) return '<p class="metric-empty">No pending invoices.</p>';
               return '<table class="section-table"><thead><tr>' +
-                `<th>${escapeHtml(firstHeading)}</th><th>Invoices</th><th>Value</th>` +
+                `<th scope="col">${escapeHtml(firstHeading)}</th><th scope="col" class="num">Invoices</th><th scope="col" class="num">Value</th>` +
                 '</tr></thead><tbody>' +
                 rows.map(row => `<tr><td>${escapeHtml(row.name)}</td>` +
-                  `<td>${escapeHtml(row.count)}</td>` +
-                  `<td>${escapeHtml(formatMetricMoney(row.value, row.currency))}</td></tr>`
+                  `<td class="num">${escapeHtml(row.count)}</td>` +
+                  `<td class="num">${escapeHtml(formatMoney(row.value, row.currency))}</td></tr>`
                 ).join("") + '</tbody></table>';
             }
 
-            function dueDateTable(rows) {
-              if (!rows.length) return '<div class="empty-state">None.</div>';
+            function dueDateTable(rows, emptyMessage = "Nothing due.") {
+              if (!rows.length) return `<p class="metric-empty">${escapeHtml(emptyMessage)}</p>`;
               return '<table class="section-table"><thead><tr>' +
-                '<th>IRJ</th><th>Company</th><th>Supplier</th><th>Due</th><th>Value</th>' +
+                '<th scope="col">IRJ</th><th scope="col">Company</th><th scope="col">Supplier</th><th scope="col">Due</th><th scope="col" class="num">Value</th>' +
                 '</tr></thead><tbody>' +
-                rows.map(row => `<tr><td>${escapeHtml(row.irj_number || "—")}</td>` +
+                rows.map(row => `<tr><td class="cell-irj">${escapeHtml(row.irj_number || "—")}</td>` +
                   `<td>${escapeHtml(row.company)}</td><td>${escapeHtml(row.supplier)}</td>` +
-                  `<td>${escapeHtml(row.due_date)}</td>` +
-                  `<td>${escapeHtml(row.value == null ? "—" : formatMetricMoney(row.value, row.currency))}</td></tr>`
+                  `<td class="cell-date">${escapeHtml(formatUkDate(row.due_date))}</td>` +
+                  `<td class="num">${escapeHtml(formatMoney(row.value, row.currency))}</td></tr>`
                 ).join("") + '</tbody></table>';
             }
 
             async function loadMetrics() {
               const dashboard = document.getElementById("metrics-dashboard");
               const granularity = document.getElementById("metrics-granularity").value;
-              dashboard.className = "empty-state";
-              dashboard.textContent = "Loading metrics…";
+              dashboard.className = "";
+              dashboard.innerHTML = loadingStateHtml("Loading metrics…");
               try {
                 const response = await fetch(
                   `/api/admin/metrics?granularity=${encodeURIComponent(granularity)}`
@@ -1448,11 +1626,11 @@
                   </section>
                   <section class="metric-panel">
                     <h4>Overdue invoices (${metrics.due_dates.overdue.length})</h4>
-                    ${dueDateTable(metrics.due_dates.overdue)}
+                    ${dueDateTable(metrics.due_dates.overdue, "No overdue invoices.")}
                   </section>
                   <section class="metric-panel">
                     <h4>Due within 7 days (${metrics.due_dates.approaching.length})</h4>
-                    ${dueDateTable(metrics.due_dates.approaching)}
+                    ${dueDateTable(metrics.due_dates.approaching, "Nothing falls due in the next 7 days.")}
                   </section>
                   <section class="metric-panel wide">
                     <h4>Total pending invoice value by company</h4>
@@ -1469,29 +1647,29 @@
                   ` : ""}
                 `;
               } catch (error) {
-                dashboard.className = "empty-state";
-                dashboard.textContent = error.message;
+                dashboard.className = "";
+                dashboard.innerHTML = emptyStateHtml("Metrics could not be loaded", error.message, "error");
               }
             }
 
             function operationsQueueTable(items, status) {
-              if (!items.length) return '<div class="empty-state">None.</div>';
+              if (!items.length) return `<p class="metric-empty">No ${escapeHtml(status)} items.</p>`;
               return '<table class="section-table"><thead><tr>' +
-                '<th>Received</th><th>Message</th><th>Attempts</th><th>Error</th><th></th>' +
+                '<th scope="col">Received</th><th scope="col">Message</th><th scope="col" class="num">Attempts</th><th scope="col">Error</th><th scope="col"><span class="visually-hidden">Actions</span></th>' +
                 '</tr></thead><tbody>' + items.map(item => `<tr>` +
                   `<td>${escapeHtml(formatUkTimestamp(item.received_at))}</td>` +
-                  `<td title="${escapeHtml(item.message_id)}">${escapeHtml(item.message_id)}</td>` +
-                  `<td>${escapeHtml(item.attempts)}</td>` +
+                  `<td class="cell-file"><span class="cell-clamp" title="${escapeAttr(item.message_id)}">${escapeHtml(item.message_id)}</span></td>` +
+                  `<td class="num">${escapeHtml(item.attempts)}</td>` +
                   `<td>${escapeHtml(item.last_error || "—")}</td>` +
                   `<td>${status === "failed" ? `<button type="button" class="secondary" ` +
-                    `data-retry-notification="${item.id}">Retry</button>` : ""}</td>` +
+                    `data-retry-notification="${item.id}" aria-label="Retry queue item ${escapeAttr(item.message_id)}">Retry</button>` : ""}</td>` +
                   `</tr>`).join("") + '</tbody></table>';
             }
 
             async function loadOperations() {
               const dashboard = document.getElementById("operations-dashboard");
-              dashboard.className = "empty-state";
-              dashboard.textContent = "Loading worker and queue status…";
+              dashboard.className = "";
+              dashboard.innerHTML = loadingStateHtml("Loading worker and queue status…");
               try {
                 const operations = await fetchAdminJson("/api/admin/operations");
                 const worker = operations.worker;
@@ -1543,8 +1721,8 @@
                   });
                 });
               } catch (error) {
-                dashboard.className = "empty-state";
-                dashboard.textContent = error.message;
+                dashboard.className = "";
+                dashboard.innerHTML = emptyStateHtml("Monitoring status could not be loaded", error.message, "error");
               }
             }
 
@@ -1552,10 +1730,9 @@
               renderSectionTable(
                 "needs-review-table",
                 SECTION_STATUSES["needs-review"],
-                [
-                  ...BASE_COLUMNS,
-                  { label: "Return stage", value: i => i.review_return_status || "Requires a dedicated resolution" },
-                ],
+                sectionColumns("needs-review", [
+                  { label: "Return stage", value: i => i.review_return_status || "Requires a dedicated resolution", className: "cell-note" },
+                ]),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   ${invoice.document_type === "statement" ? `
@@ -1577,10 +1754,9 @@
               renderSectionTable(
                 "po-matching-table",
                 SECTION_STATUSES["po-matching"],
-                [
-                  ...BASE_COLUMNS,
-                  { label: "PO number", value: i => i.po_number || "—" },
-                ],
+                sectionColumns("po-matching", [
+                  { label: "PO number", value: i => i.po_number || "—", className: "cell-ref" },
+                ]),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   ${currentUser && currentUser.role === "purchasing" ? "" : `
@@ -1593,7 +1769,7 @@
               renderSectionTable(
                 "sage-registration-table",
                 SECTION_STATUSES["sage-registration"],
-                BASE_COLUMNS,
+                sectionColumns("sage-registration"),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="register-sage" data-id="${invoice.id}" data-irj="${escapeHtml(invoice.irj_number || "")}">Confirm Sage registration / IRJ</button>
@@ -1602,7 +1778,7 @@
               renderSectionTable(
                 "approver1-table",
                 SECTION_STATUSES["approver1"],
-                BASE_COLUMNS,
+                sectionColumns("approver1"),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="approve" data-level="1" data-id="${invoice.id}">Approve</button>
@@ -1615,7 +1791,7 @@
               renderSectionTable(
                 "approver2-table",
                 SECTION_STATUSES["approver2"],
-                BASE_COLUMNS,
+                sectionColumns("approver2"),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="approve" data-level="2" data-id="${invoice.id}">Approve</button>
@@ -1628,11 +1804,9 @@
               renderSectionTable(
                 "on-hold-table",
                 SECTION_STATUSES["on-hold"],
-                [
-                  ...BASE_COLUMNS,
-                  { label: "Issue / payment note", value: i => i.hold_reason || "—" },
+                sectionColumns("on-hold", [
                   { label: "Payment method", value: i => i.payment_method || "—" },
-                ],
+                ]),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   ${invoice.status === "Payment Routing Issue / On Hold"
@@ -1644,10 +1818,9 @@
               renderSectionTable(
                 "approved-table",
                 SECTION_STATUSES["approved"],
-                [
-                  ...BASE_COLUMNS,
+                sectionColumns("approved", [
                   { label: "Payment method", value: i => i.payment_method || "Awaiting automatic routing" },
-                ],
+                ]),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                 `
@@ -1660,10 +1833,9 @@
                 renderSectionTable(
                   containerId,
                   SECTION_STATUSES[section],
-                  [
-                    ...BASE_COLUMNS,
+                  sectionColumns(section, [
                     { label: "Payment route", value: i => i.payment_method || "—" },
-                  ],
+                  ]),
                   invoice => `
                     ${pdfLinkButton(invoice)}
                     <button data-action="pay" data-id="${invoice.id}">Record payment</button>
@@ -1673,11 +1845,10 @@
               renderSectionTable(
                 "reconciliation-table",
                 SECTION_STATUSES["reconciliation"],
-                [
-                  ...BASE_COLUMNS,
-                  { label: "Payment date", value: i => i.payment_date || "—" },
+                sectionColumns("reconciliation", [
+                  { label: "Payment date", value: i => formatUkDate(i.payment_date), className: "cell-date" },
                   { label: "Paid by", value: i => i.paid_by || "—" },
-                ],
+                ]),
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   <button data-action="reconcile" data-id="${invoice.id}">Mark reconciled</button>
@@ -1686,18 +1857,17 @@
               renderSectionTable(
                 "complete-table",
                 SECTION_STATUSES["complete"],
-                [
-                  ...BASE_COLUMNS,
-                  { label: "Marked reconciled", value: i => i.reconciled_at ? i.reconciled_at.slice(0, 10) : "—" },
-                  { label: "Appeared on bank statement", value: i => i.reconciliation_date || "—" },
+                sectionColumns("complete", [
+                  { label: "Marked reconciled", value: i => formatUkDate(i.reconciled_at ? i.reconciled_at.slice(0, 10) : ""), className: "cell-date" },
+                  { label: "Appeared on bank statement", value: i => formatUkDate(i.reconciliation_date), className: "cell-date" },
                   { label: "Completed by", value: i => i.reconciled_by || i.foreign_allocated_by || "—" },
-                ],
+                ]),
                 invoice => pdfLinkButton(invoice)
               );
               renderSectionTable(
                 "rejected-table",
                 SECTION_STATUSES["rejected"],
-                BASE_COLUMNS,
+                sectionColumns("rejected"),
                 invoice => pdfLinkButton(invoice)
               );
             }
@@ -1775,8 +1945,12 @@
               applyProfile();
               document.getElementById("payment-date").value = new Date().toISOString().slice(0, 10);
               document.getElementById("payment-reference").value = "";
-              document.getElementById("payment-supplier-context").textContent =
-                invoice.supplier || "Supplier";
+              document.getElementById("payment-supplier-context").textContent = [
+                invoiceAccessibleName(invoice) || invoice.supplier || "Supplier",
+                invoice.invoice_value == null || invoice.invoice_value === ""
+                  ? ""
+                  : formatMoney(invoice.invoice_value, invoice.currency),
+              ].filter(Boolean).join(" · ");
 
               return new Promise(resolve => {
                 let settled = false;
@@ -1858,6 +2032,7 @@
               cancelLabel = "Cancel",
               tone = "default",
               scrollMessage = false,
+              context = "",
             }) {
               if (uiDialogPending) uiDialogPending(null);
               const form = document.getElementById("ui-dialog-form");
@@ -1868,6 +2043,9 @@
               const cancelButton = document.getElementById("ui-dialog-cancel");
               const opener = document.activeElement;
               document.getElementById("ui-dialog-title").textContent = title;
+              const contextEl = document.getElementById("ui-dialog-context");
+              contextEl.textContent = context;
+              contextEl.hidden = !context;
               messageEl.textContent = message;
               messageEl.hidden = !message;
               messageEl.classList.toggle("scroll", scrollMessage);
@@ -1969,12 +2147,14 @@
               placeholder = "",
               confirmLabel = "OK",
               tone = "default",
+              context = "",
             }) {
               const result = await formDialog({
                 title,
                 message,
                 confirmLabel,
                 tone,
+                context,
                 fields: [{ name: "value", label, value, required, multiline, type, placeholder }],
               });
               return result === null ? null : result.value;
@@ -1984,6 +2164,9 @@
               const action = button.dataset.action;
               const id = button.dataset.id;
               const originalText = button.textContent;
+              const dialogSubject = invoiceAccessibleName(
+                invoices.find(item => String(item.id) === String(id))
+              );
               button.disabled = true;
               button.setAttribute("aria-busy", "true");
               button.textContent = "Working…";
@@ -2013,6 +2196,7 @@
                   });
                 } else if (action === "reject-flagged") {
                   const reason = await promptDialog({
+                    context: dialogSubject,
                     title: "Reject invoice",
                     label: "Reason for rejecting this invoice",
                     required: true,
@@ -2023,6 +2207,7 @@
                   await postJson(`/api/invoices/${id}/reject-flagged`, { reason });
                 } else if (action === "po-query") {
                   const query = await formDialog({
+                    context: dialogSubject,
                     title: "Record PO query",
                     message: "The query is routed back for resolution before the invoice can be matched.",
                     confirmLabel: "Record query",
@@ -2051,6 +2236,7 @@
                   });
                 } else if (action === "po-reject") {
                   const reason = await promptDialog({
+                    context: dialogSubject,
                     title: "Reject PO invoice",
                     label: "Reason for rejecting this PO invoice",
                     required: true,
@@ -2070,12 +2256,14 @@
                 } else if (action === "approve" || action === "reject") {
                   const comments = await promptDialog(action === "reject"
                     ? {
+                        context: dialogSubject,
                         title: "Reject invoice",
                         label: "Reason for rejection",
                         confirmLabel: "Reject invoice",
                         tone: "danger",
                       }
                     : {
+                        context: dialogSubject,
                         title: "Approve invoice",
                         label: "Approval comments (optional)",
                         confirmLabel: "Approve",
@@ -2088,6 +2276,7 @@
                   });
                 } else if (action === "hold") {
                   const comments = await promptDialog({
+                    context: dialogSubject,
                     title: "Place on hold / record query",
                     label: "Reason for placing this invoice on hold / query",
                     required: true,
@@ -2101,6 +2290,7 @@
                   });
                 } else if (action === "resume") {
                   const notes = await promptDialog({
+                    context: dialogSubject,
                     title: originalText.trim() || "Resume approval",
                     label: "Resolution notes for resuming approval (optional)",
                     confirmLabel: "Resume",
@@ -2121,6 +2311,7 @@
                   await postJson(`/api/invoices/${id}/pay`, payment);
                 } else if (action === "reconcile") {
                   const reconciliation = await formDialog({
+                    context: dialogSubject,
                     title: "Mark reconciled",
                     confirmLabel: "Mark reconciled",
                     fields: [
@@ -2200,12 +2391,12 @@
               }
             });
 
-            document.getElementById("confirm-invoice-button").addEventListener("click", async () => {
-              await submitConfirm(false);
+            document.getElementById("confirm-invoice-button").addEventListener("click", async event => {
+              await withBusyButton(event.currentTarget, () => submitConfirm(false));
             });
 
-            document.getElementById("override-duplicate-button").addEventListener("click", async () => {
-              await submitConfirm(true);
+            document.getElementById("override-duplicate-button").addEventListener("click", async event => {
+              await withBusyButton(event.currentTarget, () => submitConfirm(true));
             });
 
             document.getElementById("cancel-duplicate-button").addEventListener("click", async () => {
@@ -2291,6 +2482,7 @@
               formData.append("subject", document.getElementById("manual-upload-subject").value);
               const submitButton = document.getElementById("manual-upload-submit");
               submitButton.disabled = true;
+              submitButton.setAttribute("aria-busy", "true");
               try {
                 const response = await fetch("/api/invoices/manual-upload", { method: "POST", body: formData });
                 if (!response.ok) {
@@ -2319,6 +2511,7 @@
                 statusEl.textContent = error.message;
               } finally {
                 submitButton.disabled = false;
+                submitButton.removeAttribute("aria-busy");
               }
             });
 
@@ -2433,12 +2626,12 @@
               onEdit = null
             ) {
               if (!rows.length) {
-                container.innerHTML = '<p class="empty">Nothing here yet.</p>';
+                container.innerHTML = `<p class="empty">${escapeHtml(adminEmptyCopy(container))}</p>`;
                 return;
               }
               const hasActions = Boolean(onDelete || onEdit);
-              const head = columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("") +
-                (hasActions ? "<th>Actions</th>" : "");
+              const head = columns.map(c => `<th scope="col">${escapeHtml(c.label)}</th>`).join("") +
+                (hasActions ? '<th scope="col"><span class="visually-hidden">Actions</span></th>' : "");
               const body = rows
                 .map((row, index) => {
                   const cells = columns
@@ -2446,21 +2639,23 @@
                       ? `<td>${c.value(row) ?? "—"}</td>`
                       : `<td>${escapeHtml(c.value(row) ?? "—")}</td>`)
                     .join("");
+                  const rowName = escapeAttr(String(columns[0].value(row) ?? "").trim() || "entry");
                   const actionCell = hasActions
                     ? `<td><div class="row-actions">` +
                       (onEdit
-                        ? `<button class="secondary" data-edit-index="${index}">Edit</button>`
+                        ? `<button type="button" class="secondary" data-edit-index="${index}" aria-label="Edit ${rowName}">Edit</button>`
                         : "") +
                       (onDelete
-                        ? `<button class="danger" data-delete-index="${index}">Delete</button>`
+                        ? `<button type="button" class="danger" data-delete-index="${index}" aria-label="Delete ${rowName}">Delete</button>`
                         : "") +
                       `</div></td>`
                     : "";
                   return `<tr>${cells}${actionCell}</tr>`;
                 })
                 .join("");
+              const tableName = adminTableName(container);
               container.innerHTML =
-                `<div class="admin-table-wrap"><table class="admin-table">` +
+                `<div class="admin-table-wrap"><table class="admin-table"${tableName ? ` aria-label="${escapeAttr(tableName)}"` : ""}>` +
                 `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>` +
                 `</table></div>`;
               if (onDelete) {
@@ -2490,6 +2685,29 @@
               }
             }
 
+            // Admin tables are named after their section (and company group)
+            // so screen-reader table lists are meaningful.
+            function adminTableName(container) {
+              const block = container.closest(".admin-block");
+              const section = block
+                ?.querySelector(":scope > h3, :scope > summary")?.textContent.trim() || "";
+              const group = container.closest("details.admin-company-group")
+                ?.querySelector("summary")?.textContent.trim() || "";
+              return [section, group].filter(Boolean).join(" — ");
+            }
+
+            const ADMIN_EMPTY_COPY = {
+              "admin-companies-table": "No companies yet. Add one above using its SharePoint company folder.",
+              "admin-suppliers-table": "No suppliers yet. Add one above or bulk import a supplier workbook.",
+              "admin-supplier-terms-table": "No payment settings yet. They are created by the supplier workbook import.",
+              "admin-matrix-table": "No approval routes match. Clear the filter or add a route above.",
+            };
+
+            function adminEmptyCopy(container) {
+              const owner = container.closest("[id^='admin-'][id$='-table']");
+              return ADMIN_EMPTY_COPY[owner?.id] || "Nothing here yet.";
+            }
+
             function companyGroupLabel(company) {
               if (company === "*") return "All invoice companies";
               return company || "Unassigned suppliers";
@@ -2509,7 +2727,7 @@
                 companyGroupLabel(left).localeCompare(companyGroupLabel(right))
               );
               if (!entries.length) {
-                container.innerHTML = '<p class="empty">Nothing here yet.</p>';
+                container.innerHTML = `<p class="empty">${escapeHtml(adminEmptyCopy(container))}</p>`;
                 return;
               }
               for (const [company, rows] of entries) {
@@ -2602,9 +2820,12 @@
                 container.appendChild(label);
                 controls.set(field.key, { control, field });
               }
+              const errorEl = document.getElementById("admin-edit-error");
+              errorEl.textContent = "";
               document.getElementById("admin-edit-cancel").onclick = () => dialog.close();
               form.onsubmit = async event => {
                 event.preventDefault();
+                errorEl.textContent = "";
                 const values = {};
                 for (const [key, { control, field }] of controls) {
                   if (field.omitWhenBlank && !control.value) continue;
@@ -2612,14 +2833,18 @@
                     ? null
                     : control.value;
                 }
-                try {
-                  await onSave(values);
-                  dialog.close();
-                } catch (error) {
-                  showToast(error.message, true);
-                }
+                await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
+                  try {
+                    await onSave(values);
+                    dialog.close();
+                    showToast("Changes saved.");
+                  } catch (error) {
+                    errorEl.textContent = error.message;
+                  }
+                });
               };
               dialog.showModal();
+              container.querySelector("input, select, textarea")?.focus();
             }
 
             function companyOptions(includeAll = false) {
@@ -2691,7 +2916,7 @@
                     "",
                     company
                       ? "Select supplier company…"
-                      : "Select an invoice company first…",
+                      : "Choose company first…",
                   ],
                   ...suppliers.map(supplier => [supplier.name, supplier.name]),
                 ]
@@ -3178,9 +3403,19 @@
               const fileInput = document.getElementById("admin-import-file");
               const companySelect = document.getElementById("admin-import-company");
               const resultBox = document.getElementById("admin-import-result");
+              setFormError(event.target, "");
               if (!companySelect.value || !fileInput.files.length) {
+                setFormError(
+                  event.target,
+                  !companySelect.value
+                    ? "Choose the invoice company the suppliers belong to."
+                    : "Choose an Excel workbook (.xlsx) to import."
+                );
                 return;
               }
+              const importButton = event.target.querySelector('button[type="submit"]');
+              importButton.disabled = true;
+              importButton.setAttribute("aria-busy", "true");
               const formData = new FormData();
               formData.append("file", fileInput.files[0]);
               formData.append("company", companySelect.value);
@@ -3247,23 +3482,31 @@ ${duplicates}
                 await loadSuppliers();
               } catch (error) {
                 resultBox.innerHTML = "";
-                showToast(error.message, true);
+                setFormError(event.target, error.message);
+              } finally {
+                importButton.disabled = false;
+                importButton.removeAttribute("aria-busy");
               }
             });
 
             document.getElementById("admin-company-form").addEventListener("submit", async event => {
               event.preventDefault();
+              const form = event.target;
+              setFormError(form, "");
+              await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
               try {
                 await postJson("/api/admin/companies", {
                   name: document.getElementById("admin-company-name").value,
                   sharepoint_root_folder: document.getElementById("admin-company-root-folder").value,
                   aliases: splitCommaList(document.getElementById("admin-company-aliases").value),
                 });
-                event.target.reset();
+                form.reset();
+                showToast("Company added.");
                 await loadAdminPanel();
               } catch (error) {
-                showToast(error.message, true);
+                setFormError(form, error.message);
               }
+              });
             });
 
             document.getElementById("admin-company-root-folder").addEventListener("change", event => {
@@ -3301,6 +3544,9 @@ ${duplicates}
 
             document.getElementById("admin-supplier-form").addEventListener("submit", async event => {
               event.preventDefault();
+              const form = event.target;
+              setFormError(form, "");
+              await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
               try {
                 await postJson("/api/admin/suppliers", {
                   name: document.getElementById("admin-supplier-name").value,
@@ -3310,12 +3556,14 @@ ${duplicates}
                   invoice_number_pattern:
                     document.getElementById("admin-supplier-invoice-pattern").value || null,
                 });
-                event.target.reset();
+                form.reset();
+                showToast("Supplier added.");
                 await loadAdminPanel();
                 await loadSuppliers();
               } catch (error) {
-                showToast(error.message, true);
+                setFormError(form, error.message);
               }
+              });
             });
 
             document.getElementById("admin-matrix-company").addEventListener(
@@ -3325,6 +3573,9 @@ ${duplicates}
 
             document.getElementById("admin-matrix-form").addEventListener("submit", async event => {
               event.preventDefault();
+              const form = event.target;
+              setFormError(form, "");
+              await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
               try {
                 await postJson("/api/admin/approval-matrix", {
                   company: document.getElementById("admin-matrix-company").value,
@@ -3334,15 +3585,26 @@ ${duplicates}
                   approver2_name: document.getElementById("admin-matrix-approver2-name").value || null,
                   approver2_email: document.getElementById("admin-matrix-approver2-email").value || null,
                 });
-                event.target.reset();
+                form.reset();
+                showToast("Approval route saved.");
                 await loadAdminPanel();
               } catch (error) {
-                showToast(error.message, true);
+                setFormError(form, error.message);
               }
+              });
             });
 
             document.getElementById("admin-threshold-form").addEventListener("submit", async event => {
               event.preventDefault();
+              const form = event.target;
+              setFormError(form, "");
+              const thresholdInput = document.getElementById("admin-threshold-value");
+              if (thresholdInput.value === "" || Number(thresholdInput.value) < 0 || Number(thresholdInput.value) > 1) {
+                setFormError(form, "Enter a threshold between 0 and 1, for example 0.80.");
+                thresholdInput.focus();
+                return;
+              }
+              await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
               try {
                 const threshold = Number(document.getElementById("admin-threshold-value").value);
                 const response = await fetch("/api/admin/ai-threshold", {
@@ -3353,8 +3615,9 @@ ${duplicates}
                 if (!response.ok) throw new Error("Failed to save threshold.");
                 showToast("AI confidence threshold saved.");
               } catch (error) {
-                showToast(error.message, true);
+                setFormError(form, error.message);
               }
+              });
             });
 
             document.getElementById("logout-button").addEventListener("click", async () => {
@@ -3383,6 +3646,9 @@ ${duplicates}
               errorEl.textContent = "";
               const username = document.getElementById("login-username").value;
               const password = document.getElementById("login-password").value;
+              const submitButton = event.target.querySelector('button[type="submit"]');
+              submitButton.disabled = true;
+              submitButton.setAttribute("aria-busy", "true");
               try {
                 const response = await fetch("/api/auth/login", {
                   method: "POST",
@@ -3396,6 +3662,9 @@ ${duplicates}
                 await enterApp();
               } catch (error) {
                 errorEl.textContent = error.message;
+              } finally {
+                submitButton.disabled = false;
+                submitButton.removeAttribute("aria-busy");
               }
             });
 
@@ -3528,6 +3797,75 @@ ${duplicates}
               "change",
               loadMetrics
             );
+
+            // ---------------------------------------------------------
+            // Admin in-page section menu: jumps to a section (opening it if
+            // collapsed) and highlights the section currently in view.
+            // ---------------------------------------------------------
+            const adminSectionNav = document.getElementById("admin-section-nav");
+            const reducedMotion = window.matchMedia
+              ? window.matchMedia("(prefers-reduced-motion: reduce)")
+              : null;
+
+            function adminSectionBlock(button) {
+              return document.getElementById(button.dataset.adminSection)
+                ?.closest(".admin-block") || null;
+            }
+
+            adminSectionNav.addEventListener("click", event => {
+              const button = event.target.closest("button[data-admin-section]");
+              if (!button) return;
+              const block = adminSectionBlock(button);
+              if (!block) return;
+              if (block.tagName === "DETAILS" && !block.open) block.open = true;
+              block.scrollIntoView({
+                behavior: reducedMotion && reducedMotion.matches ? "auto" : "smooth",
+                block: "start",
+              });
+              const heading = block.querySelector(":scope > summary, :scope > h3");
+              if (heading) {
+                if (heading.tagName === "H3") heading.tabIndex = -1;
+                heading.focus({ preventScroll: true });
+              }
+            });
+
+            // Highlight the last section whose heading has scrolled up to
+            // just under the sticky menu.
+            const adminSectionButtons = [...adminSectionNav.querySelectorAll("button[data-admin-section]")]
+              .map(button => [button, adminSectionBlock(button)])
+              .filter(([, block]) => block);
+            let adminSpyFrame = null;
+            function syncAdminSectionSpy() {
+              adminSpyFrame = null;
+              if (!adminSectionNav.offsetParent) return;
+              const line = adminSectionNav.getBoundingClientRect().bottom + 96;
+              let current = adminSectionButtons[0]?.[0];
+              for (const [button, block] of adminSectionButtons) {
+                if (block.getBoundingClientRect().top <= line) current = button;
+              }
+              const atBottom = window.innerHeight + window.scrollY >=
+                document.documentElement.scrollHeight - 4;
+              if (atBottom) current = adminSectionButtons.at(-1)?.[0];
+              for (const [button] of adminSectionButtons) {
+                if (button === current) button.setAttribute("aria-current", "true");
+                else button.removeAttribute("aria-current");
+              }
+            }
+            window.addEventListener("scroll", () => {
+              if (adminSpyFrame === null) {
+                adminSpyFrame = window.requestAnimationFrame(syncAdminSectionSpy);
+              }
+            }, { passive: true });
+            document.querySelector('#section-nav button[data-tab="admin"]')
+              .addEventListener("click", () => window.requestAnimationFrame(syncAdminSectionSpy));
+
+            // Sticky header gains a shadow once the page scrolls under it.
+            const topbar = document.querySelector(".topbar");
+            const syncTopbarShadow = () => {
+              topbar.classList.toggle("is-scrolled", window.scrollY > 4);
+            };
+            window.addEventListener("scroll", syncTopbarShadow, { passive: true });
+            syncTopbarShadow();
 
             window.addEventListener("beforeunload", () => {
               if (activityEventSource !== null) activityEventSource.close();
