@@ -10,10 +10,15 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 import httpx
-import msal
+
+from app.graph_http import (
+    GRAPH_BASE_URL as GRAPH_BASE_URL,  # re-exported for existing importers
+    GraphSession,
+    MsalClientCredentialTokenProvider,
+    shared_token_provider,
+)
 
 
-GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._ -]+")
 PDF_EXTENSIONS = {".pdf"}
 EXCEL_EXTENSIONS = {".xls", ".xlsx"}
@@ -62,23 +67,28 @@ class OutlookSettings:
             )
 
 
-class MsalTokenProvider:
+class MsalTokenProvider(MsalClientCredentialTokenProvider):
     def __init__(self, settings: OutlookSettings) -> None:
-        self.application = msal.ConfidentialClientApplication(
+        super().__init__(
+            settings.tenant_id,
             settings.client_id,
-            authority=f"https://login.microsoftonline.com/{settings.tenant_id}",
-            client_credential=settings.client_secret,
+            settings.client_secret,
+            error_factory=OutlookGraphError,
         )
 
-    def __call__(self) -> str:
-        result = self.application.acquire_token_for_client(
-            scopes=["https://graph.microsoft.com/.default"]
-        )
-        token = result.get("access_token")
-        if not isinstance(token, str):
-            description = result.get("error_description", "Unknown token error.")
-            raise OutlookGraphError(f"Unable to obtain Graph token: {description}")
-        return token
+
+def default_token_provider(settings: OutlookSettings) -> Callable[[], str]:
+    """One process-wide token provider per app registration.
+
+    Outlook, SharePoint and email notifications all authenticate with the same
+    OUTLOOK_MCP_* app registration, so they share one MSAL token cache.
+    """
+    return shared_token_provider(
+        settings.tenant_id,
+        settings.client_id,
+        settings.client_secret,
+        OutlookGraphError,
+    )
 
 
 class OutlookGraphClient:
@@ -91,8 +101,13 @@ class OutlookGraphClient:
     ) -> None:
         settings.validate()
         self.settings = settings
-        self.token_provider = token_provider or MsalTokenProvider(settings)
+        self.token_provider = token_provider or default_token_provider(settings)
         self.http_client = http_client or httpx.Client(timeout=30.0)
+        self.session = GraphSession(
+            self.http_client,
+            self.token_provider,
+            error_class=OutlookGraphError,
+        )
         self.settings.download_directory.mkdir(parents=True, exist_ok=True)
 
     def list_invoice_emails(
@@ -199,22 +214,17 @@ class OutlookGraphClient:
         self, message_id: str, attachment_id: str, filename: str
     ) -> Path:
         safe_filename = self._safe_pdf_filename(filename)
-        response = self._get(
-            (
-                f"/users/{quote(self.settings.mailbox, safe='')}/messages/"
-                f"{quote(message_id, safe='')}/attachments/"
-                f"{quote(attachment_id, safe='')}/$value"
-            )
+        content = self.session.download(
+            self._attachment_value_path(message_id, attachment_id),
+            max_bytes=self.settings.max_pdf_bytes,
+            too_large_error=lambda: OutlookGraphError(
+                "The PDF exceeds the configured size limit."
+            ),
         )
-        content = response.content
-        if len(content) > self.settings.max_pdf_bytes:
-            raise OutlookGraphError("The PDF exceeds the configured size limit.")
         if not content.startswith(b"%PDF-"):
             raise OutlookGraphError("The attachment content is not a valid PDF.")
 
-        target = self._unique_target(safe_filename)
-        target.write_bytes(content)
-        return target
+        return self._write_unique(safe_filename, content)
 
     def _download_excel_as_pdf(
         self, message_id: str, attachment_id: str, filename: str
@@ -227,18 +237,13 @@ class OutlookGraphClient:
             )
 
         safe_source_name = self._safe_excel_filename(filename)
-        source_response = self._get(
-            (
-                f"/users/{quote(self.settings.mailbox, safe='')}/messages/"
-                f"{quote(message_id, safe='')}/attachments/"
-                f"{quote(attachment_id, safe='')}/$value"
-            )
-        )
-        source_content = source_response.content
-        if len(source_content) > self.settings.max_excel_bytes:
-            raise OutlookGraphError(
+        source_content = self.session.download(
+            self._attachment_value_path(message_id, attachment_id),
+            max_bytes=self.settings.max_excel_bytes,
+            too_large_error=lambda: OutlookGraphError(
                 "The Excel attachment exceeds the configured size limit."
-            )
+            ),
+        )
         if not source_content:
             raise OutlookGraphError("The Excel attachment is empty.")
 
@@ -261,18 +266,18 @@ class OutlookGraphClient:
         conversion_error: Exception | None = None
         pdf_content: bytes | None = None
         try:
-            response = self._get_graph_content(
+            pdf_content = self.session.download(
                 (
                     f"/drives/{quote(drive_id, safe='')}/items/"
                     f"{quote(item_id, safe='')}/content"
                 ),
                 params={"format": "pdf"},
-            )
-            pdf_content = response.content
-            if len(pdf_content) > self.settings.max_pdf_bytes:
-                raise OutlookGraphError(
+                follow_redirects=True,
+                max_bytes=self.settings.max_pdf_bytes,
+                too_large_error=lambda: OutlookGraphError(
                     "The converted PDF exceeds the configured size limit."
-                )
+                ),
+            )
             if not pdf_content.startswith(b"%PDF-"):
                 raise OutlookGraphError(
                     "Microsoft Graph did not return a valid PDF conversion."
@@ -297,11 +302,10 @@ class OutlookGraphClient:
             raise conversion_error
         assert pdf_content is not None
 
-        target = self._unique_target(
-            self._safe_pdf_filename(f"{Path(safe_source_name).stem}.pdf")
+        return self._write_unique(
+            self._safe_pdf_filename(f"{Path(safe_source_name).stem}.pdf"),
+            pdf_content,
         )
-        target.write_bytes(pdf_content)
-        return target
 
     def create_inbox_subscription(
         self,
@@ -328,7 +332,11 @@ class OutlookGraphClient:
                     "The lifecycle notification URL must use HTTPS."
                 )
             payload["lifecycleNotificationUrl"] = lifecycle_notification_url
-        return self._send_json("POST", "/subscriptions", payload).json()
+        # Not retried on 5xx/timeouts: a lost success would create a second
+        # subscription.
+        return self._send_json(
+            "POST", "/subscriptions", payload, idempotent=False
+        ).json()
 
     def renew_subscription(self, subscription_id: str) -> dict[str, Any]:
         if not subscription_id.strip():
@@ -337,91 +345,48 @@ class OutlookGraphClient:
             "PATCH",
             f"/subscriptions/{quote(subscription_id, safe='')}",
             {"expirationDateTime": self._subscription_expiration()},
+            idempotent=True,
         ).json()
+
+    def _attachment_value_path(self, message_id: str, attachment_id: str) -> str:
+        return (
+            f"/users/{quote(self.settings.mailbox, safe='')}/messages/"
+            f"{quote(message_id, safe='')}/attachments/"
+            f"{quote(attachment_id, safe='')}/$value"
+        )
 
     def _get(
         self, path: str, *, params: dict[str, str] | None = None
     ) -> httpx.Response:
-        response = self.http_client.get(
-            f"{GRAPH_BASE_URL}{path}",
-            params=params,
-            headers={"Authorization": f"Bearer {self.token_provider()}"},
-        )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise OutlookGraphError(
-                f"Microsoft Graph request failed with HTTP {response.status_code}; "
-                f"request ID: {request_id}."
-            ) from error
-        return response
+        return self.session.request("GET", path, params=params)
 
     def _send_json(
-        self, method: str, path: str, payload: dict[str, Any]
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        idempotent: bool = False,
     ) -> httpx.Response:
-        response = self.http_client.request(
-            method,
-            f"{GRAPH_BASE_URL}{path}",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {self.token_provider()}",
-                "Content-Type": "application/json",
-            },
+        return self.session.request(
+            method, path, json=payload, idempotent=idempotent
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise OutlookGraphError(
-                f"Microsoft Graph request failed with HTTP {response.status_code}; "
-                f"request ID: {request_id}."
-            ) from error
-        return response
 
     def _put_graph_content(
         self, path: str, content: bytes
     ) -> httpx.Response:
-        response = self.http_client.put(
-            f"{GRAPH_BASE_URL}{path}",
+        # Only used for the uniquely named temporary workbook, so a retried
+        # PUT simply rewrites the same file.
+        return self.session.request(
+            "PUT",
+            path,
             content=content,
-            headers={
-                "Authorization": f"Bearer {self.token_provider()}",
-                "Content-Type": "application/octet-stream",
-            },
+            headers={"Content-Type": "application/octet-stream"},
+            idempotent=True,
         )
-        self._raise_graph_error(response)
-        return response
-
-    def _get_graph_content(
-        self, path: str, *, params: dict[str, str]
-    ) -> httpx.Response:
-        response = self.http_client.get(
-            f"{GRAPH_BASE_URL}{path}",
-            params=params,
-            headers={"Authorization": f"Bearer {self.token_provider()}"},
-            follow_redirects=True,
-        )
-        self._raise_graph_error(response)
-        return response
 
     def _delete_graph_item(self, path: str) -> None:
-        response = self.http_client.delete(
-            f"{GRAPH_BASE_URL}{path}",
-            headers={"Authorization": f"Bearer {self.token_provider()}"},
-        )
-        self._raise_graph_error(response)
-
-    @staticmethod
-    def _raise_graph_error(response: httpx.Response) -> None:
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise OutlookGraphError(
-                f"Microsoft Graph request failed with HTTP {response.status_code}; "
-                f"request ID: {request_id}."
-            ) from error
+        self.session.request("DELETE", path, ok_on_retry_statuses={404})
 
     @staticmethod
     def _validate_subscription_values(
@@ -458,19 +423,26 @@ class OutlookGraphClient:
             raise OutlookGraphError("Only XLS and XLSX files can be converted.")
         return cleaned[:180]
 
-    def _unique_target(self, filename: str) -> Path:
-        candidate = self.settings.download_directory / filename
-        if not candidate.exists():
-            return candidate
+    def _write_unique(self, filename: str, content: bytes) -> Path:
+        """Atomically claim a free filename and write content to it.
 
-        stem = candidate.stem
-        suffix = candidate.suffix
-        counter = 2
+        Uses exclusive creation so concurrent downloads of attachments with
+        the same name never overwrite each other.
+        """
+        directory = self.settings.download_directory
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        counter = 1
         while True:
-            candidate = self.settings.download_directory / f"{stem}_{counter}{suffix}"
-            if not candidate.exists():
-                return candidate
-            counter += 1
+            name = filename if counter == 1 else f"{stem}_{counter}{suffix}"
+            candidate = directory / name
+            try:
+                with open(candidate, "xb") as handle:
+                    handle.write(content)
+            except FileExistsError:
+                counter += 1
+                continue
+            return candidate
 
 
 def settings_from_environment() -> OutlookSettings:

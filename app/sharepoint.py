@@ -10,11 +10,10 @@ from urllib.parse import quote
 
 import httpx
 
-from app.outlook_graph import MsalTokenProvider, OutlookSettings
+from app.graph_http import GRAPH_BASE_URL, GraphSession
+from app.outlook_graph import OutlookSettings, default_token_provider
 from app.company_folders import FLAGGED_INVOICES_FOLDER
 
-
-GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 
 class SharePointConfigurationError(RuntimeError):
@@ -64,8 +63,13 @@ class SharePointClient:
     ) -> None:
         sharepoint_settings.validate()
         self.settings = sharepoint_settings
-        self.token_provider = token_provider or MsalTokenProvider(outlook_settings)
+        self.token_provider = token_provider or default_token_provider(outlook_settings)
         self.http_client = http_client or httpx.Client(timeout=60.0)
+        self.session = GraphSession(
+            self.http_client,
+            self.token_provider,
+            error_class=SharePointError,
+        )
         self._cache_lock = Lock()
         self._folder_cache: dict[str, tuple[float, str]] = {}
         self._folder_inventory_cache: dict[int, tuple[float, list[str]]] = {}
@@ -97,30 +101,15 @@ class SharePointClient:
         """Return PDFs currently waiting in the configured Incoming folder."""
         drive_id = quote(self.settings.drive_id, safe="")
         folder = quote(str(PurePosixPath(self.settings.incoming_folder)), safe="/")
-        url: str | None = (
-            f"{GRAPH_BASE_URL}/drives/{drive_id}/root:/{folder}:/children"
-        )
-        params: dict[str, str] | None = {
+        url = f"{GRAPH_BASE_URL}/drives/{drive_id}/root:/{folder}:/children"
+        params: dict[str, str] = {
             "$select": "id,name,size,file,webUrl,createdDateTime",
             "$top": "200",
         }
         items: list[dict[str, Any]] = []
-        while url:
-            response = self.http_client.get(
-                url,
-                params=params,
-                headers={"Authorization": "Bearer " + self.token_provider()},
-            )
-            params = None
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                request_id = response.headers.get("request-id", "not provided")
-                raise SharePointError(
-                    f"SharePoint Incoming listing failed with HTTP "
-                    f"{response.status_code}; request ID: {request_id}."
-                ) from error
-            payload = response.json()
+        for payload in self.session.paginate(
+            url, params=params, operation="SharePoint Incoming listing"
+        ):
             page = payload.get("value", [])
             if not isinstance(page, list):
                 raise SharePointError(
@@ -133,8 +122,6 @@ class SharePointClient:
                 and isinstance(item.get("file"), dict)
                 and str(item.get("name", "")).lower().endswith(".pdf")
             )
-            next_link = payload.get("@odata.nextLink")
-            url = next_link if isinstance(next_link, str) else None
         return items
 
     def download_item(self, item_id: str) -> bytes:
@@ -143,20 +130,12 @@ class SharePointClient:
             f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
             f"items/{quote(item_id, safe='')}/content"
         )
-        response = self.http_client.get(
+        return self.session.request(
+            "GET",
             url,
-            headers={"Authorization": "Bearer " + self.token_provider()},
+            operation="SharePoint invoice download",
             follow_redirects=True,
-        )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise SharePointError(
-                f"SharePoint invoice download failed with HTTP "
-                f"{response.status_code}; request ID: {request_id}."
-            ) from error
-        return response.content
+        ).content
 
     def delete_item(self, item_id: str) -> None:
         """Permanently delete a DriveItem from the configured library."""
@@ -164,20 +143,12 @@ class SharePointClient:
             f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
             f"items/{quote(item_id, safe='')}"
         )
-        response = self.http_client.delete(
+        self.session.request(
+            "DELETE",
             url,
-            headers={"Authorization": "Bearer " + self.token_provider()},
+            operation="SharePoint invoice deletion",
+            ok_statuses={404},
         )
-        if response.status_code == 404:
-            return
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise SharePointError(
-                f"SharePoint invoice deletion failed with HTTP "
-                f"{response.status_code}; request ID: {request_id}."
-            ) from error
 
     def move_to_folder(
         self,
@@ -201,7 +172,8 @@ class SharePointClient:
             "parentReference": {"id": folder_id},
             "name": destination_filename,
         }
-        response = self._send_json("PATCH", url, payload)
+        # Setting the same parent and name twice is harmless, so retry it.
+        response = self._send_json("PATCH", url, payload, idempotent=True)
         with self._cache_lock:
             self._statement_library_cache.clear()
         return response.json()
@@ -248,24 +220,11 @@ class SharePointClient:
             f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
         )
         paths: set[str] = set()
-        url: str | None = f"{drive_prefix}/root/delta"
-        params: dict[str, str] | None = {"$top": "200"}
-        while url:
-            response = self.http_client.get(
-                url,
-                params=params,
-                headers={"Authorization": "Bearer " + self.token_provider()},
-            )
-            params = None
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                request_id = response.headers.get("request-id", "not provided")
-                raise SharePointError(
-                    f"SharePoint folder inventory failed with HTTP "
-                    f"{response.status_code}; request ID: {request_id}."
-                ) from error
-            payload = response.json()
+        for payload in self.session.paginate(
+            f"{drive_prefix}/root/delta",
+            params={"$top": "200"},
+            operation="SharePoint folder inventory",
+        ):
             page = payload.get("value", [])
             if not isinstance(page, list):
                 raise SharePointError(
@@ -292,8 +251,6 @@ class SharePointClient:
                     raise SharePointError(
                         f"SharePoint folder scan exceeded {max_folders} folders."
                     )
-            next_link = payload.get("@odata.nextLink")
-            url = next_link if isinstance(next_link, str) else None
         result = sorted(paths, key=str.casefold)
         with self._cache_lock:
             self._folder_inventory_cache[max_folders] = (monotonic(), result)
@@ -322,27 +279,15 @@ class SharePointClient:
         )
         library: dict[str, list[dict[str, Any]]] = {}
         item_count = 0
-        url: str | None = f"{drive_prefix}/root/delta"
-        params: dict[str, str] | None = {
+        params = {
             "$select": "id,name,size,file,folder,webUrl,createdDateTime,lastModifiedDateTime,parentReference,deleted",
             "$top": "200",
         }
-        while url:
-            response = self.http_client.get(
-                url,
-                params=params,
-                headers={"Authorization": "Bearer " + self.token_provider()},
-            )
-            params = None
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                request_id = response.headers.get("request-id", "not provided")
-                raise SharePointError(
-                    f"SharePoint statement library listing failed with HTTP "
-                    f"{response.status_code}; request ID: {request_id}."
-                ) from error
-            payload = response.json()
+        for payload in self.session.paginate(
+            f"{drive_prefix}/root/delta",
+            params=params,
+            operation="SharePoint statement library listing",
+        ):
             page = payload.get("value", [])
             if not isinstance(page, list):
                 raise SharePointError(
@@ -387,8 +332,6 @@ class SharePointClient:
                             "lastModifiedDateTime": item.get("lastModifiedDateTime"),
                         }
                     )
-            next_link = payload.get("@odata.nextLink")
-            url = next_link if isinstance(next_link, str) else None
 
         result = {
             company: sorted(
@@ -422,23 +365,18 @@ class SharePointClient:
             f"root:/{quote(safe_folder, safe='/')}/"
             f"{safe_filename}:/content"
         )
-        response = self.http_client.put(
+        # A PUT to a fixed path that replaces (or fails on conflict) is safe to
+        # retry. With "rename", a retry after a lost success would create a
+        # second "name 1.pdf" copy, so only throttling/connect errors retry.
+        response = self.session.request(
+            "PUT",
             url,
+            operation="SharePoint upload",
             params={"@microsoft.graph.conflictBehavior": conflict_behavior},
             content=content,
-            headers={
-                "Authorization": f"Bearer {self.token_provider()}",
-                "Content-Type": "application/pdf",
-            },
+            headers={"Content-Type": "application/pdf"},
+            idempotent=conflict_behavior in {"replace", "fail"},
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise SharePointError(
-                f"SharePoint upload failed with HTTP {response.status_code}; "
-                f"request ID: {request_id}."
-            ) from error
         return response.json()
 
     def _ensure_folder(self, folder_path: str) -> str:
@@ -493,27 +431,11 @@ class SharePointClient:
         else:
             url = f"{drive_prefix}/items/{quote(parent_id, safe='')}/children"
 
-        params: dict[str, str] | None = {
-            "$select": "id,name,folder",
-            "$top": "200",
-        }
-        while url:
-            response = self.http_client.get(
-                url,
-                params=params,
-                headers={"Authorization": f"Bearer {self.token_provider()}"},
-            )
-            params = None
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                request_id = response.headers.get("request-id", "not provided")
-                raise SharePointError(
-                    f"SharePoint folder lookup failed with HTTP {response.status_code}; "
-                    f"request ID: {request_id}."
-                ) from error
-
-            payload = response.json()
+        for payload in self.session.paginate(
+            url,
+            params={"$select": "id,name,folder", "$top": "200"},
+            operation="SharePoint folder lookup",
+        ):
             items = payload.get("value", [])
             if not isinstance(items, list):
                 raise SharePointError(
@@ -526,8 +448,6 @@ class SharePointClient:
                     and str(item.get("name", "")).casefold() == name.casefold()
                 ):
                     return str(item["id"])
-            next_link = payload.get("@odata.nextLink")
-            url = next_link if isinstance(next_link, str) else None
 
         # Folder does not exist — create it
         if parent_id is None:
@@ -540,32 +460,28 @@ class SharePointClient:
             "folder": {},
             "@microsoft.graph.conflictBehavior": "rename",
         }
+        # conflictBehavior=rename makes this non-idempotent: never retried
+        # except on throttling or connection failures.
         created = self._send_json("POST", create_url, payload)
         with self._cache_lock:
             self._folder_inventory_cache.clear()
         return str(created.json()["id"])
 
     def _send_json(
-        self, method: str, url: str, payload: dict[str, Any]
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        idempotent: bool = False,
     ) -> httpx.Response:
-        response = self.http_client.request(
+        return self.session.request(
             method,
             url,
+            operation="SharePoint request",
             json=payload,
-            headers={
-                "Authorization": f"Bearer {self.token_provider()}",
-                "Content-Type": "application/json",
-            },
+            idempotent=idempotent,
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            request_id = response.headers.get("request-id", "not provided")
-            raise SharePointError(
-                f"SharePoint request failed with HTTP {response.status_code}; "
-                f"request ID: {request_id}."
-            ) from error
-        return response
 
 def sharepoint_settings_from_environment() -> SharePointSettings:
     return SharePointSettings(

@@ -8,10 +8,10 @@ from urllib.parse import quote
 
 import httpx
 
+from app.graph_http import GraphSession
 from app.outlook_graph import (
-    GRAPH_BASE_URL,
-    MsalTokenProvider,
     OutlookSettings,
+    default_token_provider,
     settings_from_environment,
 )
 
@@ -52,8 +52,13 @@ class GraphEmailNotifier:
         http_client: httpx.Client | None = None,
     ) -> None:
         self.settings = settings
-        self.token_provider = token_provider or MsalTokenProvider(outlook_settings)
+        self.token_provider = token_provider or default_token_provider(outlook_settings)
         self.http_client = http_client or httpx.Client(timeout=30.0)
+        self.session = GraphSession(
+            self.http_client,
+            self.token_provider,
+            error_class=EmailNotificationError,
+        )
 
     def send(self, *, recipient: str, subject: str, body: str) -> None:
         if not self.settings.enabled:
@@ -64,12 +69,14 @@ class GraphEmailNotifier:
                 "An email notification recipient is required."
             )
         mailbox = quote(self.settings.sender_mailbox, safe="")
-        response = self.http_client.post(
-            f"{GRAPH_BASE_URL}/users/{mailbox}/sendMail",
-            headers={
-                "Authorization": "Bearer " + self.token_provider(),
-                "Content-Type": "application/json",
-            },
+        # sendMail is not idempotent: GraphSession retries it only on HTTP 429
+        # (throttled before execution) or when the connection never opened,
+        # so a retry can never deliver the same email twice.
+        response = self.session.request(
+            "POST",
+            f"/users/{mailbox}/sendMail",
+            idempotent=False,
+            raise_for_status=False,
             json={
                 "message": {
                     "subject": subject,
@@ -89,11 +96,7 @@ class GraphEmailNotifier:
             },
         )
         if response.status_code != 202:
-            request_id = response.headers.get("request-id", "not provided")
-            raise EmailNotificationError(
-                f"Microsoft Graph email delivery failed with HTTP "
-                f"{response.status_code}; request ID: {request_id}."
-            )
+            self.session.raise_error(response, "Microsoft Graph email delivery")
 
 
 def send_email_notification(*, recipient: str, subject: str, body: str) -> bool:
