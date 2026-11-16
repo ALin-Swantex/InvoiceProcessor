@@ -203,3 +203,25 @@ def test_manual_upload_reports_upload_failure_instead_of_crashing(
     # Previously ``item`` was unbound here and the request crashed (500).
     assert response.status_code == 503
     assert "SharePoint Incoming upload failed" in response.json()["detail"]
+
+
+def test_unreachable_database_returns_a_clear_503(tmp_path) -> None:
+    from psycopg import OperationalError
+    from psycopg_pool import PoolTimeout
+
+    from tests.test_api import client_for
+
+    client = client_for(tmp_path)
+
+    @client.app.get("/api/_test/pool-timeout")
+    def pool_timeout() -> None:
+        raise PoolTimeout("couldn't get a connection after 30.00 sec")
+
+    @client.app.get("/api/_test/connect-failed")
+    def connect_failed() -> None:
+        raise OperationalError("failed to resolve host")
+
+    for path in ("/api/_test/pool-timeout", "/api/_test/connect-failed"):
+        response = client.get(path)
+        assert response.status_code == 503
+        assert "database is unreachable" in response.json()["detail"]
