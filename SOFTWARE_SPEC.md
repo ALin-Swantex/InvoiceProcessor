@@ -49,7 +49,7 @@ remain only as isolated test doubles.
 - Store queue errors, attempts, and worker heartbeat in PostgreSQL.
 - Store extracted fields, confidence, warnings, model, and prompt version.
 - For invoices longer than three pages, send only the first and final pages to
-  Azure extraction; the first page supplies identity fields and the final page
+  the AI extractor; the first page supplies identity fields and the final page
   supplies the invoice total.
 - Route missing, ambiguous, invalid, unknown, or low-confidence results to
   review.

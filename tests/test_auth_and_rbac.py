@@ -56,7 +56,7 @@ def login(client: TestClient, username: str, password: str) -> None:
     assert response.status_code == 200, response.text
 
 
-def test_manual_upload_runs_extraction_when_azure_is_configured(
+def test_manual_upload_runs_extraction_when_ai_is_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("app.main.ai_extraction_configured", lambda: True)
@@ -80,6 +80,8 @@ def test_manual_upload_runs_extraction_when_azure_is_configured(
             "currency": 0.99,
         },
         warnings=(),
+        model="test-model",
+        prompt_version="test-v1",
     )
     login(client, "purchase.ledger", "ChangeMe-PL1!")
 
@@ -92,7 +94,8 @@ def test_manual_upload_runs_extraction_when_azure_is_configured(
     assert response.json()["supplier_invoice_number"] == "INV-AUTO-1"
     assert response.json()["ai_confidence"] == 0.96
     assert response.json()["status"] == "Needs Review"
-    assert response.json()["extraction_model"] == "prebuilt-invoice"
+    assert response.json()["extraction_model"] == "test-model"
+    assert response.json()["extraction_prompt_version"] == "test-v1"
     assert response.json()["routing_explanation"]
 
     confirmed = client.post(

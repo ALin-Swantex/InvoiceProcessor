@@ -18,9 +18,10 @@ import os
 import socket
 import tempfile
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
-from fastapi import FastAPI
+if TYPE_CHECKING:  # keep sample_pdf importable without the web stack
+    from fastapi import FastAPI
 
 # Settings that must never reach a demo run, however the environment is set up.
 _CLOUD_ENVIRONMENT_PREFIXES = (
@@ -31,6 +32,9 @@ _CLOUD_ENVIRONMENT_PREFIXES = (
     "AZURE_",
     "SAGE_",
     "OUTLOOK_MCP_",
+    "ANTHROPIC_",
+    "EXTRACTION_",
+    "OPENAI_",
 )
 _CLOUD_ENVIRONMENT_NAMES = frozenset(
     {"DATABASE_URL", "EMAIL_NOTIFICATION_SENDER", "PURCHASE_LEDGER_NOTIFICATION_EMAIL"}

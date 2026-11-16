@@ -45,7 +45,7 @@ class SharePointIncomingMonitor:
     """Registers each PDF found in SharePoint Incoming exactly once.
 
     SharePoint remains the canonical file location. The local path is a
-    processing cache used by Document Intelligence and the inline PDF preview.
+    processing cache used by AI extraction and the inline PDF preview.
     """
 
     def __init__(
