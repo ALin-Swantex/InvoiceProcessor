@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.types import Scope
 
 from app.activity_feed import ActivityFeedStore
@@ -129,6 +129,33 @@ def _build_invoice_store_from_environment(invoice_db_path: Path) -> InvoiceStore
     return create_postgres_invoice_store()  # type: ignore[return-value]
 
 
+DATABASE_UNAVAILABLE_MESSAGE = (
+    "The database is unreachable. Check the network or VPN connection and the "
+    "AZURE_POSTGRES_* settings, then try again."
+)
+
+
+def _register_database_error_handlers(app: FastAPI) -> None:
+    """Report an unreachable PostgreSQL as a clear 503, not a hung request.
+
+    Without this, any route that touches the database (for example the Microsoft
+    sign-in, which saves its OAuth state) waits for the connection pool timeout
+    and then fails with an unexplained server error.
+    """
+    try:
+        from psycopg import OperationalError
+        from psycopg_pool import PoolTimeout
+    except ImportError:  # SQLite-only installs have no psycopg.
+        return
+
+    async def database_unavailable(request: object, error: Exception) -> JSONResponse:
+        logger.error("Database unavailable: %s: %s", type(error).__name__, error)
+        return JSONResponse({"detail": DATABASE_UNAVAILABLE_MESSAGE}, status_code=503)
+
+    app.add_exception_handler(PoolTimeout, database_unavailable)
+    app.add_exception_handler(OperationalError, database_unavailable)
+
+
 def create_app(
     *,
     notification_store: OutlookNotificationStore | None = None,
@@ -153,6 +180,7 @@ def create_app(
     app.mount(
         "/static", RevalidatingStaticFiles(directory=STATIC_DIR), name="static"
     )
+    _register_database_error_handlers(app)
     if notification_store is None:
         from app.postgres_notifications import PostgresOutlookNotificationStore
         from app.postgres_monitoring import PostgresWorkerMonitor
