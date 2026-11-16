@@ -1,0 +1,45 @@
+# Invoice Processor containers.
+#
+#   docker compose up -d --build            web app + Outlook worker
+#   docker compose --profile tools run --rm migrate    apply database migrations
+#
+# Configuration comes from .env (never copied into the image). The database is
+# Azure PostgreSQL, so the host running these containers must be able to
+# resolve and reach it (VPN, private network or an allowed IP).
+
+x-app: &app
+  build: .
+  image: invoice-processor:local
+  env_file: .env
+  volumes:
+    - invoice-data:/data
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *app
+    ports:
+      - "8000:8000"
+    # The image's default command and HEALTHCHECK are used.
+
+  # Run exactly ONE worker per mailbox. Do not scale this service.
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.outlook_worker"]
+    # A SIGTERM lets the current invoice finish; allow time for AI extraction.
+    stop_grace_period: 120s
+    healthcheck:
+      disable: true   # worker health is the heartbeat shown by web's /api/health
+    depends_on:
+      web:
+        condition: service_healthy
+
+  # One-shot job; needs a database identity with schema-change permission.
+  migrate:
+    <<: *app
+    command: ["python", "-m", "app.postgres_migrate"]
+    restart: "no"
+    profiles: ["tools"]
+
+volumes:
+  invoice-data:

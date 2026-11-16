@@ -48,7 +48,8 @@ complete state flow.
 - Python 3.11 or newer
 - Access to the configured Microsoft 365 tenant and SharePoint site
 - Azure Database for PostgreSQL for the connected deployment
-- LibreOffice when Outlook Excel attachments must be converted to PDF
+- Excel attachments are converted to PDF through Microsoft Graph (no local
+  LibreOffice is needed)
 
 ## Initial setup
 
@@ -91,7 +92,31 @@ session, and configuration metadata are stored in PostgreSQL. The canonical PDF
 remains in SharePoint. For read-only Power BI reporting, see
 [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md).
 
-## Run the application
+## Run with Docker
+
+One image runs everything; `docker-compose.yml` starts the web application and
+the Outlook worker, and reads your settings from `.env` (never copied into the
+image):
+
+```bash
+cp .env.example .env        # then fill in the values
+docker compose up -d --build
+docker compose --profile tools run --rm migrate   # apply database migrations
+```
+
+Open <http://localhost:8000>. Notes:
+
+- The containers must be able to resolve and reach Azure PostgreSQL and
+  Document Intelligence (VPN, private network or an allowed IP).
+- Run exactly one `worker` per mailbox; do not scale it.
+- Working files live on the `invoice-data` volume (`/data`). SharePoint stays
+  the canonical PDF store, so the volume can be rebuilt.
+- `docker compose logs -f web worker` shows logs; the web container reports
+  health through `/api/health`, which includes the worker heartbeat.
+- Behind HTTPS set `AUTH_COOKIE_SECURE=true` and a public `APP_PUBLIC_URL`; use
+  `false` only for plain-HTTP local testing.
+
+## Run the application without Docker
 
 After installing the project, the easiest cross-platform option is:
 
