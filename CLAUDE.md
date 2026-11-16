@@ -2,6 +2,17 @@
 
 Internal invoice-processing app (FastAPI + vanilla JS UI + a background worker). Invoices arrive by Outlook or manual upload, PDFs are filed in SharePoint, fields are extracted by Claude, and Purchase Ledger / approvers move each invoice through review, PO matching, approval, payment and reconciliation. PostgreSQL holds the data; Microsoft Entra handles login. See `README.md`, `SOFTWARE_SPEC.md` and `INVOICE_WORKFLOW_FLOWCHART.md` for the business process.
 
+## Working guidelines
+These bias toward caution over speed; use judgment on trivial tasks.
+
+**Think before coding.** State assumptions and ask when something is unclear. If there is more than one reasonable reading, present them instead of picking one silently. If a simpler approach exists, say so and push back.
+
+**Keep it simple.** Write the minimum code that solves the request: no extra features, no abstraction for a single use, no configurability nobody asked for, no handling of impossible cases. If 200 lines could be 50, rewrite it.
+
+**Make surgical changes.** Every changed line should trace to the request. Do not tidy adjacent code, comments or formatting, and match the existing style. Remove only the imports and code your own change made unused; mention other dead code instead of deleting it.
+
+**Work toward a verifiable goal.** Turn the task into a check, then loop until it passes: a bug starts with a test that reproduces it, a refactor needs the tests green before and after. For multi-step work, state a short plan with a check for each step.
+
 ## Commands
 ```bash
 python3 -m pytest -q                                   # full suite (mocked; no cloud, no .env needed)
