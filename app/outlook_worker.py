@@ -20,9 +20,6 @@ from app.sharepoint import sharepoint_client_from_environment
 from app.sharepoint_intake import SharePointIncomingMonitor
 
 
-load_project_environment()
-
-
 class OutlookRetriever(Protocol):
     async def list_invoice_emails(
         self,
@@ -377,4 +374,5 @@ async def run_forever() -> None:
 
 
 if __name__ == "__main__":
+    load_project_environment()
     asyncio.run(run_forever())

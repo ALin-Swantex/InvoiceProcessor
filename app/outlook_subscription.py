@@ -8,10 +8,8 @@ from app.environment import load_project_environment
 from app.outlook_graph import graph_client_from_environment
 
 
-load_project_environment()
-
-
 def main() -> None:
+    load_project_environment()
     parser = argparse.ArgumentParser(
         description="Create or renew the Outlook Inbox Graph subscription."
     )
