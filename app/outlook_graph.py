@@ -47,10 +47,10 @@ class OutlookSettings:
 
     def validate(self) -> None:
         values = {
-            "OUTLOOK_MCP_TENANT_ID": self.tenant_id,
-            "OUTLOOK_MCP_CLIENT_ID": self.client_id,
-            "OUTLOOK_MCP_CLIENT_SECRET": self.client_secret,
-            "OUTLOOK_MCP_MAILBOX": self.mailbox,
+            "GRAPH_TENANT_ID": self.tenant_id,
+            "GRAPH_CLIENT_ID": self.client_id,
+            "GRAPH_CLIENT_SECRET": self.client_secret,
+            "GRAPH_MAILBOX": self.mailbox,
         }
         missing = [name for name, value in values.items() if not value.strip()]
         if missing:
@@ -59,11 +59,11 @@ class OutlookSettings:
             )
         if self.max_pdf_bytes <= 0:
             raise OutlookConfigurationError(
-                "OUTLOOK_MCP_MAX_PDF_BYTES must be greater than zero."
+                "OUTLOOK_MAX_PDF_BYTES must be greater than zero."
             )
         if self.max_excel_bytes <= 0:
             raise OutlookConfigurationError(
-                "OUTLOOK_MCP_MAX_EXCEL_BYTES must be greater than zero."
+                "OUTLOOK_MAX_EXCEL_BYTES must be greater than zero."
             )
 
 
@@ -81,7 +81,7 @@ def default_token_provider(settings: OutlookSettings) -> Callable[[], str]:
     """One process-wide token provider per app registration.
 
     Outlook, SharePoint and email notifications all authenticate with the same
-    OUTLOOK_MCP_* app registration, so they share one MSAL token cache.
+    GRAPH_* app registration, so they share one MSAL token cache.
     """
     return shared_token_provider(
         settings.tenant_id,
@@ -447,18 +447,18 @@ class OutlookGraphClient:
 
 def settings_from_environment() -> OutlookSettings:
     return OutlookSettings(
-        tenant_id=os.environ.get("OUTLOOK_MCP_TENANT_ID", ""),
-        client_id=os.environ.get("OUTLOOK_MCP_CLIENT_ID", ""),
-        client_secret=os.environ.get("OUTLOOK_MCP_CLIENT_SECRET", ""),
-        mailbox=os.environ.get("OUTLOOK_MCP_MAILBOX", ""),
+        tenant_id=os.environ.get("GRAPH_TENANT_ID", ""),
+        client_id=os.environ.get("GRAPH_CLIENT_ID", ""),
+        client_secret=os.environ.get("GRAPH_CLIENT_SECRET", ""),
+        mailbox=os.environ.get("GRAPH_MAILBOX", ""),
         download_directory=Path(
-            os.environ.get("OUTLOOK_MCP_DOWNLOAD_DIR", "outlook_downloads")
+            os.environ.get("OUTLOOK_DOWNLOAD_DIR", "outlook_downloads")
         ),
         max_pdf_bytes=int(
-            os.environ.get("OUTLOOK_MCP_MAX_PDF_BYTES", str(20 * 1024 * 1024))
+            os.environ.get("OUTLOOK_MAX_PDF_BYTES", str(20 * 1024 * 1024))
         ),
         max_excel_bytes=int(
-            os.environ.get("OUTLOOK_MCP_MAX_EXCEL_BYTES", str(50 * 1024 * 1024))
+            os.environ.get("OUTLOOK_MAX_EXCEL_BYTES", str(50 * 1024 * 1024))
         ),
         excel_conversion_drive_id=os.environ.get(
             "EXCEL_CONVERSION_DRIVE_ID",

@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     # Writable working data lives on the /data volume, never inside the image.
-    OUTLOOK_MCP_DOWNLOAD_DIR=/data/outlook_downloads \
+    OUTLOOK_DOWNLOAD_DIR=/data/outlook_downloads \
     MANUAL_UPLOAD_DIR=/data/manual_uploads \
     SHAREPOINT_INVOICE_CACHE_DIR=/data/sharepoint_invoice_cache
 

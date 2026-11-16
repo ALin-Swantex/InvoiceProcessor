@@ -85,8 +85,8 @@ drive ID and create the folder configured by
 `EXCEL_CONVERSION_TEMP_FOLDER` (default: `Invoice Conversion`). When the
 conversion drive is the same as `SHAREPOINT_DRIVE_ID`,
 `EXCEL_CONVERSION_DRIVE_ID` may be omitted because the worker falls back to
-that value. `OUTLOOK_MCP_MAX_EXCEL_BYTES` limits the source workbook upload
-(default: 50 MiB), while `OUTLOOK_MCP_MAX_PDF_BYTES` independently limits the
+that value. `OUTLOOK_MAX_EXCEL_BYTES` limits the source workbook upload
+(default: 50 MiB), while `OUTLOOK_MAX_PDF_BYTES` independently limits the
 converted PDF.
 
 For production, use a certificate or managed identity instead of a long-lived
@@ -117,8 +117,8 @@ python -m app.outlook_worker
 ```
 
 The worker polls the PostgreSQL notification queue, calls Microsoft Graph directly
-using the `OUTLOOK_MCP_TENANT_ID` / `OUTLOOK_MCP_CLIENT_ID` /
-`OUTLOOK_MCP_CLIENT_SECRET` / `OUTLOOK_MCP_MAILBOX` settings, and stores
+using the `GRAPH_TENANT_ID` / `GRAPH_CLIENT_ID` /
+`GRAPH_CLIENT_SECRET` / `GRAPH_MAILBOX` settings, and stores
 received invoice records and runtime state in Azure PostgreSQL.
 
 ## 5. Create the Graph subscription

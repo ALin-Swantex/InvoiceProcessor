@@ -65,7 +65,7 @@ def _graph_token() -> str:
 
 
 def _check_outlook(token: str) -> str:
-    mailbox = os.environ["OUTLOOK_MCP_MAILBOX"]
+    mailbox = os.environ["GRAPH_MAILBOX"]
     url = (
         "https://graph.microsoft.com/v1.0/users/"
         f"{quote(mailbox, safe='')}/mailFolders/inbox"
@@ -98,9 +98,9 @@ def _check_document_intelligence() -> str:
     from azure.identity import ClientSecretCredential
 
     credential = ClientSecretCredential(
-        os.environ["OUTLOOK_MCP_TENANT_ID"],
-        os.environ["OUTLOOK_MCP_CLIENT_ID"],
-        os.environ["OUTLOOK_MCP_CLIENT_SECRET"],
+        os.environ["GRAPH_TENANT_ID"],
+        os.environ["GRAPH_CLIENT_ID"],
+        os.environ["GRAPH_CLIENT_SECRET"],
     )
     with credential:
         with DocumentIntelligenceAdministrationClient(

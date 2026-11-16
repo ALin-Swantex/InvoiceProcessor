@@ -238,7 +238,7 @@ python3 -m app.outlook_subscription renew "$OUTLOOK_SUBSCRIPTION_ID"
   operational rules
 - [INVOICE_WORKFLOW_FLOWCHART.md](INVOICE_WORKFLOW_FLOWCHART.md) — current
   workflow and implementation mapping
-- [OUTLOOK_MCP_SETUP.md](OUTLOOK_MCP_SETUP.md) — Microsoft Graph mailbox and
+- [GRAPH_SETUP.md](GRAPH_SETUP.md) — Microsoft Graph mailbox and
   webhook configuration
 - [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md) — reporting views and
   Power BI connection instructions
