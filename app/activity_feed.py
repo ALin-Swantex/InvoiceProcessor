@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -26,9 +26,14 @@ CREATE TABLE IF NOT EXISTS invoice_email_stages (
     invoice_id INTEGER NOT NULL,
     stage TEXT NOT NULL,
     claimed_at TEXT NOT NULL,
+    sent_at TEXT,
     PRIMARY KEY (invoice_id, stage)
 );
 """
+
+# A claimed-but-never-sent email stage can be taken over after this long, so a
+# crash between claiming and sending does not lose the email permanently.
+EMAIL_CLAIM_STALE_SECONDS = 600
 
 # Valid target_role values used throughout the app. "all" is broadcast to
 # every connected frontend session regardless of the selected role.
@@ -60,6 +65,20 @@ class ActivityFeedStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(invoice_email_stages)"
+                ).fetchall()
+            }
+            if "sent_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE invoice_email_stages ADD COLUMN sent_at TEXT"
+                )
+                # Existing claims were completed sends; never re-send them.
+                connection.execute(
+                    "UPDATE invoice_email_stages SET sent_at = claimed_at"
+                )
             connection.commit()
 
     def add_event(
@@ -126,8 +145,20 @@ class ActivityFeedStore:
             ).fetchall()
         return [ActivityEvent(**dict(row)) for row in rows]
 
-    def claim_email_stage(self, invoice_id: int, stage: str) -> bool:
-        """Atomically reserve one email delivery attempt for an invoice stage."""
+    def claim_email_stage(
+        self,
+        invoice_id: int,
+        stage: str,
+        *,
+        stale_after_seconds: int = EMAIL_CLAIM_STALE_SECONDS,
+    ) -> bool:
+        """Atomically reserve one email delivery attempt for an invoice stage.
+
+        A stage that was claimed but never marked sent, and whose claim is older
+        than ``stale_after_seconds``, is taken over so the email is not lost.
+        """
+        now = datetime.now(timezone.utc)
+        stale_before = (now - timedelta(seconds=stale_after_seconds)).isoformat()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
@@ -135,10 +166,35 @@ class ActivityFeedStore:
                     invoice_id, stage, claimed_at
                 ) VALUES (?, ?, ?)
                 """,
-                (invoice_id, stage, datetime.now(timezone.utc).isoformat()),
+                (invoice_id, stage, now.isoformat()),
+            )
+            claimed = cursor.rowcount == 1
+            if not claimed:
+                takeover = connection.execute(
+                    """
+                    UPDATE invoice_email_stages
+                    SET claimed_at = ?
+                    WHERE invoice_id = ? AND stage = ?
+                      AND sent_at IS NULL AND claimed_at < ?
+                    """,
+                    (now.isoformat(), invoice_id, stage, stale_before),
+                )
+                claimed = takeover.rowcount == 1
+            connection.commit()
+        return claimed
+
+    def mark_email_stage_sent(self, invoice_id: int, stage: str) -> None:
+        """Record that the claimed email was delivered, so it is never retaken."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE invoice_email_stages
+                SET sent_at = ?
+                WHERE invoice_id = ? AND stage = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), invoice_id, stage),
             )
             connection.commit()
-        return cursor.rowcount == 1
 
     def release_email_stage(self, invoice_id: int, stage: str) -> None:
         with self._connect() as connection:

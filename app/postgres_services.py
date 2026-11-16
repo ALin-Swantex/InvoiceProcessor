@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from app.activity_feed import ActivityEvent
+from app.activity_feed import EMAIL_CLAIM_STALE_SECONDS, ActivityEvent
 from app.postgres_settings import (
     ConnectionFactory,
     PostgresSettings,
@@ -219,20 +219,47 @@ class PostgresActivityFeedStore:
                 rows = cursor.fetchall()
         return [_activity_event(row) for row in rows]
 
-    def claim_email_stage(self, invoice_id: int, stage: str) -> bool:
-        """Atomically reserve one email delivery attempt for an invoice stage."""
+    def claim_email_stage(
+        self,
+        invoice_id: int,
+        stage: str,
+        *,
+        stale_after_seconds: int = EMAIL_CLAIM_STALE_SECONDS,
+    ) -> bool:
+        """Atomically reserve one email delivery attempt for an invoice stage.
+
+        A stage that was claimed but never marked sent, and whose claim is older
+        than ``stale_after_seconds``, is taken over so the email is not lost.
+        """
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO invoice_email_stages (invoice_id, stage)
                     VALUES (%s, %s)
-                    ON CONFLICT (invoice_id, stage) DO NOTHING
+                    ON CONFLICT (invoice_id, stage) DO UPDATE
+                    SET claimed_at = now()
+                    WHERE invoice_email_stages.sent_at IS NULL
+                      AND invoice_email_stages.claimed_at
+                          < now() - make_interval(secs => %s)
                     RETURNING invoice_id
+                    """,
+                    (invoice_id, stage, float(stale_after_seconds)),
+                )
+                return cursor.fetchone() is not None
+
+    def mark_email_stage_sent(self, invoice_id: int, stage: str) -> None:
+        """Record that the claimed email was delivered, so it is never retaken."""
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE invoice_email_stages
+                    SET sent_at = now()
+                    WHERE invoice_id = %s AND stage = %s
                     """,
                     (invoice_id, stage),
                 )
-                return cursor.fetchone() is not None
 
     def release_email_stage(self, invoice_id: int, stage: str) -> None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]

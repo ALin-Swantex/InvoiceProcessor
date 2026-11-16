@@ -2,7 +2,7 @@
 
 Internal invoice-processing application built with FastAPI and Microsoft 365.
 It receives invoice files from Outlook or manual upload, stores PDFs in
-SharePoint, extracts invoice data with Azure Document Intelligence, and manages
+SharePoint, extracts invoice data with an AI model (Claude), and manages
 review, PO matching, approval, payment, reconciliation, and audit history.
 
 ## Current workflow
@@ -48,7 +48,8 @@ complete state flow.
 - Python 3.11 or newer
 - Access to the configured Microsoft 365 tenant and SharePoint site
 - Azure Database for PostgreSQL for the connected deployment
-- LibreOffice when Outlook Excel attachments must be converted to PDF
+- Excel attachments are converted to PDF through Microsoft Graph (no local
+  LibreOffice is needed)
 
 ## Initial setup
 
@@ -62,7 +63,7 @@ cp .env.example .env
 ```
 
 Configure `.env` with the required Entra, Microsoft Graph, SharePoint, Azure
-PostgreSQL, and Document Intelligence settings. Never commit `.env` or secrets.
+PostgreSQL, and `ANTHROPIC_API_KEY` settings. Never commit `.env` or secrets.
 
 The application runtime uses PostgreSQL for invoices, configuration, sessions,
 activity, IRJ sequences, and the Outlook processing queue:
@@ -91,7 +92,48 @@ session, and configuration metadata are stored in PostgreSQL. The canonical PDF
 remains in SharePoint. For read-only Power BI reporting, see
 [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md).
 
-## Run the application
+## Demo mode (no Azure needed)
+
+To look around the application, or to work on the UI while Azure is
+unavailable, run it on temporary local data with sample invoices in every
+workflow stage:
+
+```bash
+python -m app.demo            # http://localhost:8000, Ctrl+C to stop
+docker compose --profile demo up demo   # http://localhost:8001
+```
+
+It prints the demo accounts and passwords on start-up. Demo mode uses local
+SQLite storage and local password sign-in only. It ignores `.env` and every
+Azure, Microsoft 365, SharePoint and PostgreSQL setting, so it can never touch
+real systems, and its data is discarded when it stops (`--data-dir` keeps it).
+
+## Run with Docker
+
+One image runs everything; `docker-compose.yml` starts the web application and
+the Outlook worker, and reads your settings from `.env` (never copied into the
+image):
+
+```bash
+cp .env.example .env        # then fill in the values
+docker compose up -d --build
+docker compose --profile tools run --rm migrate   # apply database migrations
+```
+
+Open <http://localhost:8000>. Notes:
+
+- The containers must be able to resolve and reach Azure PostgreSQL (VPN,
+  private network or an allowed IP) and make outbound HTTPS calls to the
+  Anthropic API for invoice extraction.
+- Run exactly one `worker` per mailbox; do not scale it.
+- Working files live on the `invoice-data` volume (`/data`). SharePoint stays
+  the canonical PDF store, so the volume can be rebuilt.
+- `docker compose logs -f web worker` shows logs; the web container reports
+  health through `/api/health`, which includes the worker heartbeat.
+- Behind HTTPS set `AUTH_COOKIE_SECURE=true` and a public `APP_PUBLIC_URL`; use
+  `false` only for plain-HTTP local testing.
+
+## Run the application without Docker
 
 After installing the project, the easiest cross-platform option is:
 
@@ -156,7 +198,32 @@ pytest -q
 
 The suite uses local and mocked services; passing tests do not establish live
 Azure connectivity. Run `python -m scripts.check_live_azure` for read-only
-PostgreSQL, Outlook, SharePoint, and Document Intelligence smoke checks.
+PostgreSQL, Outlook, and SharePoint smoke checks. Add `--extraction` to also
+make one small paid AI extraction call on a generated sample invoice.
+
+## AI invoice extraction
+
+Invoice PDFs are read by Claude, which returns the supplier, customer, invoice
+number, PO, date, total and currency with a quoted piece of evidence and a
+certainty for each. Deterministic checks then verify the values against the
+PDF's text (is the invoice number really in the document?), the arithmetic (net
+plus tax equals the total), the date and the configured company names. Anything
+uncertain or failing a check goes to Needs Review, and the Admin confidence
+threshold applies as before. The model and prompt version are recorded with each
+extraction.
+
+Set `ANTHROPIC_API_KEY`. `EXTRACTION_MODEL` (default `claude-opus-5-5`) reads
+every invoice. Optionally set `EXTRACTION_ESCALATION_MODEL` (for example Sonnet
+as the first model and Opus as the escalation model): when the first model has
+difficulty (a required field missing, uncertain or failing a check, or it cannot
+read the document), the stronger model reads the invoice again and its answer is
+used. If the first model was confident about a field and the second reads it
+differently, the invoice goes to Needs Review. Escalated invoices cost two model
+calls, and the recorded model shows both (`first -> second`). Tune with
+`EXTRACTION_EFFORT` and `EXTRACTION_ESCALATION_EFFORT`. With no key the application does
+not guess: invoices wait in Needs Review. Invoice PDFs are sent to the Anthropic
+API (first and last page only for invoices over three pages), so confirm your
+data-handling terms before enabling it.
 
 ## Authentication and roles
 
@@ -213,7 +280,7 @@ python3 -m app.outlook_subscription renew "$OUTLOOK_SUBSCRIPTION_ID"
   operational rules
 - [INVOICE_WORKFLOW_FLOWCHART.md](INVOICE_WORKFLOW_FLOWCHART.md) — current
   workflow and implementation mapping
-- [OUTLOOK_MCP_SETUP.md](OUTLOOK_MCP_SETUP.md) — Microsoft Graph mailbox and
+- [GRAPH_SETUP.md](GRAPH_SETUP.md) — Microsoft Graph mailbox and
   webhook configuration
 - [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md) — reporting views and
   Power BI connection instructions

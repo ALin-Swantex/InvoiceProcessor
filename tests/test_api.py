@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import cast
 
 from fastapi.testclient import TestClient
@@ -33,8 +34,16 @@ def client_for(tmp_path) -> TestClient:
 def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     client = client_for(tmp_path)
 
-    home = client.get("/")
-    assert home.status_code == 200
+    page = client.get("/")
+    assert page.status_code == 200
+    stylesheet = client.get("/static/app.css")
+    script = client.get("/static/app.js")
+    assert stylesheet.status_code == 200
+    assert script.status_code == 200
+    assert '<link rel="stylesheet" href="/static/app.css">' in page.text
+    assert '<script src="/static/app.js"></script>' in page.text
+    # The page, stylesheet and script together make up the interface.
+    home = SimpleNamespace(text=page.text + stylesheet.text + script.text)
     assert "<h1>Swantex</h1>" in home.text
     assert "Continue with Microsoft 365" in home.text
     assert "Protected by Microsoft Entra ID" in home.text
@@ -352,8 +361,34 @@ def test_statement_library_is_read_from_sharepoint(tmp_path) -> None:
     assert pdf.headers["content-type"] == "application/pdf"
 
 
+def _sign_in_purchase_ledger(client: TestClient) -> None:
+    response = client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    )
+    assert response.status_code == 200
+
+
+def test_confirmation_api_requires_sign_in(tmp_path) -> None:
+    client = client_for(tmp_path)
+
+    response = client.post(
+        "/api/workflow/confirm",
+        json={
+            "invoice_id": "invoice-123",
+            "company": "Example Company",
+            "company_folder": "/Companies/Example/Invoices",
+            "original_filename": "invoice.pdf",
+            "irj_number": "001245",
+        },
+    )
+
+    assert response.status_code == 401
+
+
 def test_confirmation_api_returns_po_routing_decision(tmp_path) -> None:
     client = client_for(tmp_path)
+    _sign_in_purchase_ledger(client)
 
     response = client.post(
         "/api/workflow/confirm",
@@ -376,6 +411,7 @@ def test_confirmation_api_returns_po_routing_decision(tmp_path) -> None:
 
 def test_confirmation_api_returns_nominal_routing_decision(tmp_path) -> None:
     client = client_for(tmp_path)
+    _sign_in_purchase_ledger(client)
 
     response = client.post(
         "/api/workflow/confirm",

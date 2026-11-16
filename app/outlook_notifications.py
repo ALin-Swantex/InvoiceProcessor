@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS outlook_notifications (
 CREATE INDEX IF NOT EXISTS idx_outlook_notifications_status
 ON outlook_notifications(status, received_at);
 """
+
+# No dedicated claim-timestamp column exists (and the schema must not change),
+# so the claim time is recorded inside the JSON ``payload`` column, which the
+# application never reads back. Rows claimed before this field existed fall
+# back to ``received_at`` when deciding whether they are stale.
+CLAIMED_AT_KEY = "claimed_at"
+DEFAULT_MAX_ATTEMPTS = 5
+
+
+def _utc_timestamp(moment: datetime | None = None) -> str:
+    return (moment or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(
+        timespec="microseconds"
+    )
 
 
 @dataclass(frozen=True)
@@ -130,10 +143,11 @@ class OutlookNotificationStore:
             updated = connection.execute(
                 """
                 UPDATE outlook_notifications
-                SET status = 'processing', attempts = attempts + 1, last_error = NULL
+                SET status = 'processing', attempts = attempts + 1, last_error = NULL,
+                    payload = json_set(payload, '$.claimed_at', ?)
                 WHERE id = ? AND status = 'pending'
                 """,
-                (row["id"],),
+                (_utc_timestamp(), row["id"]),
             )
             connection.commit()
             if updated.rowcount != 1:
@@ -162,6 +176,55 @@ class OutlookNotificationStore:
 
     def retry_failed(self, notification_id: int) -> None:
         self._set_status(notification_id, "pending")
+
+    def touch_claim(self, notification_id: int) -> None:
+        """Refresh the claim time of an item this worker is still processing."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE outlook_notifications
+                SET payload = json_set(payload, '$.claimed_at', ?)
+                WHERE id = ? AND status = 'processing'
+                """,
+                (_utc_timestamp(), notification_id),
+            )
+            connection.commit()
+
+    def reclaim_stale(
+        self,
+        older_than_seconds: float,
+        *,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        now: datetime | None = None,
+    ) -> int:
+        """Release items stuck in ``processing`` (e.g. after a worker crash).
+
+        Items whose claim is older than ``older_than_seconds`` go back to
+        ``pending``; items that have already used ``max_attempts`` claims are
+        marked ``failed`` instead so a poison message cannot loop forever.
+        Returns the number of items released.
+        """
+        cutoff = _utc_timestamp(
+            (now or datetime.now(timezone.utc)) - timedelta(seconds=older_than_seconds)
+        )
+        note = (
+            "Reclaimed: the worker processing this item stopped responding "
+            f"for more than {int(older_than_seconds)} seconds."
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE outlook_notifications
+                SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+                    last_error = ?
+                WHERE status = 'processing'
+                  AND COALESCE(json_extract(payload, '$.claimed_at'), received_at) < ?
+                """,
+                (max_attempts, note, cutoff),
+            )
+            connection.commit()
+            return cursor.rowcount
 
     def _set_status(self, notification_id: int, status: str) -> None:
         with self._connect() as connection:

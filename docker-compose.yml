@@ -1,0 +1,60 @@
+# Invoice Processor containers.
+#
+#   docker compose up -d --build            web app + Outlook worker
+#   docker compose --profile tools run --rm migrate    apply database migrations
+#
+# Configuration comes from .env (never copied into the image). The database is
+# Azure PostgreSQL, so the host running these containers must be able to
+# resolve and reach it (VPN, private network or an allowed IP).
+
+x-app: &app
+  build: .
+  image: invoice-processor:local
+  env_file: .env
+  # Explicit values win over .env, so working files always land on the volume.
+  environment:
+    OUTLOOK_DOWNLOAD_DIR: /data/outlook_downloads
+    MANUAL_UPLOAD_DIR: /data/manual_uploads
+    SHAREPOINT_INVOICE_CACHE_DIR: /data/sharepoint_invoice_cache
+  volumes:
+    - invoice-data:/data
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *app
+    ports:
+      - "8000:8000"
+    # The image's default command and HEALTHCHECK are used.
+
+  # Run exactly ONE worker per mailbox. Do not scale this service.
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.outlook_worker"]
+    # A SIGTERM lets the current invoice finish; allow time for AI extraction.
+    stop_grace_period: 120s
+    healthcheck:
+      disable: true   # worker health is the heartbeat shown by web's /api/health
+    depends_on:
+      web:
+        condition: service_healthy
+
+  # Sample data and local sign-in only: no .env, no secrets, no Azure.
+  #   docker compose --profile demo up demo      then open http://localhost:8001
+  demo:
+    build: .
+    image: invoice-processor:local
+    command: ["python", "-m", "app.demo", "--host", "0.0.0.0", "--port", "8000", "--public-url", "http://localhost:8001"]
+    ports:
+      - "8001:8000"
+    profiles: ["demo"]
+
+  # One-shot job; needs a database identity with schema-change permission.
+  migrate:
+    <<: *app
+    command: ["python", "-m", "app.postgres_migrate"]
+    restart: "no"
+    profiles: ["tools"]
+
+volumes:
+  invoice-data:

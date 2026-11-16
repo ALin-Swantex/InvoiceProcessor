@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -15,15 +16,17 @@ from app.activity_feed import (
     ActivityFeedStore,
 )
 from app.ai_extraction import (
-    DocumentIntelligenceConfigurationError,
-    DocumentIntelligenceServiceError,
+    ExtractionConfigurationError,
     ExtractionResult,
+    ExtractionServiceError,
+    ReferenceData,
     run_ai_extraction,
 )
 from app.approval_matrix import ApprovalMatrixStore
 from app.approval_matrix import find_approvers as _default_find_approvers
 from app.companies import CompanyStore
 from app.companies import get_company as _default_get_company
+from app.companies import list_companies as _default_list_companies
 from app.company_folders import (
     FLAGGED_INVOICES_FOLDER,
     REJECTED_INVOICES_FOLDER,
@@ -42,6 +45,7 @@ from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
 from app.suppliers import get_supplier as _default_get_supplier
+from app.suppliers import list_suppliers as _default_list_suppliers
 from app.supplier_terms import SupplierTermsStore
 from app.workflow import (
     ConfirmedInvoice,
@@ -55,6 +59,13 @@ from app.workflow import (
 class InvoiceLifecycleError(ValueError):
     """Raised for business-rule violations (invalid state transitions,
     unknown company, etc.). Callers should map this to HTTP 422/409."""
+
+
+def _is_unique_violation(error: BaseException) -> bool:
+    """True for a unique-constraint failure from SQLite or PostgreSQL (psycopg)."""
+    if isinstance(error, sqlite3.IntegrityError):
+        return True
+    return type(error).__name__ == "UniqueViolation"
 
 
 class InvoiceExtractionUnavailableError(InvoiceLifecycleError):
@@ -106,7 +117,7 @@ class InvoiceLifecycle:
         suppliers_store: SupplierStore | None = None,
         supplier_terms_store: SupplierTermsStore | None = None,
         configuration_getter: Callable[[str, str | None], str | None] | None = None,
-        extraction_runner: Callable[[Path], ExtractionResult] = run_ai_extraction,
+        extraction_runner: Callable[[Path], ExtractionResult] | None = None,
         classification_runner: Callable[[Path], DocumentClassification] = (
             classify_pdf_document
         ),
@@ -120,8 +131,33 @@ class InvoiceLifecycle:
         self.suppliers_store = suppliers_store
         self.supplier_terms_store = supplier_terms_store
         self.configuration_getter = configuration_getter
-        self.extraction_runner = extraction_runner
+        # By default extraction is given the configured companies and suppliers
+        # so the model can return exactly the names the application knows.
+        self.extraction_runner = extraction_runner or self._extract_with_reference_data
         self.classification_runner = classification_runner
+
+    def _extract_with_reference_data(self, pdf_path: Path) -> ExtractionResult:
+        return run_ai_extraction(pdf_path, reference=self._reference_data())
+
+    def _reference_data(self) -> ReferenceData | None:
+        """Companies and suppliers (with aliases) for the extraction prompt."""
+        try:
+            companies = (
+                self.companies_store.list()
+                if self.companies_store is not None
+                else _default_list_companies()
+            )
+            suppliers = (
+                self.suppliers_store.list()
+                if self.suppliers_store is not None
+                else _default_list_suppliers()
+            )
+        except Exception:
+            return None  # extraction still works, just without name hints
+        return ReferenceData(
+            companies=tuple((c.name, tuple(c.aliases)) for c in companies),
+            suppliers=tuple((s.name, tuple(s.aliases)) for s in suppliers),
+        )
 
     def _get_company(self, name: str):
         if self.companies_store is not None:
@@ -162,6 +198,7 @@ class InvoiceLifecycle:
         if sent is False:
             self.activity_feed.release_email_stage(invoice_id, stage)
             return
+        self.activity_feed.mark_email_stage_sent(invoice_id, stage)
         self.activity_feed.add_event(
             event_type="stage_email_sent",
             target_role=ROLE_PURCHASE_LEDGER,
@@ -278,6 +315,7 @@ class InvoiceLifecycle:
             if not did_send:
                 self.activity_feed.release_email_stage(invoice.id, stage)
                 continue
+            self.activity_feed.mark_email_stage_sent(invoice.id, stage)
             self.invoice_store.update_fields(
                 invoice.id, **{timestamp_field: current.isoformat()}
             )
@@ -330,8 +368,8 @@ class InvoiceLifecycle:
                 )
             result = self.extraction_runner(Path(invoice.stored_path))
         except (
-            DocumentIntelligenceConfigurationError,
-            DocumentIntelligenceServiceError,
+            ExtractionConfigurationError,
+            ExtractionServiceError,
         ) as error:
             self.activity_feed.add_event(
                 event_type="extraction_unavailable",
@@ -435,14 +473,15 @@ class InvoiceLifecycle:
             "currency": result.currency,
         }
         extraction_metadata = {
-            "extraction_model": os.environ.get(
-                "INVOICE_EXTRACTION_MODEL",
-                os.environ.get(
-                    "AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID", "prebuilt-invoice"
-                ),
+            "extraction_model": (
+                result.model
+                or os.environ.get("INVOICE_EXTRACTION_MODEL", "").strip()
+                or "unspecified"
             ),
-            "extraction_prompt_version": os.environ.get(
-                "INVOICE_EXTRACTION_PROMPT_VERSION", "v1"
+            "extraction_prompt_version": (
+                result.prompt_version
+                or os.environ.get("INVOICE_EXTRACTION_PROMPT_VERSION", "").strip()
+                or "unspecified"
             ),
             "extracted_fields_json": json.dumps(
                 extracted_fields, sort_keys=True, separators=(",", ":")
@@ -673,11 +712,18 @@ class InvoiceLifecycle:
         manual_irj = self._uses_manual_irj(company_profile.name)
         irj_number = (
             invoice.irj_number
-            if invoice.irj_number
+            if self._irj_belongs_to_company(invoice, company_profile.name)
             else None
             if manual_irj
             else self.irj_generator.generate(company_profile.name)
         )
+        if irj_number and irj_number != invoice.irj_number:
+            # Record the allocation straight away. If routing or SharePoint
+            # filing fails below, a retry reuses this number instead of
+            # allocating another one and leaving a gap in the sequence.
+            invoice = self.invoice_store.update_fields(
+                invoice_id, irj_number=irj_number, company=company_profile.name
+            )
         try:
             decision = route_confirmed_invoice(
                 ConfirmedInvoice(
@@ -900,13 +946,24 @@ class InvoiceLifecycle:
 
         now = datetime.now(timezone.utc).isoformat()
         if not retrying_missing_route:
-            invoice = self.invoice_store.update_fields(
-                invoice_id,
-                irj_number=normalized_irj,
-                sage_registered_at=now,
-                sage_reference=None,
-                sage_registered_by=recorded_by,
-            )
+            try:
+                invoice = self.invoice_store.update_fields(
+                    invoice_id,
+                    irj_number=normalized_irj,
+                    sage_registered_at=now,
+                    sage_reference=None,
+                    sage_registered_by=recorded_by,
+                )
+            except Exception as error:
+                # Two requests can pass the check above together; the unique
+                # (company, IRJ) index then rejects the second. Report that as
+                # a normal lifecycle error, not an unhandled database error.
+                if _is_unique_violation(error):
+                    raise InvoiceLifecycleError(
+                        f"IRJ number {normalized_irj} is already assigned to "
+                        "another invoice."
+                    ) from error
+                raise
 
         if invoice.invoice_type == "po":
             self._move_pdf_in_sharepoint(
@@ -1011,6 +1068,22 @@ class InvoiceLifecycle:
             invoice_id=invoice_id,
         )
         return record
+
+    def _irj_belongs_to_company(
+        self, invoice: InvoiceRecord, company_name: str
+    ) -> bool:
+        """True when the invoice's existing IRJ came from this company's sequence.
+
+        IRJ numbers are allocated per company, so a number issued for one company
+        must not be reused if the invoice is re-confirmed under another.
+        """
+        if not invoice.irj_number:
+            return False
+        if not invoice.company:
+            return True
+        existing = self._get_company(invoice.company)
+        existing_name = existing.name if existing is not None else invoice.company
+        return existing_name.strip().casefold() == company_name.strip().casefold()
 
     def _uses_manual_irj(self, company: str) -> bool:
         default = (

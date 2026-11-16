@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Swantex | Invoice Processing</title>
+  <script>
+    // Apply a manually chosen theme before first paint. Storage may be
+    // unavailable (private mode, blocked site data); the page still works.
+    (function () {
+      try {
+        var theme = window.localStorage.getItem("invoice-processor-theme");
+        if (theme === "light" || theme === "dark") {
+          document.documentElement.setAttribute("data-theme", theme);
+        }
+      } catch (error) { /* ignore */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <div id="toast-container" aria-live="polite" aria-relevant="additions" aria-label="Notifications"></div>
+
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="icon-menu" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="icon-close" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="icon-sun" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g></symbol>
+    <symbol id="icon-moon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+    <symbol id="icon-inbox" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3 13l2.5-7h13L21 13v6H3z"/><path d="M3 13h5l1.5 2.5h5L16 13h5"/></g></symbol>
+  </svg>
+
+  <div id="login-screen">
+    <form class="login-card" id="login-form">
+      <button type="button" class="icon-button login-theme" data-theme-toggle aria-label="Switch colour theme">
+        <svg class="theme-icon-light" aria-hidden="true"><use href="#icon-moon"/></svg>
+        <svg class="theme-icon-dark" aria-hidden="true"><use href="#icon-sun"/></svg>
+      </button>
+      <div class="login-brand">
+        <div class="login-brand-mark" aria-hidden="true">S</div>
+        <div>
+          <strong>Swantex</strong>
+          <span>Invoice Processing</span>
+        </div>
+      </div>
+      <h1>Welcome back</h1>
+      <p>
+        Sign in with your Swantex Microsoft 365 account to securely
+        access invoice processing and approvals.
+      </p>
+      <div id="login-error" role="alert"></div>
+      <a
+        id="microsoft-login-button"
+        class="microsoft-login hidden"
+        href="/api/auth/microsoft/login"
+      >
+        <span class="microsoft-mark" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </span>
+        Continue with Microsoft 365
+      </a>
+      <div class="login-security">Protected by Microsoft Entra ID</div>
+      <div id="local-login-fields">
+        <div class="login-divider">Development access</div>
+        <label>Username<input id="login-username" autocomplete="username"></label>
+        <label>Password<input id="login-password" type="password" autocomplete="current-password"></label>
+        <button type="submit" class="primary">Local sign in</button>
+      </div>
+    </form>
+  </div>
+
+  <dialog id="payment-dialog" aria-labelledby="payment-dialog-title">
+    <form id="payment-form" class="dialog-content">
+      <h2 id="payment-dialog-title">Record domestic payment</h2>
+      <p id="payment-supplier-context"></p>
+      <div class="grid">
+        <label>Payment date
+          <input id="payment-date" type="date" required>
+        </label>
+        <label>Payment method
+          <input id="payment-method" disabled>
+        </label>
+        <label class="full">Supplier account
+          <select id="payment-supplier-account"></select>
+        </label>
+        <label class="full">Payment reference
+          <input id="payment-reference" required>
+        </label>
+        <label>Normal payment terms
+          <input id="payment-terms" disabled>
+        </label>
+        <label>Pay from bank account
+          <input id="payment-bank-account" disabled>
+        </label>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" id="payment-cancel">Cancel</button>
+        <button type="submit" class="primary">Record payment</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="sage-registration-dialog" aria-labelledby="sage-registration-title">
+    <form id="sage-registration-form" class="dialog-content">
+      <h2 id="sage-registration-title">Confirm Sage registration</h2>
+      <p id="sage-registration-context"></p>
+      <div class="grid">
+        <label class="full">IRJ number (six digits)
+          <input
+            id="sage-registration-irj"
+            inputmode="numeric"
+            pattern="[0-9]{6}"
+            maxlength="6"
+            minlength="6"
+            autocomplete="off"
+            required
+          >
+        </label>
+      </div>
+      <div id="sage-registration-error" class="error" role="alert"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="sage-registration-cancel">Cancel</button>
+        <button type="submit" class="primary">Confirm registration</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-edit-dialog" class="admin-edit-dialog" aria-labelledby="admin-edit-title">
+    <form id="admin-edit-form" class="dialog-content">
+      <h2 id="admin-edit-title">Edit record</h2>
+      <p>Update the fields below, then save your changes.</p>
+      <div id="admin-edit-fields" class="admin-edit-fields"></div>
+      <div id="admin-edit-error" class="dialog-error" role="alert"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="admin-edit-cancel">Cancel</button>
+        <button type="submit" class="primary">Save changes</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Reusable confirm / prompt dialog driven by confirmDialog() and promptDialog(). -->
+  <dialog id="ui-dialog" aria-labelledby="ui-dialog-title" aria-describedby="ui-dialog-message">
+    <form id="ui-dialog-form" class="dialog-content">
+      <h2 id="ui-dialog-title">Confirm</h2>
+      <p id="ui-dialog-context" class="dialog-context" hidden></p>
+      <p id="ui-dialog-message" class="dialog-message"></p>
+      <div id="ui-dialog-fields" class="dialog-fields"></div>
+      <div id="ui-dialog-error" class="dialog-error" role="alert"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="ui-dialog-cancel">Cancel</button>
+        <button type="submit" class="primary" id="ui-dialog-confirm">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="app-root" class="hidden">
+  <div class="nav-scrim" id="nav-scrim" aria-hidden="true"></div>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">S</div>
+      <div>
+        <h1>Swantex</h1>
+        <p>Invoice Processing</p>
+      </div>
+      <button type="button" class="icon-button sidebar-close" id="nav-close" aria-label="Close navigation">
+        <svg aria-hidden="true"><use href="#icon-close"/></svg>
+      </button>
+    </div>
+    <nav class="section-nav" id="section-nav" aria-label="Invoice queues">
+      <div class="nav-group" role="group" aria-labelledby="nav-group-find">
+        <p class="nav-group-label" id="nav-group-find">Find</p>
+        <button data-tab="search" class="active">Search invoices</button>
+        <button data-tab="statements">Statements</button>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-group-process">
+        <p class="nav-group-label" id="nav-group-process">Process</p>
+        <button data-tab="incoming">Incoming<span class="count" id="count-incoming">0</span></button>
+        <button data-tab="needs-review">Flagged<span class="count" id="count-needs-review">0</span></button>
+        <button data-tab="po-matching">PO Matching<span class="count" id="count-po-matching">0</span></button>
+        <button data-tab="sage-registration">Sage Registration<span class="count" id="count-sage-registration">0</span></button>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-group-approve">
+        <p class="nav-group-label" id="nav-group-approve">Approve</p>
+        <button data-tab="approver1">Approver 1<span class="count" id="count-approver1">0</span></button>
+        <button data-tab="approver2">Approver 2<span class="count" id="count-approver2">0</span></button>
+        <button data-tab="on-hold">On Hold / Query<span class="count" id="count-on-hold">0</span></button>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-group-pay">
+        <p class="nav-group-label" id="nav-group-pay">Pay</p>
+        <button data-tab="approved">Approved<span class="count" id="count-approved">0</span></button>
+        <button data-tab="payment-bacs">BACS<span class="count" id="count-payment-bacs">0</span></button>
+        <button data-tab="payment-bankline">Bankline<span class="count" id="count-payment-bankline">0</span></button>
+        <button data-tab="payment-foreign-poa">Foreign POA<span class="count" id="count-payment-foreign-poa">0</span></button>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-group-close">
+        <p class="nav-group-label" id="nav-group-close">Close</p>
+        <button data-tab="reconciliation">Bank Reconciliation<span class="count" id="count-reconciliation">0</span></button>
+        <button data-tab="complete">Complete / Filed<span class="count" id="count-complete">0</span></button>
+        <button data-tab="rejected">Rejected<span class="count" id="count-rejected">0</span></button>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-group-admin">
+        <p class="nav-group-label" id="nav-group-admin">Admin</p>
+        <button data-tab="admin">Admin</button>
+      </div>
+    </nav>
+  </aside>
+  <main>
+    <header class="topbar">
+      <button
+        type="button"
+        class="icon-button"
+        id="nav-toggle"
+        aria-controls="section-nav"
+        aria-expanded="true"
+        aria-label="Toggle navigation"
+      >
+        <svg aria-hidden="true"><use href="#icon-menu"/></svg>
+      </button>
+      <div class="topbar-title">
+        <span class="topbar-eyebrow" id="page-group">Find</span>
+        <h2 id="page-title">Search invoices</h2>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" class="icon-button" data-theme-toggle aria-label="Switch colour theme">
+          <svg class="theme-icon-light" aria-hidden="true"><use href="#icon-moon"/></svg>
+          <svg class="theme-icon-dark" aria-hidden="true"><use href="#icon-sun"/></svg>
+        </button>
+        <div class="user-chip" id="user-chip">
+          <span class="user-avatar" id="user-avatar" aria-hidden="true">·</span>
+          <span id="user-chip-label">Signed in</span>
+          <button type="button" id="logout-button">Sign out</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="page" id="main-content" tabindex="-1">
+    <div class="tab-panel" data-tab-panel="incoming">
+      <details class="card manual-upload">
+        <summary>Manually add an invoice to Incoming Invoices</summary>
+        <div class="manual-upload-body">
+          <p class="manual-upload-hint">
+            For invoices received outside of the normal email process (e.g. post, hand-delivered,
+            or another mailbox). The PDF enters the exact same workflow as an Outlook-sourced invoice.
+          </p>
+          <form id="manual-upload-form">
+            <div class="grid">
+              <label class="full">Invoice PDF
+                <input type="file" id="manual-upload-file" accept="application/pdf" required>
+              </label>
+              <label>Sender name<input id="manual-upload-sender-name" placeholder="Optional"></label>
+              <label>Sender email<input id="manual-upload-sender-address" placeholder="Optional"></label>
+              <label class="full">Subject / description
+                <input id="manual-upload-subject" placeholder="Optional, e.g. 'Posted invoice from Acme Ltd'">
+              </label>
+            </div>
+            <div id="manual-upload-status" role="status"></div>
+            <div class="actions">
+              <button type="submit" class="primary" id="manual-upload-submit">Add to Incoming Invoices</button>
+            </div>
+          </form>
+        </div>
+      </details>
+
+      <div class="layout">
+        <section class="card pdf-card" aria-labelledby="document-title">
+          <div class="card-header">
+            <h2 id="document-title">Invoice PDF</h2>
+            <span class="badge" id="document-badge">No invoice selected</span>
+          </div>
+          <div class="pdf-empty" id="pdf-empty">
+            <div>
+              <div class="pdf-icon">PDF</div>
+              <strong>No received invoice selected</strong>
+              <p>PDFs retrieved from Outlook will appear here after the webhook worker processes them.</p>
+            </div>
+          </div>
+          <iframe class="pdf-frame" id="pdf-frame" title="Selected invoice PDF"></iframe>
+        </section>
+
+        <section class="card review-card" aria-labelledby="details-title">
+          <div class="card-header">
+            <h2 id="details-title">Extracted invoice information</h2>
+            <span class="badge" id="processing-badge">Awaiting invoice</span>
+          </div>
+          <div class="content review-primary">
+            <label class="invoice-picker">Received invoice
+              <select id="invoice-picker">
+                <option value="">No processed Outlook PDFs</option>
+              </select>
+            </label>
+
+            <div class="notice danger" id="duplicate-warning" style="display: none;" role="alert">
+              <strong aria-hidden="true">⚠</strong>
+              <div id="duplicate-warning-text"></div>
+            </div>
+
+            <div class="review-group primary-group">
+              <h3 class="section-title">Invoice details (AI-extracted — review and correct before confirming)</h3>
+              <div class="grid">
+                <label>IRJ number
+                  <input id="preview-irj" disabled placeholder="Assigned at filing">
+                </label>
+                <label>Company being invoiced
+                  <select id="preview-company">
+                    <option value="">Select company…</option>
+                  </select>
+                </label>
+                <label class="full">Supplier
+                  <select id="preview-supplier" disabled>
+                    <option value="">Select a company first…</option>
+                  </select>
+                </label>
+                <div class="notice supplier-match-prompt" id="supplier-match-prompt" style="display: none;" role="status">
+                  <strong>Supplier check</strong>
+                  <div>
+                    <span id="supplier-match-text"></span>
+                    <div class="supplier-match-actions">
+                      <button type="button" id="confirm-supplier-match">Confirm suggested supplier</button>
+                    </div>
+                  </div>
+                </div>
+                <label>Supplier invoice number
+                  <input id="preview-supplier-invoice" placeholder="e.g. INV-10442">
+                </label>
+                <label>Purchase Order number
+                  <input id="preview-po" placeholder="If one applies">
+                </label>
+                <label>Invoice date
+                  <input id="preview-invoice-date" type="date">
+                </label>
+                <label>Invoice value
+                  <input id="preview-value" type="number" step="0.01" inputmode="decimal" placeholder="0.00">
+                </label>
+                <label>Currency
+                  <input id="preview-currency" value="GBP" placeholder="GBP" maxlength="3" autocapitalize="characters">
+                </label>
+                <label class="full">Correction reason
+                  <textarea id="correction-reason" placeholder="Describe why any extracted values were changed (optional)."></textarea>
+                </label>
+              </div>
+            </div>
+
+            <details class="review-group" open>
+              <summary>AI extraction status</summary>
+              <div class="grid">
+                <label>AI processing status
+                  <input id="processing-status" disabled placeholder="Waiting for invoice">
+                </label>
+                <label>Overall confidence
+                  <div class="confidence">
+                    <input id="ai-confidence" disabled placeholder="Not calculated">
+                    <small id="ai-confidence-percent">—</small>
+                  </div>
+                </label>
+                <label class="full">Review warnings
+                  <textarea id="review-warnings" disabled placeholder="Missing, uncertain, or conflicting fields will be shown here."></textarea>
+                </label>
+                <label>Extraction model
+                  <input id="extraction-model" disabled placeholder="Not recorded">
+                </label>
+                <label>Prompt / extraction version
+                  <input id="extraction-prompt-version" disabled placeholder="Not recorded">
+                </label>
+                <label class="full">Routing explanation
+                  <textarea id="routing-explanation" disabled placeholder="The routing decision will be shown here."></textarea>
+                </label>
+              </div>
+            </details>
+
+            <details class="review-group">
+              <summary>Source email</summary>
+              <div class="grid">
+                <label>Sender<input id="source-sender" disabled placeholder="Email sender"></label>
+                <label>Date received<input id="source-received" disabled placeholder="Received date and time"></label>
+                <label class="full">Email subject<input id="source-subject" disabled placeholder="Email subject"></label>
+              </div>
+            </details>
+          </div>
+          <div class="actions review-actions">
+            <button type="button" class="danger" id="delete-invoice-button" style="display:none">Delete duplicate</button>
+            <button type="button" class="danger" id="cancel-duplicate-button" style="display: none">Confirmed duplicate — cancel</button>
+            <span class="action-spacer" aria-hidden="true"></span>
+            <button type="button" class="secondary" id="retry-approval-route-button" style="display: none">Retry configured approver route</button>
+            <button type="button" class="warning" id="flag-review-button">Flag for review</button>
+            <button type="button" class="warning" id="override-duplicate-button" style="display: none">This is not a duplicate — route anyway</button>
+            <button type="button" class="primary" id="confirm-invoice-button">Purchase Ledger: confirm invoice</button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="tab-panel active" data-tab-panel="search">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Search invoices</h2>
+            <p class="card-subtitle">Filter by company and supplier, or look up a single IRJ number.</p>
+          </div>
+        </div>
+        <div class="content">
+          <form class="admin-form search-form" id="invoice-search-form">
+            <label>Company
+              <select id="invoice-search-company">
+                <option value="">All companies</option>
+              </select>
+            </label>
+            <label>Supplier
+              <select id="invoice-search-supplier">
+                <option value="">All suppliers</option>
+              </select>
+            </label>
+            <label>IRJ number
+              <input
+                id="invoice-search-irj"
+                placeholder="Six digits (optional)"
+                inputmode="numeric"
+                pattern="[0-9]{6}"
+                maxlength="6"
+                autocomplete="off"
+              >
+            </label>
+            <button type="submit" class="primary">Search</button>
+          </form>
+          <div id="invoice-search-result" class="empty-state" aria-live="polite">
+            Select a company or supplier, or enter an IRJ number.
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="statements">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Company statements</h2>
+            <p class="card-subtitle">Supplier statements filed for each company.</p>
+          </div>
+        </div>
+        <div class="content">
+          <p class="admin-help">
+            Statements are read directly from each SharePoint
+            <code>Statements/{Company}</code> folder.
+          </p>
+          <label class="statements-toolbar">Company
+            <select id="statement-company">
+              <option value="">Select company…</option>
+            </select>
+          </label>
+          <div id="statement-list" class="empty-state" aria-live="polite">
+            Select a company to view its statements.
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="needs-review">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Flagged Documents — Purchase Ledger Review</h2>
+            <p class="card-subtitle">Documents the AI could not route confidently, or that someone flagged. Select a row to see the PDF and extracted fields.</p>
+          </div>
+        </div>
+        <div class="content" id="needs-review-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="po-matching">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Purchase Order Invoice Matching</h2>
+            <p class="card-subtitle">Match each invoice against its purchase order, or record a query.</p>
+          </div>
+        </div>
+        <p class="role-note" id="po-matching-readonly-note" hidden>
+          Read-only for your role: Purchase Ledger records PO matches, queries and rejections.
+          You can still review each invoice and open its PDF.
+        </p>
+        <div class="content" id="po-matching-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="sage-registration">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Awaiting Sage Registration</h2>
+            <p class="card-subtitle">Register each invoice in Sage and confirm its IRJ number.</p>
+          </div>
+        </div>
+        <div class="content" id="sage-registration-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="approver1">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Approver 1 — Pending Approvals</h2>
+            <p class="card-subtitle">Approve, query or reject invoices routed to you as first approver.</p>
+          </div>
+        </div>
+        <div class="content" id="approver1-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="approver2">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Approver 2 — Pending Approvals</h2>
+            <p class="card-subtitle">Invoices that need a second approval after Approver 1.</p>
+          </div>
+        </div>
+        <div class="content" id="approver2-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="on-hold">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>On Hold / Approval Queries</h2>
+            <p class="card-subtitle">Approval queries and routing issues waiting to be resolved and resumed.</p>
+          </div>
+        </div>
+        <div class="content" id="on-hold-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="approved">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Approved — Ready for Payment</h2>
+            <p class="card-subtitle">Approved invoices waiting to be routed to a payment run.</p>
+          </div>
+        </div>
+        <div class="content" id="approved-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="payment-bacs">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Approved for Payment — BACS</h2>
+            <p class="card-subtitle">Record each payment once it has been made by BACS.</p>
+          </div>
+        </div>
+        <div class="content" id="payment-bacs-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="payment-bankline">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Approved for Payment — Bankline</h2>
+            <p class="card-subtitle">Record each payment once it has been made through Bankline.</p>
+          </div>
+        </div>
+        <div class="content" id="payment-bankline-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="payment-foreign-poa">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Approved for Payment — Foreign POA</h2>
+            <p class="card-subtitle">Foreign currency invoices awaiting payment or allocation.</p>
+          </div>
+        </div>
+        <div class="content" id="payment-foreign-poa-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="reconciliation">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Bank Reconciliation</h2>
+            <p class="card-subtitle">Mark paid invoices reconciled once they appear on a bank statement.</p>
+          </div>
+        </div>
+        <div class="content" id="reconciliation-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="complete">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Complete / Filed</h2>
+            <p class="card-subtitle">Reconciled invoices and filed statements.</p>
+          </div>
+        </div>
+        <div class="content" id="complete-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="rejected">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2>Rejected</h2>
+            <p class="card-subtitle">Rejected invoices and cancelled duplicates.</p>
+          </div>
+        </div>
+        <div class="content" id="rejected-table"><div class="skeleton" aria-hidden="true"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+      </section>
+    </div>
+
+    <div class="tab-panel" data-tab-panel="admin">
+      <section class="card">
+        <div class="content" id="admin-panel">
+          <nav class="admin-section-nav" id="admin-section-nav" aria-label="Admin sections">
+            <button type="button" data-admin-section="admin-bi-metrics">Metrics</button>
+            <button type="button" data-admin-section="admin-operations">Monitoring</button>
+            <button type="button" data-admin-section="admin-irj-settings">IRJ numbering</button>
+            <button type="button" data-admin-section="admin-import-form">Bulk import</button>
+            <button type="button" data-admin-section="admin-companies-config">Companies</button>
+            <button type="button" data-admin-section="admin-supplier-form">Suppliers</button>
+            <button type="button" data-admin-section="admin-supplier-terms-table">Payment settings</button>
+            <button type="button" data-admin-section="admin-matrix-form">Approval matrix</button>
+            <button type="button" data-admin-section="admin-threshold-form">AI threshold</button>
+          </nav>
+          <details class="admin-block admin-collapsible" id="admin-bi-metrics">
+            <summary>Reporting metrics</summary>
+            <div class="admin-collapsible-content">
+              <div class="metrics-toolbar">
+                <label>Invoice volume interval
+                  <select id="metrics-granularity">
+                    <option value="day">Daily — last 30 days</option>
+                    <option value="week">Weekly — last 12 weeks</option>
+                    <option value="month" selected>Monthly — last 12 months</option>
+                  </select>
+                </label>
+              </div>
+              <div id="metrics-dashboard" class="empty-state">
+                Metrics load when this section is opened.
+              </div>
+            </div>
+          </details>
+
+          <details class="admin-block admin-collapsible" id="admin-operations">
+            <summary>Worker and production monitoring</summary>
+            <div class="admin-collapsible-content">
+              <div class="section-toolbar">
+                <button type="button" id="refresh-operations" class="secondary">Refresh status</button>
+              </div>
+              <div id="operations-dashboard" class="empty-state">
+                Open this section to load worker and queue status.
+              </div>
+            </div>
+          </details>
+
+          <details class="admin-block admin-collapsible">
+            <summary>IRJ numbering by company</summary>
+            <div class="admin-collapsible-content">
+              <p class="admin-help">
+                Automatic companies continue from the latest paper IRJ.
+                Manual companies require a six-digit IRJ during Sage registration.
+              </p>
+              <div id="admin-irj-settings"></div>
+            </div>
+          </details>
+
+          <div class="admin-block">
+            <h3>Bulk import supplier master data</h3>
+            <p class="admin-help">
+              Choose the invoice company, then upload an Excel (.xlsx) sheet
+              containing Trading Partner Name, Supplier Account Number,
+              Default Payment Method, Payment Terms, Bank Account, and
+              Approver(s). Optional Approver Email columns can also be
+              included. Every supplier and approval route will be assigned
+              to the selected company.
+            </p>
+            <form class="admin-form" id="admin-import-form">
+              <label>Invoice company
+                <select id="admin-import-company" required>
+                  <option value="">Select invoice company…</option>
+                </select>
+              </label>
+              <label>Workbook
+                <input id="admin-import-file" type="file" accept=".xlsx,.xlsm" required>
+              </label>
+              <button type="submit" class="primary">Import workbook</button>
+            </form>
+            <div id="admin-import-result" aria-live="polite"></div>
+          </div>
+
+          <details class="admin-block admin-collapsible" id="admin-companies-config">
+            <summary>Companies</summary>
+            <div class="admin-collapsible-content">
+              <p id="admin-sharepoint-folder-status" class="admin-help">
+                Open this section to load SharePoint folders.
+              </p>
+              <form class="admin-form" id="admin-company-form">
+                <label>Company name
+                  <input id="admin-company-name" placeholder="e.g. Acme Trading Ltd" required>
+                </label>
+                <label class="company-folder-field">SharePoint company folder
+                  <select id="admin-company-root-folder" required disabled>
+                    <option value="">Select SharePoint company folder…</option>
+                  </select>
+                </label>
+                <label>Aliases
+                  <input id="admin-company-aliases" placeholder="Comma separated">
+                </label>
+                <button type="submit" class="primary" id="admin-company-submit" disabled>Add company</button>
+              </form>
+              <div id="admin-company-folder-preview" class="empty">
+                Select a company folder to preview its workflow destinations.
+              </div>
+              <div id="admin-companies-table"></div>
+            </div>
+          </details>
+
+          <div class="admin-block">
+            <h3>Suppliers</h3>
+            <p class="admin-help">Supplier names and aliases are used to match the supplier the AI extracts from each invoice.</p>
+            <form class="admin-form" id="admin-supplier-form">
+              <label>Supplier name
+                <input id="admin-supplier-name" placeholder="Supplier name" required>
+              </label>
+              <label>Aliases
+                <input id="admin-supplier-aliases" placeholder="Comma separated">
+              </label>
+              <label>Default company
+                <select id="admin-supplier-default-company">
+                  <option value="">No default company</option>
+                </select>
+              </label>
+              <label>Contact email
+                <input id="admin-supplier-contact" placeholder="Optional">
+              </label>
+              <label>Invoice number pattern
+                <input
+                  id="admin-supplier-invoice-pattern"
+                  placeholder="e.g. ########@@@"
+                  title="# = digit, @ = letter, * = letter or digit"
+                >
+              </label>
+              <button type="submit" class="primary">Add supplier</button>
+            </form>
+            <div id="admin-suppliers-table"></div>
+          </div>
+
+          <div class="admin-block">
+            <h3>Supplier payment settings</h3>
+            <p class="admin-help">Account numbers, payment methods and terms per invoice company, created by the bulk import.</p>
+            <div id="admin-supplier-terms-table"></div>
+          </div>
+
+          <div class="admin-block">
+            <h3>Approval matrix</h3>
+            <p class="admin-help">Who approves invoices for each invoice company and supplier. Routes without an approver email cannot notify the approver.</p>
+            <p class="form-heading">Add an approval route</p>
+            <form class="admin-form" id="admin-matrix-form">
+              <label>Invoice company
+                <select id="admin-matrix-company" required>
+                  <option value="">Select invoice company…</option>
+                  <option value="*">All invoice companies</option>
+                </select>
+              </label>
+              <label>Supplier company
+                <select id="admin-matrix-supplier" required>
+                  <option value="">Select supplier company…</option>
+                </select>
+              </label>
+              <label>Approver 1 name
+                <input id="admin-matrix-approver1-name" required>
+              </label>
+              <label>Approver 1 email
+                <input id="admin-matrix-approver1-email" type="email" required>
+              </label>
+              <label>Approver 2 name
+                <input id="admin-matrix-approver2-name" placeholder="Optional">
+              </label>
+              <label>Approver 2 email
+                <input id="admin-matrix-approver2-email" type="email" placeholder="Optional">
+              </label>
+              <button type="submit" class="primary">Add route</button>
+            </form>
+            <div class="metrics-toolbar table-toolbar">
+              <label>Filter routes
+                <input id="admin-matrix-filter" type="search" placeholder="Company, supplier or approver">
+              </label>
+              <label>Show
+                <select id="admin-matrix-email-filter">
+                  <option value="all">All routes</option>
+                  <option value="missing">Missing approver email</option>
+                </select>
+              </label>
+            </div>
+            <div id="admin-matrix-table"></div>
+          </div>
+
+          <div class="admin-block">
+            <h3>AI extraction confidence threshold</h3>
+            <p class="admin-help">AI confidence below this value (between 0 and 1) is flagged for Purchase Ledger review.</p>
+            <form class="admin-form" id="admin-threshold-form">
+              <label>Threshold
+                <input id="admin-threshold-value" type="number" min="0" max="1" step="0.01" placeholder="0.80">
+              </label>
+              <button type="submit" class="primary">Save threshold</button>
+            </form>
+          </div>
+
+        </div>
+      </section>
+    </div>
+    </div>
+  </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -95,6 +95,42 @@ def test_due_dates_support_days_eom_and_report_unknown_terms() -> None:
     assert unknown["due_dates"]["unavailable_count"] == 1
 
 
+def test_due_dates_use_all_company_terms_when_no_company_terms_exist() -> None:
+    all_company = SupplierTerms(
+        id=2,
+        company="*",
+        supplier="Supplier Ltd",
+        payment_terms_notice="30 Days",
+    )
+    metrics = build_metrics(
+        [invoice(1, invoice_date="2026-09-01")],
+        [all_company],
+        granularity="day",
+        today=date(2026, 9, 25),
+    )
+
+    due = metrics["due_dates"]
+    assert due["unavailable_count"] == 0
+    assert due["approaching"][0]["due_date"] == "2026-10-01"
+
+
+def test_company_specific_terms_win_over_all_company_terms() -> None:
+    all_company = SupplierTerms(
+        id=2,
+        company="*",
+        supplier="Supplier Ltd",
+        payment_terms_notice="60 Days",
+    )
+    metrics = build_metrics(
+        [invoice(1, invoice_date="2026-09-01")],
+        [all_company, terms("30 Days")],
+        granularity="day",
+        today=date(2026, 9, 25),
+    )
+
+    assert metrics["due_dates"]["approaching"][0]["due_date"] == "2026-10-01"
+
+
 def test_volume_uses_selected_granularity() -> None:
     metrics = build_metrics(
         [
