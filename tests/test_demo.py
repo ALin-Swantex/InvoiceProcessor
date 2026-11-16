@@ -111,3 +111,19 @@ def test_demo_environment_drops_every_cloud_setting(
         assert name not in os.environ
     assert os.environ["AUTH_LOCAL_LOGIN_ENABLED"] == "true"
     assert os.environ["INVOICE_PROCESSOR_SKIP_DOTENV"] == "1"
+
+
+def test_demo_refuses_to_start_when_its_port_is_taken(capsys) -> None:
+    import socket
+
+    from app.demo import main, port_in_use
+
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+
+        assert port_in_use(port) is True
+        assert main(["--port", str(port)]) == 2
+
+    assert "already in use" in capsys.readouterr().out
