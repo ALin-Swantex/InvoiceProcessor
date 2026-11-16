@@ -92,6 +92,22 @@ session, and configuration metadata are stored in PostgreSQL. The canonical PDF
 remains in SharePoint. For read-only Power BI reporting, see
 [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md).
 
+## Demo mode (no Azure needed)
+
+To look around the application, or to work on the UI while Azure is
+unavailable, run it on temporary local data with sample invoices in every
+workflow stage:
+
+```bash
+python -m app.demo            # http://localhost:8000, Ctrl+C to stop
+docker compose --profile demo up demo   # http://localhost:8001
+```
+
+It prints the demo accounts and passwords on start-up. Demo mode uses local
+SQLite storage and local password sign-in only. It ignores `.env` and every
+Azure, Microsoft 365, SharePoint and PostgreSQL setting, so it can never touch
+real systems, and its data is discarded when it stops (`--data-dir` keeps it).
+
 ## Run with Docker
 
 One image runs everything; `docker-compose.yml` starts the web application and
