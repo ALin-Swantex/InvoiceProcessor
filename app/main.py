@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
+from starlette.types import Scope
 
 from app.activity_feed import ActivityFeedStore
 from app.ai_extraction import ai_extraction_configured  # noqa: F401 -- patched by tests; resolved at call time by app.routers.invoices
@@ -69,8 +72,43 @@ from app.supplier_terms import SupplierTermsStore
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+_INDEX_HTML_CACHE: dict[str, object] = {"mtime_ns": None, "text": ""}
+
+
 def _index_html() -> str:
-    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    """Return index.html, re-reading it only when the file changes.
+
+    Keyed on the file's mtime so a deploy (or local edit) is picked up
+    without restarting, while normal page loads avoid disk reads.
+    """
+    path = STATIC_DIR / "index.html"
+    mtime_ns = path.stat().st_mtime_ns
+    if _INDEX_HTML_CACHE["mtime_ns"] != mtime_ns:
+        _INDEX_HTML_CACHE["text"] = path.read_text(encoding="utf-8")
+        _INDEX_HTML_CACHE["mtime_ns"] = mtime_ns
+    return str(_INDEX_HTML_CACHE["text"])
+
+
+class RevalidatingStaticFiles(StaticFiles):
+    """Static files that browsers may cache but must revalidate.
+
+    ``no-cache`` means "store, but check with the server before use", so
+    the ETag/Last-Modified conditional request turns repeat loads into
+    cheap 304s while a deploy is still picked up immediately.
+    """
+
+    def file_response(
+        self,
+        full_path: "os.PathLike[str] | str",
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        response = super().file_response(
+            full_path, stat_result, scope, status_code
+        )
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 logger = logging.getLogger("invoice_processor")
@@ -109,7 +147,12 @@ def create_app(
     auto_configure_sharepoint: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="Invoice Intake Prototype", version="0.1.0")
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    # GZipMiddleware skips text/event-stream by default, so the SSE
+    # activity stream is not buffered by compression.
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.mount(
+        "/static", RevalidatingStaticFiles(directory=STATIC_DIR), name="static"
+    )
     if notification_store is None:
         from app.postgres_notifications import PostgresOutlookNotificationStore
         from app.postgres_monitoring import PostgresWorkerMonitor

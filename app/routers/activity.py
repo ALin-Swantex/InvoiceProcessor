@@ -36,6 +36,21 @@ def activity(
     return [asdict(event) for event in events]
 
 
+@router.get("/api/activity/latest")
+def activity_latest(
+    http_request: Request, user: User = Depends(get_current_user)
+) -> dict[str, int]:
+    """Return only the newest activity event id.
+
+    The UI uses this to position its activity cursor on page load without
+    replaying history as toasts (``/api/activity`` with ``since_id=0``
+    returns the *oldest* events). Only an integer is exposed -- the same
+    value the SSE stream already signals to every role.
+    """
+    del user
+    return {"latest_id": int(http_request.app.state.activity_feed.latest_id())}
+
+
 @router.get("/api/activity/stream")
 async def activity_stream(
     request: Request,
