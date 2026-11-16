@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import uuid
 from dataclasses import asdict
@@ -59,7 +58,7 @@ def list_invoices(
 
 
 @router.post("/api/invoices/manual-upload")
-async def manual_upload_invoice(
+def manual_upload_invoice(
     http_request: Request,
     file: UploadFile = File(...),
     sender_name: str | None = Form(None),
@@ -78,6 +77,10 @@ async def manual_upload_invoice(
     In the connected deployment, the PDF is uploaded to SharePoint
     Incoming first and registered from its DriveItem identity. A local
     cache is retained only for Document Intelligence and PDF preview.
+
+    This is a plain (sync) handler so FastAPI runs it in its threadpool:
+    the SharePoint upload, AI extraction and store writes below are all
+    blocking and must not stall the event loop.
     """
     import app.main as main_module
     app = http_request.app
@@ -86,7 +89,7 @@ async def manual_upload_invoice(
     ).lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files may be uploaded.")
 
-    content = await file.read()
+    content = file.file.read()
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file was empty.")
     try:
@@ -129,19 +132,26 @@ async def manual_upload_invoice(
             activity_feed=app.state.activity_feed,
         )
         try:
-            item = await asyncio.to_thread(
-                lifecycle.sharepoint_client.upload_to_incoming,
+            item = lifecycle.sharepoint_client.upload_to_incoming(
                 original_filename,
                 content,
             )
-            record = await asyncio.to_thread(
-                monitor.ingest_item,
+        except (SharePointError, InvoiceExtractionUnavailableError) as error:
+            # Nothing was uploaded, so there is no record to fall back to.
+            raise HTTPException(
+                status_code=503,
+                detail=f"SharePoint Incoming upload failed: {error}",
+            ) from error
+        try:
+            record = monitor.ingest_item(
                 item,
                 source_message=message,
                 content=content,
                 event_type="manual_intake",
             )
         except InvoiceExtractionUnavailableError:
+            # The item was registered before extraction failed; return it
+            # so it stays visible for manual review.
             item_id = str(item.get("id", ""))
             record = app.state.invoice_store.get_by_sharepoint_item_id(item_id)
         except SharePointError as error:

@@ -767,6 +767,85 @@
               `;
             }
 
+            // Per-table render state so a refreshed invoice snapshot only
+            // touches tables (and rows) whose data actually changed. Unchanged
+            // rows keep their DOM nodes, so an expanded PDF iframe is not
+            // reloaded when some other invoice changes.
+            const renderedSectionState = new Map();
+
+            function sectionRenderContext() {
+              return JSON.stringify([
+                currentUser ? currentUser.role : null,
+                invoiceCompanies.map(company => company.name),
+              ]);
+            }
+
+            function invoiceRowHtml(invoice, columns, actionsFn) {
+              const expanded = expandedInvoiceIds.has(String(invoice.id));
+              let html = `<tr class="invoice-summary-row" data-expand-invoice="${invoice.id}" ` +
+                `tabindex="0" aria-expanded="${expanded}" title="Click to view invoice analysis">`;
+              for (const column of columns) {
+                const value = escapeHtml(column.value(invoice));
+                html += column.boxed
+                  ? `<td class="invoice-description-cell"><div class="mini-description">${value}</div></td>`
+                  : `<td>${value}</td>`;
+              }
+              html += `<td class="row-actions"><div class="row-action-buttons">` +
+                `${actionsFn(invoice)}</div>` +
+                `<span class="invoice-expand-hint">${expanded ? "Hide" : "View"} PDF and extracted fields</span></td>`;
+              html += "</tr>";
+              if (expanded) {
+                html += `<tr class="invoice-analysis-row"><td colspan="${columns.length + 1}" ` +
+                  `class="invoice-analysis-cell">${invoiceAnalysisHtml(invoice)}</td></tr>`;
+              }
+              return html;
+            }
+
+            function elementsMatching(root, selector) {
+              const matches = [...root.querySelectorAll(selector)];
+              if (root.matches && root.matches(selector)) matches.unshift(root);
+              return matches;
+            }
+
+            function bindInvoiceRowEvents(root, containerId) {
+              elementsMatching(root, "[data-action]").forEach(button => {
+                button.addEventListener("click", () => handleRowAction(button));
+              });
+              populateStatementCompanySelects(root);
+              elementsMatching(root, "[data-expand-invoice]").forEach(row => {
+                const toggle = event => {
+                  if (event.target.closest("button, a, input, select, textarea")) return;
+                  if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
+                  event.preventDefault();
+                  const id = String(row.dataset.expandInvoice);
+                  if (expandedInvoiceIds.has(id)) {
+                    expandedInvoiceIds.delete(id);
+                  } else {
+                    expandedInvoiceIds.add(id);
+                  }
+                  renderAllSections();
+                  if (event.type === "keydown") {
+                    document.getElementById(containerId)
+                      ?.querySelector(`[data-expand-invoice="${CSS.escape(id)}"]`)
+                      ?.focus();
+                  }
+                };
+                row.addEventListener("click", toggle);
+                row.addEventListener("keydown", toggle);
+              });
+            }
+
+            function invoiceRowNodesFrom(tbody) {
+              const rowNodes = new Map();
+              for (const row of tbody.querySelectorAll(":scope > tr[data-expand-invoice]")) {
+                const nodes = [row];
+                const next = row.nextElementSibling;
+                if (next && next.classList.contains("invoice-analysis-row")) nodes.push(next);
+                rowNodes.set(String(row.dataset.expandInvoice), nodes);
+              }
+              return rowNodes;
+            }
+
             function renderSectionTable(
               containerId,
               statuses,
@@ -779,53 +858,85 @@
               const rows = invoices.filter(
                 i => statuses.includes(i.status) && rowFilter(i)
               );
+              const context = sectionRenderContext();
+              const rowSignatures = rows.map(invoice => JSON.stringify([
+                invoice,
+                expandedInvoiceIds.has(String(invoice.id)),
+              ]));
+              const signature = `${context}\n${rowSignatures.join("\n")}`;
+              const previous = renderedSectionState.get(containerId);
+              if (previous && previous.signature === signature) return;
               if (!rows.length) {
                 container.innerHTML = '<div class="empty-state">No documents in this section.</div>';
+                renderedSectionState.set(containerId, { signature, tbody: null, rows: new Map() });
+                return;
+              }
+              if (
+                previous &&
+                previous.context === context &&
+                previous.tbody &&
+                container.contains(previous.tbody)
+              ) {
+                // Patch only the rows whose invoice (or expanded state)
+                // changed; retained rows are never detached.
+                const tbody = previous.tbody;
+                const nextRows = new Map();
+                const desired = [];
+                rows.forEach((invoice, index) => {
+                  const id = String(invoice.id);
+                  const existing = previous.rows.get(id);
+                  if (existing && existing.signature === rowSignatures[index]) {
+                    nextRows.set(id, existing);
+                    desired.push(existing.nodes);
+                    return;
+                  }
+                  const template = document.createElement("template");
+                  template.innerHTML = invoiceRowHtml(invoice, columns, actionsFn);
+                  const nodes = [...template.content.children];
+                  nodes.forEach(node => bindInvoiceRowEvents(node, containerId));
+                  const entry = { signature: rowSignatures[index], nodes };
+                  nextRows.set(id, entry);
+                  desired.push(nodes);
+                });
+                for (const [id, entry] of previous.rows) {
+                  if (nextRows.get(id) !== entry) entry.nodes.forEach(node => node.remove());
+                }
+                let cursor = tbody.firstChild;
+                for (const nodes of desired) {
+                  for (const node of nodes) {
+                    if (node === cursor) {
+                      cursor = cursor.nextSibling;
+                    } else {
+                      tbody.insertBefore(node, cursor);
+                    }
+                  }
+                }
+                renderedSectionState.set(containerId, {
+                  signature, context, tbody, rows: nextRows,
+                });
                 return;
               }
               let html = '<table class="section-table"><thead><tr>';
               for (const column of columns) html += `<th>${column.label}</th>`;
               html += "<th>Actions</th></tr></thead><tbody>";
               for (const invoice of rows) {
-                const expanded = expandedInvoiceIds.has(String(invoice.id));
-                html += `<tr class="invoice-summary-row" data-expand-invoice="${invoice.id}" ` +
-                  `tabindex="0" aria-expanded="${expanded}" title="Click to view invoice analysis">`;
-                for (const column of columns) {
-                  const value = escapeHtml(column.value(invoice));
-                  html += column.boxed
-                    ? `<td class="invoice-description-cell"><div class="mini-description">${value}</div></td>`
-                    : `<td>${value}</td>`;
-                }
-                html += `<td class="row-actions"><div class="row-action-buttons">` +
-                  `${actionsFn(invoice)}</div>` +
-                  `<span class="invoice-expand-hint">${expanded ? "Hide" : "View"} PDF and extracted fields</span></td>`;
-                html += "</tr>";
-                if (expanded) {
-                  html += `<tr class="invoice-analysis-row"><td colspan="${columns.length + 1}" ` +
-                    `class="invoice-analysis-cell">${invoiceAnalysisHtml(invoice)}</td></tr>`;
-                }
+                html += invoiceRowHtml(invoice, columns, actionsFn);
               }
               html += "</tbody></table>";
               container.innerHTML = html;
-              container.querySelectorAll("[data-action]").forEach(button => {
-                button.addEventListener("click", () => handleRowAction(button));
+              bindInvoiceRowEvents(container, containerId);
+              const tbody = container.querySelector("tbody");
+              const rowNodes = invoiceRowNodesFrom(tbody);
+              const renderedRows = new Map();
+              rows.forEach((invoice, index) => {
+                const id = String(invoice.id);
+                renderedRows.set(id, {
+                  signature: rowSignatures[index],
+                  nodes: rowNodes.get(id) || [],
+                });
               });
-              populateStatementCompanySelects(container);
-              container.querySelectorAll("[data-expand-invoice]").forEach(row => {
-                const toggle = event => {
-                  if (event.target.closest("button, a, input, select, textarea")) return;
-                  if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
-                  event.preventDefault();
-                  const id = String(row.dataset.expandInvoice);
-                  if (expandedInvoiceIds.has(id)) {
-                    expandedInvoiceIds.delete(id);
-                  } else {
-                    expandedInvoiceIds.add(id);
-                  }
-                  renderAllSections();
-                };
-                row.addEventListener("click", toggle);
-                row.addEventListener("keydown", toggle);
+              renderedSectionState.set(containerId, {
+                signature, context, tbody, rows: renderedRows,
               });
             }
 
@@ -1782,10 +1893,16 @@
             }
 
             async function initActivityCursor() {
-              const response = await fetch("/api/activity");
-              if (!response.ok) { lastActivityId = 0; return; }
-              const events = await response.json();
-              lastActivityId = events.length ? events[events.length - 1].id : 0;
+              // Start from the newest event so existing history is not
+              // replayed as toasts (/api/activity returns the oldest first).
+              try {
+                const response = await fetch("/api/activity/latest");
+                if (!response.ok) { lastActivityId = 0; return; }
+                const body = await response.json();
+                lastActivityId = Number(body.latest_id) || 0;
+              } catch (error) {
+                lastActivityId = 0;
+              }
             }
 
             function connectLiveUpdates() {
@@ -2153,6 +2270,108 @@
               }
             }
 
+            // Filtering the approval matrix only re-renders this table from
+            // the cached adminMatrix; it does not refetch the admin panel.
+            function renderAdminMatrixTable() {
+              const matrixQuery = document.getElementById("admin-matrix-filter")
+                .value.trim().toLowerCase();
+              const matrixEmailFilter = document.getElementById("admin-matrix-email-filter").value;
+              const visibleMatrix = adminMatrix.filter(entry => {
+                const searchText = [entry.company, entry.supplier, entry.approver1_name,
+                  entry.approver1_email, entry.approver2_name, entry.approver2_email]
+                  .filter(Boolean).join(" ").toLowerCase();
+                const missingEmail = !entry.approver1_email ||
+                  (entry.approver2_name && !entry.approver2_email);
+                return (!matrixQuery || searchText.includes(matrixQuery)) &&
+                  (matrixEmailFilter !== "missing" || missingEmail);
+              });
+              renderCompanyGroupedTables(
+                document.getElementById("admin-matrix-table"),
+                rowsGroupedByCompany(visibleMatrix),
+                [
+                  { label: "Supplier company", value: m => m.supplier },
+                  {
+                    label: "Approver 1",
+                    value: m => m.approver1_email
+                      ? `${m.approver1_name} <${m.approver1_email}>`
+                      : `${m.approver1_name} — missing email`,
+                  },
+                  {
+                    label: "Approver 2",
+                    value: m => m.approver2_name
+                      ? (m.approver2_email
+                        ? `${m.approver2_name} <${m.approver2_email}>`
+                        : `${m.approver2_name} — missing email`)
+                      : "—",
+                  },
+                ],
+                async id => {
+                  await fetch(`/api/admin/approval-matrix/${id}`, { method: "DELETE" });
+                  await loadAdminPanel();
+                },
+                "id",
+                entry => {
+                  openAdminEditor("Edit approval route", [
+                    {
+                      key: "company",
+                      label: "Invoice company",
+                      type: "select",
+                      options: includeCurrentOption(
+                        companyOptions(true),
+                        entry.company,
+                        entry.company === "*" ? "All invoice companies" : entry.company
+                      ),
+                      value: entry.company,
+                      required: true,
+                    },
+                    {
+                      key: "supplier",
+                      label: "Supplier company",
+                      type: "select",
+                      options: includeCurrentOption(
+                        supplierOptions(),
+                        entry.supplier
+                      ),
+                      value: entry.supplier,
+                      required: true,
+                    },
+                    {
+                      key: "approver1_name",
+                      label: "Approver 1 name",
+                      value: entry.approver1_name,
+                      required: true,
+                    },
+                    {
+                      key: "approver1_email",
+                      label: "Approver 1 email",
+                      type: "email",
+                      value: entry.approver1_email,
+                      required: true,
+                    },
+                    {
+                      key: "approver2_name",
+                      label: "Approver 2 name",
+                      value: entry.approver2_name,
+                      nullWhenBlank: true,
+                    },
+                    {
+                      key: "approver2_email",
+                      label: "Approver 2 email",
+                      type: "email",
+                      value: entry.approver2_email,
+                      nullWhenBlank: true,
+                    },
+                  ], async values => {
+                    await putJson(
+                      `/api/admin/approval-matrix/${entry.id}`,
+                      values
+                    );
+                    await loadAdminPanel();
+                  });
+                }
+              );
+            }
+
             async function loadAdminPanel() {
               try {
                 const [companies, suppliers, matrix, supplierTerms, threshold, irjSettings] = await Promise.all([
@@ -2168,18 +2387,6 @@
                 adminMatrix = matrix;
                 adminSupplierTerms = supplierTerms;
                 loadAdminReferenceOptions(companies, suppliers);
-                const matrixQuery = document.getElementById("admin-matrix-filter")
-                  .value.trim().toLowerCase();
-                const matrixEmailFilter = document.getElementById("admin-matrix-email-filter").value;
-                const visibleMatrix = matrix.filter(entry => {
-                  const searchText = [entry.company, entry.supplier, entry.approver1_name,
-                    entry.approver1_email, entry.approver2_name, entry.approver2_email]
-                    .filter(Boolean).join(" ").toLowerCase();
-                  const missingEmail = !entry.approver1_email ||
-                    (entry.approver2_name && !entry.approver2_email);
-                  return (!matrixQuery || searchText.includes(matrixQuery)) &&
-                    (matrixEmailFilter !== "missing" || missingEmail);
-                });
                 renderSimpleTable(
                   document.getElementById("admin-companies-table"),
                   [
@@ -2393,91 +2600,7 @@
                     });
                   }
                 );
-                renderCompanyGroupedTables(
-                  document.getElementById("admin-matrix-table"),
-                  rowsGroupedByCompany(visibleMatrix),
-                  [
-                    { label: "Supplier company", value: m => m.supplier },
-                    {
-                      label: "Approver 1",
-                      value: m => m.approver1_email
-                        ? `${m.approver1_name} <${m.approver1_email}>`
-                        : `${m.approver1_name} — missing email`,
-                    },
-                    {
-                      label: "Approver 2",
-                      value: m => m.approver2_name
-                        ? (m.approver2_email
-                          ? `${m.approver2_name} <${m.approver2_email}>`
-                          : `${m.approver2_name} — missing email`)
-                        : "—",
-                    },
-                  ],
-                  async id => {
-                    await fetch(`/api/admin/approval-matrix/${id}`, { method: "DELETE" });
-                    await loadAdminPanel();
-                  },
-                  "id",
-                  entry => {
-                    openAdminEditor("Edit approval route", [
-                      {
-                        key: "company",
-                        label: "Invoice company",
-                        type: "select",
-                        options: includeCurrentOption(
-                          companyOptions(true),
-                          entry.company,
-                          entry.company === "*" ? "All invoice companies" : entry.company
-                        ),
-                        value: entry.company,
-                        required: true,
-                      },
-                      {
-                        key: "supplier",
-                        label: "Supplier company",
-                        type: "select",
-                        options: includeCurrentOption(
-                          supplierOptions(),
-                          entry.supplier
-                        ),
-                        value: entry.supplier,
-                        required: true,
-                      },
-                      {
-                        key: "approver1_name",
-                        label: "Approver 1 name",
-                        value: entry.approver1_name,
-                        required: true,
-                      },
-                      {
-                        key: "approver1_email",
-                        label: "Approver 1 email",
-                        type: "email",
-                        value: entry.approver1_email,
-                        required: true,
-                      },
-                      {
-                        key: "approver2_name",
-                        label: "Approver 2 name",
-                        value: entry.approver2_name,
-                        nullWhenBlank: true,
-                      },
-                      {
-                        key: "approver2_email",
-                        label: "Approver 2 email",
-                        type: "email",
-                        value: entry.approver2_email,
-                        nullWhenBlank: true,
-                      },
-                    ], async values => {
-                      await putJson(
-                        `/api/admin/approval-matrix/${entry.id}`,
-                        values
-                      );
-                      await loadAdminPanel();
-                    });
-                  }
-                );
+                renderAdminMatrixTable();
                 document.getElementById("admin-threshold-value").value = threshold.threshold ?? 0.8;
                 irjConfigurations = new Map(
                   irjSettings.map(setting => [setting.company, setting])
@@ -2807,17 +2930,41 @@ ${duplicates}
                 await loadAdminPanel();
               }
               await initActivityCursor();
+              stopPolling();
+              if (!document.hidden) {
+                connectLiveUpdates();
+                startPolling();
+              }
+            }
+
+            function startPolling() {
               if (activityPollTimer !== null) window.clearInterval(activityPollTimer);
               if (invoicePollTimer !== null) window.clearInterval(invoicePollTimer);
-              connectLiveUpdates();
               activityPollTimer = window.setInterval(pollActivity, 30000);
               invoicePollTimer = window.setInterval(loadInvoices, 120000);
             }
 
+            function stopPolling() {
+              if (activityPollTimer !== null) window.clearInterval(activityPollTimer);
+              if (invoicePollTimer !== null) window.clearInterval(invoicePollTimer);
+              activityPollTimer = null;
+              invoicePollTimer = null;
+            }
+
+            // Background tabs stop polling and close the live-update stream;
+            // returning to the tab refreshes once and resumes both.
             document.addEventListener("visibilitychange", () => {
-              if (document.visibilityState === "visible" && currentUser) {
+              if (!currentUser) return;
+              if (document.visibilityState === "visible") {
                 loadInvoices();
-                pollActivity();
+                pollActivity().then(() => {
+                  if (currentUser && !document.hidden) connectLiveUpdates();
+                });
+                startPolling();
+              } else {
+                stopPolling();
+                if (activityEventSource !== null) activityEventSource.close();
+                activityEventSource = null;
               }
             });
 
@@ -2844,12 +2991,12 @@ ${duplicates}
                 if (adminMatrixFilterTimer !== null) {
                   window.clearTimeout(adminMatrixFilterTimer);
                 }
-                adminMatrixFilterTimer = window.setTimeout(loadAdminPanel, 250);
+                adminMatrixFilterTimer = window.setTimeout(renderAdminMatrixTable, 250);
               }
             );
             document.getElementById("admin-matrix-email-filter").addEventListener(
               "change",
-              loadAdminPanel
+              renderAdminMatrixTable
             );
 
             document.getElementById("admin-companies-config").addEventListener(
