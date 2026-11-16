@@ -9,7 +9,15 @@ import pytest
 os.environ["INVOICE_PROCESSOR_SKIP_DOTENV"] = "1"
 for _name in list(os.environ):
     if _name.startswith(
-        ("OUTLOOK_MCP_", "AZURE_POSTGRES_", "SHAREPOINT_", "EXCEL_CONVERSION_")
+        (
+            "GRAPH_",
+            "OUTLOOK_MCP_",
+            "OUTLOOK_DOWNLOAD",
+            "OUTLOOK_MAX_",
+            "AZURE_POSTGRES_",
+            "SHAREPOINT_",
+            "EXCEL_CONVERSION_",
+        )
     ) or _name in {"DATABASE_URL", "INVOICE_EXTRACTION_MODEL", "AZURE_DOCUMENT_INTELLIGENCE_MODEL_ID"}:
         del os.environ[_name]
 

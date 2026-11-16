@@ -308,9 +308,9 @@ def create_app(
         required = (
             "SHAREPOINT_SITE_ID",
             "SHAREPOINT_DRIVE_ID",
-            "OUTLOOK_MCP_TENANT_ID",
-            "OUTLOOK_MCP_CLIENT_ID",
-            "OUTLOOK_MCP_CLIENT_SECRET",
+            "GRAPH_TENANT_ID",
+            "GRAPH_CLIENT_ID",
+            "GRAPH_CLIENT_SECRET",
         )
         missing = [name for name in required if not os.environ.get(name, "").strip()]
         if missing:

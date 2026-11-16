@@ -11,6 +11,11 @@ x-app: &app
   build: .
   image: invoice-processor:local
   env_file: .env
+  # Explicit values win over .env, so working files always land on the volume.
+  environment:
+    OUTLOOK_DOWNLOAD_DIR: /data/outlook_downloads
+    MANUAL_UPLOAD_DIR: /data/manual_uploads
+    SHAREPOINT_INVOICE_CACHE_DIR: /data/sharepoint_invoice_cache
   volumes:
     - invoice-data:/data
   restart: unless-stopped

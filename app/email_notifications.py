@@ -32,11 +32,11 @@ class EmailNotificationSettings:
         ).strip().casefold() in {"1", "true", "yes", "on"}
         sender = os.environ.get(
             "EMAIL_NOTIFICATION_SENDER",
-            os.environ.get("OUTLOOK_MCP_MAILBOX", ""),
+            os.environ.get("GRAPH_MAILBOX", ""),
         ).strip()
         if enabled and not sender:
             raise EmailNotificationError(
-                "EMAIL_NOTIFICATION_SENDER or OUTLOOK_MCP_MAILBOX is required "
+                "EMAIL_NOTIFICATION_SENDER or GRAPH_MAILBOX is required "
                 "when email notifications are enabled."
             )
         return cls(sender_mailbox=sender, enabled=enabled)

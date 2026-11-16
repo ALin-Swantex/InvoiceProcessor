@@ -228,9 +228,9 @@ class AzureInvoiceExtractor:
                 "Install the 'azure' optional dependencies before enabling "
                 "Document Intelligence."
             ) from error
-        tenant_id = os.environ.get("OUTLOOK_MCP_TENANT_ID", "").strip()
-        client_id = os.environ.get("OUTLOOK_MCP_CLIENT_ID", "").strip()
-        client_secret = os.environ.get("OUTLOOK_MCP_CLIENT_SECRET", "").strip()
+        tenant_id = os.environ.get("GRAPH_TENANT_ID", "").strip()
+        client_id = os.environ.get("GRAPH_CLIENT_ID", "").strip()
+        client_secret = os.environ.get("GRAPH_CLIENT_SECRET", "").strip()
         supplied_credentials = [tenant_id, client_id, client_secret]
         if any(supplied_credentials) and not all(supplied_credentials):
             raise DocumentIntelligenceConfigurationError(

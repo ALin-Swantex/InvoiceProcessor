@@ -97,10 +97,10 @@ class PostgresSettings:
         password = self.password
         if password is None:
             if credential is None:
-                tenant_id = os.environ.get("OUTLOOK_MCP_TENANT_ID", "").strip()
-                client_id = os.environ.get("OUTLOOK_MCP_CLIENT_ID", "").strip()
+                tenant_id = os.environ.get("GRAPH_TENANT_ID", "").strip()
+                client_id = os.environ.get("GRAPH_CLIENT_ID", "").strip()
                 client_secret = os.environ.get(
-                    "OUTLOOK_MCP_CLIENT_SECRET", ""
+                    "GRAPH_CLIENT_SECRET", ""
                 ).strip()
                 supplied = (tenant_id, client_id, client_secret)
                 if any(supplied) and not all(supplied):
@@ -167,9 +167,9 @@ def postgres_connection_factory(
     if resolved.password is not None:
         pool = _postgres_pool(resolved, *pool_settings)
     else:
-        tenant_id = os.environ.get("OUTLOOK_MCP_TENANT_ID", "").strip()
-        client_id = os.environ.get("OUTLOOK_MCP_CLIENT_ID", "").strip()
-        client_secret = os.environ.get("OUTLOOK_MCP_CLIENT_SECRET", "").strip()
+        tenant_id = os.environ.get("GRAPH_TENANT_ID", "").strip()
+        client_id = os.environ.get("GRAPH_CLIENT_ID", "").strip()
+        client_secret = os.environ.get("GRAPH_CLIENT_SECRET", "").strip()
         supplied = (tenant_id, client_id, client_secret)
         if any(supplied) and not all(supplied):
             raise ValueError(
