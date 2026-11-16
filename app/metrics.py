@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Iterable
 
+from app.approval_matrix import ALL_COMPANIES
 from app.invoices import InvoiceRecord
 from app.supplier_terms import SupplierTerms
 
@@ -146,7 +147,11 @@ def _matching_terms(
 ) -> SupplierTerms | None:
     company = (invoice.company or "").strip().casefold()
     supplier = (invoice.supplier or "").strip().casefold()
-    matches = terms_by_supplier.get((company, supplier), [])
+    # Company-specific terms win; otherwise use all-company ("*") terms, exactly
+    # as payment routing does in SupplierTermsStore.list_for_supplier.
+    matches = terms_by_supplier.get((company, supplier)) or terms_by_supplier.get(
+        (ALL_COMPANIES, supplier), []
+    )
     account = (invoice.supplier_account_number or "").strip().casefold()
     if account:
         for terms in matches:
