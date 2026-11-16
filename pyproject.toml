@@ -36,5 +36,8 @@ invoice-processor = "app.launcher:main"
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[tool.setuptools.package-data]
+app = ["static/*", "postgres_migrations/*.sql", "*.template"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
