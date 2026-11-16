@@ -12,6 +12,19 @@ AAD_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
 LOCAL_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 ConnectionFactory = Callable[[], object]
 
+# Pools created by this module, so short-lived commands (migrations, one-off
+# scripts) can close them explicitly instead of hanging on their worker threads.
+_OPEN_POOLS: list[object] = []
+
+
+def close_postgres_pools() -> None:
+    """Close every connection pool this process opened."""
+    while _OPEN_POOLS:
+        pool = _OPEN_POOLS.pop()
+        close = getattr(pool, "close", None)
+        if close is not None:
+            close()
+
 
 @dataclass(frozen=True)
 class PostgresSettings:
@@ -200,7 +213,7 @@ def _postgres_pool(
         )
     pool_module = importlib.import_module("psycopg_pool")
     rows = importlib.import_module("psycopg.rows")
-    return pool_module.ConnectionPool(
+    pool = pool_module.ConnectionPool(
         kwargs={
             **settings.connection_kwargs(),
             "row_factory": rows.dict_row,
@@ -212,6 +225,8 @@ def _postgres_pool(
         check=pool_module.ConnectionPool.check_connection,
         open=True,
     )
+    _OPEN_POOLS.append(pool)
+    return pool
 
 
 @lru_cache(maxsize=4)
@@ -242,7 +257,7 @@ def _entra_postgres_pool(
 
     kwargs = settings.connection_kwargs(credential=_NoPasswordCredential())
     kwargs.pop("password", None)
-    return pool_module.ConnectionPool(
+    pool = pool_module.ConnectionPool(
         connection_class=EntraConnection,
         kwargs={
             **kwargs,
@@ -256,6 +271,8 @@ def _entra_postgres_pool(
         check=pool_module.ConnectionPool.check_connection,
         open=True,
     )
+    _OPEN_POOLS.append(pool)
+    return pool
 
 
 class _NoPasswordCredential:
