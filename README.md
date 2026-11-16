@@ -212,8 +212,15 @@ uncertain or failing a check goes to Needs Review, and the Admin confidence
 threshold applies as before. The model and prompt version are recorded with each
 extraction.
 
-Set `ANTHROPIC_API_KEY` and, if you want, `EXTRACTION_MODEL` (default
-`claude-opus-5-5`) and `EXTRACTION_EFFORT`. With no key the application does
+Set `ANTHROPIC_API_KEY`. `EXTRACTION_MODEL` (default `claude-opus-5-5`) reads
+every invoice. Optionally set `EXTRACTION_ESCALATION_MODEL` (for example Sonnet
+as the first model and Opus as the escalation model): when the first model has
+difficulty (a required field missing, uncertain or failing a check, or it cannot
+read the document), the stronger model reads the invoice again and its answer is
+used. If the first model was confident about a field and the second reads it
+differently, the invoice goes to Needs Review. Escalated invoices cost two model
+calls, and the recorded model shows both (`first -> second`). Tune with
+`EXTRACTION_EFFORT` and `EXTRACTION_ESCALATION_EFFORT`. With no key the application does
 not guess: invoices wait in Needs Review. Invoice PDFs are sent to the Anthropic
 API (first and last page only for invoices over three pages), so confirm your
 data-handling terms before enabling it.

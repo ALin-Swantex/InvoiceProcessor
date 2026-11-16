@@ -13,7 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from functools import lru_cache
 from io import BytesIO
@@ -29,6 +29,7 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.80
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_EFFORT = "medium"
 DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_ESCALATION_EFFORT = "high"
 PROMPT_VERSION = "llm-v1"
 MAX_OUTPUT_TOKENS = 16000
 
@@ -50,6 +51,7 @@ REQUIRED_FIELDS = (
 # calibrate against reviewers' corrections, not measured probabilities.
 CERTAINTY_SCORES = {"high": 0.95, "medium": 0.70, "low": 0.40}
 UNEVIDENCED_CAP = 0.70  # a value with no supporting quote is never "high"
+DISAGREEMENT_CAP = 0.60  # two models read the same field differently
 
 
 class ExtractionConfigurationError(RuntimeError):
@@ -70,6 +72,16 @@ class ExtractionSettings:
     model: str = DEFAULT_MODEL
     effort: str = DEFAULT_EFFORT
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    # Optional second, stronger model used only when the first one has
+    # difficulty with an invoice. Blank means no escalation.
+    escalation_model: str = ""
+    escalation_effort: str = DEFAULT_ESCALATION_EFFORT
+
+    @property
+    def escalation_enabled(self) -> bool:
+        return bool(self.escalation_model.strip()) and (
+            self.escalation_model.strip() != self.model.strip()
+        )
 
     def validate(self) -> None:
         if self.provider != "anthropic":
@@ -81,6 +93,10 @@ class ExtractionSettings:
         if self.effort not in {"", "low", "medium", "high", "xhigh", "max"}:
             raise ExtractionConfigurationError(
                 "EXTRACTION_EFFORT must be low, medium, high, xhigh or max."
+            )
+        if self.escalation_effort not in {"", "low", "medium", "high", "xhigh", "max"}:
+            raise ExtractionConfigurationError(
+                "EXTRACTION_ESCALATION_EFFORT must be low, medium, high, xhigh or max."
             )
         if self.timeout_seconds <= 0:
             raise ExtractionConfigurationError(
@@ -177,6 +193,12 @@ def settings_from_environment() -> ExtractionSettings:
             else DEFAULT_EFFORT
         ),
         timeout_seconds=timeout,
+        escalation_model=os.environ.get("EXTRACTION_ESCALATION_MODEL", "").strip(),
+        escalation_effort=(
+            os.environ["EXTRACTION_ESCALATION_EFFORT"].strip().lower()
+            if "EXTRACTION_ESCALATION_EFFORT" in os.environ
+            else DEFAULT_ESCALATION_EFFORT
+        ),
     )
 
 
@@ -340,25 +362,82 @@ class ClaudeInvoiceExtractor:
             raise ExtractionError("The invoice is not a valid PDF.")
 
         analysis_bytes = self._pages_for_analysis(pdf_bytes)
-        response = self._request(analysis_bytes, reference)
-        data = self._parse(response)
-        return self._to_result(
-            data,
-            text_layer=_pdf_text(analysis_bytes),
-            reference=reference,
-        )
+        text_layer = _pdf_text(analysis_bytes)
+        settings = self.settings
+
+        first: ExtractionResult | None = None
+        first_error: ExtractionError | None = None
+        try:
+            first = self._extract_once(
+                analysis_bytes, text_layer, reference, settings.model, settings.effort
+            )
+        except ExtractionError as error:
+            # The document could not be read by the first model (cut-off answer,
+            # unreadable JSON, a refusal). A stronger model may do better.
+            if not settings.escalation_enabled:
+                raise
+            first_error = error
+
+        if not settings.escalation_enabled:
+            assert first is not None
+            return first
+        if first is not None and not _needs_escalation(first):
+            return first
+
+        try:
+            second = self._extract_once(
+                analysis_bytes,
+                text_layer,
+                reference,
+                settings.escalation_model,
+                settings.escalation_effort,
+            )
+        except (
+            ExtractionError,
+            ExtractionServiceError,
+            ExtractionConfigurationError,
+        ) as error:
+            if first is None:
+                raise
+            # Keep the first model's answer for a person to review rather than
+            # stalling the invoice because the stronger model was unavailable.
+            return _with_warning(
+                first,
+                f"A second opinion from {settings.escalation_model} was not "
+                f"available ({error}); please check this invoice carefully.",
+            )
+        return _combine(first, second, settings)
 
     # -- request -----------------------------------------------------------
 
-    def _request(self, pdf_bytes: bytes, reference: ReferenceData | None) -> Any:
+    def _extract_once(
+        self,
+        pdf_bytes: bytes,
+        text_layer: str,
+        reference: ReferenceData | None,
+        model: str,
+        effort: str,
+    ) -> ExtractionResult:
+        data = self._parse(self._request(pdf_bytes, reference, model, effort))
+        return self._to_result(
+            data, text_layer=text_layer, reference=reference, model=model
+        )
+
+    def _request(
+        self,
+        pdf_bytes: bytes,
+        reference: ReferenceData | None,
+        model: str,
+        effort: str,
+    ) -> Any:
         output_config: dict[str, Any] = {
             "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}
         }
-        if self.settings.effort:
-            output_config["effort"] = self.settings.effort
+        if effort:
+            output_config["effort"] = effort
         try:
             return self.client.messages.create(
-                model=self.settings.model,
+                model=model,
                 max_tokens=MAX_OUTPUT_TOKENS,
                 # Two system blocks: fixed rules, then the (rarely changing)
                 # names list, which is marked cacheable so repeat requests are
@@ -425,13 +504,14 @@ class ClaudeInvoiceExtractor:
         *,
         text_layer: str,
         reference: ReferenceData | None,
+        model: str,
     ) -> ExtractionResult:
         document_type = str(data.get("document_type") or "invoice")
         type_certainty = CERTAINTY_SCORES.get(
             str(data.get("document_type_certainty") or "low"), 0.40
         )
         reason = str(data.get("document_type_reason") or "").strip() or None
-        label = {"model": self.settings.model, "prompt_version": PROMPT_VERSION}
+        label = {"model": model, "prompt_version": PROMPT_VERSION}
 
         if document_type == "statement":
             return ExtractionResult(
@@ -555,6 +635,79 @@ class ClaudeInvoiceExtractor:
                 "Install the 'anthropic' package to enable AI extraction."
             ) from error
         return anthropic.Anthropic(timeout=settings.timeout_seconds, max_retries=2)
+
+
+def _needs_escalation(result: ExtractionResult) -> bool:
+    """True when the first model had difficulty with an invoice.
+
+    A statement is not a difficulty (it is routed on its own), and neither is a
+    note or credit-note remark: escalate only when a required field is missing,
+    uncertain or contradicted by a check, i.e. the overall confidence is below
+    the Admin threshold.
+    """
+    if result.document_type == "statement":
+        return False
+    return result.confidence < confidence_threshold()
+
+
+def _with_warning(result: ExtractionResult, warning: str) -> ExtractionResult:
+    return replace(result, warnings=(*result.warnings, warning), needs_review=True)
+
+
+def _same_value(a: object, b: object) -> bool:
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return round(float(a), 2) == round(float(b), 2)
+    return str(a).strip().casefold() == str(b).strip().casefold()
+
+
+def _combine(
+    first: ExtractionResult | None,
+    second: ExtractionResult,
+    settings: ExtractionSettings,
+) -> ExtractionResult:
+    """Use the stronger model's answer, flagging real disagreements.
+
+    The second model's result is authoritative. If the first model was confident
+    about a field and the second read something different, that conflict is a
+    reason for a person to look, so it caps the field and adds a warning. A field
+    the first model was unsure of is not a conflict: that is why we escalated.
+    """
+    label = f"{settings.model} -> {settings.escalation_model}"
+    if first is None or second.document_type == "statement":
+        return replace(second, model=label)
+
+    warnings = list(second.warnings)
+    scores = dict(second.field_confidences)
+    threshold = confidence_threshold()
+    for name in (*REQUIRED_FIELDS, "purchase_order_number"):
+        before, after = getattr(first, name), getattr(second, name)
+        if before is None or after is None or _same_value(before, after):
+            continue
+        if first.field_confidences.get(name, 0.0) < CERTAINTY_SCORES["medium"]:
+            continue
+        scores[name] = min(scores.get(name, 0.0), DISAGREEMENT_CAP)
+        warnings.append(
+            f"{settings.model} read {_display_name(name)} as '{before}' but "
+            f"{settings.escalation_model} read '{after}'; please check."
+        )
+        if scores[name] < threshold:
+            warnings.append(
+                f"'{_display_name(name)}' confidence {scores[name]:.0%} is below the "
+                f"{threshold:.0%} threshold."
+            )
+
+    required = [
+        0.0 if getattr(second, name) is None else scores.get(name, 0.0)
+        for name in REQUIRED_FIELDS
+    ]
+    return replace(
+        second,
+        model=label,
+        warnings=tuple(warnings),
+        field_confidences=scores,
+        confidence=min(required, default=0.0),
+        needs_review=bool(warnings),
+    )
 
 
 def _read_field(
