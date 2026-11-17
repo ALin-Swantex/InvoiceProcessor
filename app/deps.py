@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import asdict
 
 from fastapi import FastAPI, HTTPException, Response as FastAPIResponse
@@ -24,9 +25,9 @@ from app.company_folders import (
     CompanyFolderStructure,
     discover_company_folder_structures,
 )
-from app.invoice_lifecycle import InvoiceLifecycle
+from app.invoice_lifecycle import InvoiceLifecycle, InvoiceLifecycleError
 from app.invoices import InvoiceRecord
-from app.sharepoint import SharePointError
+from app.sharepoint import SharePointClient, SharePointError
 
 logger = logging.getLogger("invoice_processor")
 
@@ -61,6 +62,25 @@ def get_lifecycle(app: FastAPI) -> InvoiceLifecycle:
                 error,
             )
     return current
+
+
+def require_sharepoint_client(app: FastAPI) -> SharePointClient:
+    client = get_lifecycle(app).sharepoint_client
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="SharePoint is not configured or accessible.",
+        )
+    return client
+
+
+def lifecycle_action(action: Callable[..., InvoiceRecord], *args: object, **kwargs: object) -> dict[str, object]:
+    """Run a lifecycle step, reporting a workflow error as HTTP 422."""
+    try:
+        record = action(*args, **kwargs)
+    except InvoiceLifecycleError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return asdict(record)
 
 
 def sync_sharepoint_companies(app: FastAPI) -> list[CompanyProfile]:

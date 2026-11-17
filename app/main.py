@@ -20,7 +20,6 @@ from app.entra_auth import (
 )
 from app.companies import CompanyStore
 from app.config_db import SQLiteProcessConfigurationStore
-from app.deps import company_response as _company_response  # noqa: F401
 from app.environment import load_project_environment, project_path_from_environment
 from app.invoice_lifecycle import InvoiceLifecycle
 from app.invoices import InvoiceStore
@@ -35,34 +34,6 @@ from app.routers import (
     reference as reference_routes,
     statements as statement_routes,
     ui as ui_routes,
-)
-from app.schemas import (  # noqa: F401 -- re-exported for existing importers
-    ROLES_APPROVERS_ADMIN,
-    ROLES_PURCHASE_LEDGER_ADMIN,
-    ApprovalDecisionRequest,
-    ApprovalMatrixRequest,
-    ApprovalMatrixUpdateRequest,
-    CompanyRequest,
-    CompanyUpdateRequest,
-    ConfirmationRequest,
-    FlagReviewRequest,
-    ForeignAllocationRequest,
-    InvoiceConfirmRequest,
-    IrjConfigurationUpdateRequest,
-    LoginRequest,
-    PaymentRequest,
-    PaymentRouteRequest,
-    PoMatchRequest,
-    ReconciliationRequest,
-    RejectInvoiceRequest,
-    ResumeApprovalRequest,
-    ReviewDecisionRequest,
-    SageRegistrationRequest,
-    StatementFileRequest,
-    SupplierRequest,
-    SupplierTermsUpdateRequest,
-    SupplierUpdateRequest,
-    ThresholdUpdateRequest,
 )
 from app.sharepoint import SharePointClient
 from app.suppliers import SupplierStore

@@ -18,6 +18,7 @@ from app.deps import (
     invoice_for_user,
     invoice_is_visible_to_user,
     invoices_for_user,
+    lifecycle_action,
     require_assigned_approver,
 )
 from app.invoice_lifecycle import InvoiceExtractionUnavailableError, InvoiceLifecycleError
@@ -205,15 +206,12 @@ def register_invoice_in_sage(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).register_in_sage(
-            invoice_id,
-            irj_number=request.irj_number,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).register_in_sage,
+        invoice_id,
+        irj_number=request.irj_number,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/payment-route")
@@ -224,15 +222,12 @@ def choose_payment_route(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).route_for_payment(
-            invoice_id,
-            route=request.route,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).route_for_payment,
+        invoice_id,
+        route=request.route,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/retry-payment-route")
@@ -242,11 +237,7 @@ def retry_invoice_payment_route(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).auto_route_for_payment(invoice_id)
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(get_lifecycle(app).auto_route_for_payment, invoice_id)
 
 
 @router.post("/api/invoices/{invoice_id}/reject")
@@ -257,13 +248,10 @@ def reject_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).reject_invoice(
-            invoice_id, reason=request.reason, recorded_by=user.display_name
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).reject_invoice,
+        invoice_id, reason=request.reason, recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/cancel-duplicate")
@@ -273,13 +261,10 @@ def cancel_duplicate_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).cancel_confirmed_duplicate(
-            invoice_id, recorded_by=user.display_name
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).cancel_confirmed_duplicate,
+        invoice_id, recorded_by=user.display_name,
+    )
 
 
 @router.get("/api/invoices/{invoice_id}")
@@ -426,13 +411,10 @@ def route_foreign_payment(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).route_as_foreign_payment(
-            invoice_id, recorded_by=user.display_name
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).route_as_foreign_payment,
+        invoice_id, recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/allocate-foreign-payment")
@@ -443,16 +425,13 @@ def allocate_foreign_payment(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).mark_foreign_allocated(
-            invoice_id,
-            allocation_date=request.allocation_date,
-            allocation_reference=request.allocation_reference,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).mark_foreign_allocated,
+        invoice_id,
+        allocation_date=request.allocation_date,
+        allocation_reference=request.allocation_reference,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/revert-foreign-payment")
@@ -462,13 +441,10 @@ def revert_foreign_payment(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).revert_foreign_payment_route(
-            invoice_id, recorded_by=user.display_name
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).revert_foreign_payment_route,
+        invoice_id, recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/confirm")
@@ -479,23 +455,20 @@ def confirm_and_route_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).confirm_and_route(
-            invoice_id,
-            company=request.company,
-            supplier=request.supplier,
-            supplier_invoice_number=request.supplier_invoice_number,
-            purchase_order_number=request.purchase_order_number,
-            invoice_date=request.invoice_date,
-            invoice_value=request.invoice_value,
-            currency=request.currency,
-            override_duplicate=request.override_duplicate,
-            recorded_by=user.display_name,
-            correction_reason=request.correction_reason,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).confirm_and_route,
+        invoice_id,
+        company=request.company,
+        supplier=request.supplier,
+        supplier_invoice_number=request.supplier_invoice_number,
+        purchase_order_number=request.purchase_order_number,
+        invoice_date=request.invoice_date,
+        invoice_value=request.invoice_value,
+        currency=request.currency,
+        override_duplicate=request.override_duplicate,
+        recorded_by=user.display_name,
+        correction_reason=request.correction_reason,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/po-match")
@@ -506,18 +479,15 @@ def po_match_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).record_po_match(
-            invoice_id,
-            matched=request.matched,
-            notes=request.notes,
-            query_category=request.query_category,
-            purchasing_contact=request.purchasing_contact,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).record_po_match,
+        invoice_id,
+        matched=request.matched,
+        notes=request.notes,
+        query_category=request.query_category,
+        purchasing_contact=request.purchasing_contact,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/approve")
@@ -541,17 +511,14 @@ def approve_invoice(
             status_code=403, detail="Approver 2 can only decide level-2 approvals."
         )
     require_assigned_approver(app, invoice_id, user, request.level)
-    try:
-        record = get_lifecycle(app).decide_approval(
-            invoice_id,
-            level=request.level,
-            decision=request.decision,
-            comments=request.comments,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).decide_approval,
+        invoice_id,
+        level=request.level,
+        decision=request.decision,
+        comments=request.comments,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/resume-approval")
@@ -562,15 +529,12 @@ def resume_approval_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).resume_approval(
-            invoice_id,
-            resolution_notes=request.resolution_notes,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).resume_approval,
+        invoice_id,
+        resolution_notes=request.resolution_notes,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/flag-review")
@@ -581,11 +545,7 @@ def flag_invoice_for_review(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).flag_for_review(invoice_id, reason=request.reason)
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(get_lifecycle(app).flag_for_review, invoice_id, reason=request.reason)
 
 
 @router.post("/api/invoices/{invoice_id}/review-decision")
@@ -596,16 +556,13 @@ def decide_flagged_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).resolve_flagged_review(
-            invoice_id,
-            accepted=request.accepted,
-            reason=request.reason,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).resolve_flagged_review,
+        invoice_id,
+        accepted=request.accepted,
+        reason=request.reason,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/reject-flagged")
@@ -616,15 +573,12 @@ def reject_flagged_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).reject_flagged_invoice(
-            invoice_id,
-            reason=request.reason,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).reject_flagged_invoice,
+        invoice_id,
+        reason=request.reason,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/file-statement")
@@ -635,15 +589,12 @@ def file_supplier_statement(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).file_statement(
-            invoice_id,
-            company=request.company,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).file_statement,
+        invoice_id,
+        company=request.company,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/mark-as-invoice")
@@ -653,14 +604,11 @@ def mark_document_as_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).mark_as_invoice(
-            invoice_id,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).mark_as_invoice,
+        invoice_id,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/pay")
@@ -671,18 +619,15 @@ def pay_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).mark_paid(
-            invoice_id,
-            payment_date=request.payment_date,
-            supplier_account_number=request.supplier_account_number,
-            payment_reference=request.payment_reference,
-            payment_method=request.payment_method,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).mark_paid,
+        invoice_id,
+        payment_date=request.payment_date,
+        supplier_account_number=request.supplier_account_number,
+        payment_reference=request.payment_reference,
+        payment_method=request.payment_method,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/invoices/{invoice_id}/reconcile")
@@ -693,16 +638,13 @@ def reconcile_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    try:
-        record = get_lifecycle(app).mark_reconciled(
-            invoice_id,
-            reconciliation_date=request.reconciliation_date,
-            notes=request.notes,
-            recorded_by=user.display_name,
-        )
-    except InvoiceLifecycleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return asdict(record)
+    return lifecycle_action(
+        get_lifecycle(app).mark_reconciled,
+        invoice_id,
+        reconciliation_date=request.reconciliation_date,
+        notes=request.notes,
+        recorded_by=user.display_name,
+    )
 
 
 @router.post("/api/workflow/confirm")
