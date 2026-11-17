@@ -21,6 +21,7 @@ python3 -m app.outlook_worker                          # Outlook/SharePoint work
 python3 -m app.postgres_migrate                        # apply DB migrations
 python3 -m app.demo                                    # sample data, local login, no cloud (never touches .env)
 python3 -m scripts.check_live_azure [--extraction]     # read-only live checks; --extraction makes one small paid AI call
+python3 -m scripts.sort_mailbox_pdfs --output DIR [--dry-run]   # one-off: save mailbox PDFs into Company/Supplier folders (read-only on the mailbox; --dry-run sends nothing)
 docker compose up -d --build                           # web + worker; `--profile tools run --rm migrate`; `--profile demo up demo`
 ```
 
