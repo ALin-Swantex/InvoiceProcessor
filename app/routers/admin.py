@@ -37,6 +37,7 @@ from app.schemas import (
     SupplierRequest,
     SupplierTermsUpdateRequest,
     SupplierUpdateRequest,
+    AutoConfirmUpdateRequest,
     ThresholdUpdateRequest,
 )
 from app.sharepoint import SharePointError
@@ -475,6 +476,26 @@ def admin_set_ai_threshold(
         "ai_confidence_threshold", str(request.threshold)
     )
     return {"threshold": request.threshold}
+
+
+@router.get("/api/admin/ai-auto-confirm")
+def admin_get_ai_auto_confirm(
+    http_request: Request, user: User = Depends(require_role(ROLE_ADMIN))
+) -> dict[str, bool]:
+    store = http_request.app.state.process_configuration_store
+    return {"enabled": str(store.get("ai_auto_confirm", "false")).strip().casefold() == "true"}
+
+
+@router.put("/api/admin/ai-auto-confirm")
+def admin_set_ai_auto_confirm(
+    http_request: Request,
+    request: AutoConfirmUpdateRequest,
+    user: User = Depends(require_role(ROLE_ADMIN)),
+) -> dict[str, bool]:
+    http_request.app.state.process_configuration_store.set(
+        "ai_auto_confirm", "true" if request.enabled else "false"
+    )
+    return {"enabled": request.enabled}
 
 
 @router.put("/api/admin/irj-configurations/{company_name}")

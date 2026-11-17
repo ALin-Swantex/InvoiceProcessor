@@ -1485,3 +1485,17 @@ def test_duplicate_invoice_is_flagged_when_invoice_number_is_blank(
         f"It's a duplicate of IRJ {confirm1.json()['irj_number']}"
     )
     assert "matched on matching filename and file size" in body["review_reason"]
+
+
+def test_auto_confirm_switch_is_admin_only_and_off_by_default(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    login(client, "purchase.ledger", "ChangeMe-PL1!")
+    assert client.get("/api/admin/ai-auto-confirm").status_code == 403
+    assert client.put("/api/admin/ai-auto-confirm", json={"enabled": True}).status_code == 403
+
+    login(client, "admin", "ChangeMe-Admin1!")
+    assert client.get("/api/admin/ai-auto-confirm").json() == {"enabled": False}
+    assert client.put("/api/admin/ai-auto-confirm", json={"enabled": True}).json() == {"enabled": True}
+    assert client.get("/api/admin/ai-auto-confirm").json() == {"enabled": True}
+    client.put("/api/admin/ai-auto-confirm", json={"enabled": False})
+    assert client.get("/api/admin/ai-auto-confirm").json() == {"enabled": False}

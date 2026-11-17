@@ -185,6 +185,10 @@ class ThresholdUpdateRequest(BaseModel):
     threshold: float
 
 
+class AutoConfirmUpdateRequest(BaseModel):
+    enabled: bool
+
+
 class IrjConfigurationUpdateRequest(BaseModel):
     mode: str
     current_irj: str | None = None

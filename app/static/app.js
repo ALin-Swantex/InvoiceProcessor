@@ -3112,6 +3112,7 @@
             }
 
             async function loadAdminPanel() {
+              loadAutoConfirmSetting();
               try {
                 const [companies, suppliers, matrix, supplierTerms, threshold, irjSettings] = await Promise.all([
                   fetchAdminJson("/api/admin/companies"),
@@ -3631,6 +3632,39 @@ ${duplicates}
               } catch (error) {
                 setFormError(form, error.message);
               }
+              });
+            });
+
+            async function loadAutoConfirmSetting() {
+              try {
+                const response = await fetch("/api/admin/ai-auto-confirm");
+                if (!response.ok) return;
+                const body = await response.json();
+                document.getElementById("admin-auto-confirm").checked = Boolean(body.enabled);
+              } catch (error) {
+                // The switch keeps its previous state; the next panel load retries.
+              }
+            }
+
+            document.getElementById("admin-auto-confirm-form").addEventListener("submit", async event => {
+              event.preventDefault();
+              const form = event.target;
+              setFormError(form, "");
+              await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
+                try {
+                  const enabled = document.getElementById("admin-auto-confirm").checked;
+                  const response = await fetch("/api/admin/ai-auto-confirm", {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ enabled }),
+                  });
+                  if (!response.ok) throw new Error("Failed to save the setting.");
+                  showToast(enabled
+                    ? "Confident invoices will now be confirmed automatically."
+                    : "Every invoice will now wait for Purchase Ledger confirmation.");
+                } catch (error) {
+                  setFormError(form, error.message);
+                }
               });
             });
 

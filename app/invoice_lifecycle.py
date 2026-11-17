@@ -68,6 +68,9 @@ def _is_unique_violation(error: BaseException) -> bool:
     return type(error).__name__ == "UniqueViolation"
 
 
+AUTO_CONFIRM_ACTOR = "AI auto-confirm"
+
+
 class InvoiceExtractionUnavailableError(InvoiceLifecycleError):
     pass
 
@@ -547,8 +550,9 @@ class InvoiceLifecycle:
                 invoice_id=invoice_id,
             )
             return record
-        # Reached only once real AI extraction is connected and confident.
-        return self.invoice_store.update_fields(
+        # Reached only when extraction is confident: every required field read,
+        # no warnings, no duplicate, company and supplier known.
+        record = self.invoice_store.update_fields(
             invoice_id,
             company=company,
             supplier=supplier,
@@ -576,6 +580,52 @@ class InvoiceLifecycle:
             ),
             **extraction_metadata,
         )
+        if self._auto_confirm_enabled():
+            return self._auto_confirm(record, result)
+        return record
+
+    def _auto_confirm_enabled(self) -> bool:
+        if self.configuration_getter is None:
+            return False
+        value = self.configuration_getter("ai_auto_confirm", "false")
+        return str(value).strip().casefold() == "true"
+
+    def _auto_confirm(
+        self, record: InvoiceRecord, result: ExtractionResult
+    ) -> InvoiceRecord:
+        """Route a confident invoice on without waiting for Purchase Ledger.
+
+        confirm_and_route repeats the duplicate, invoice-number and approver
+        checks. If any of them refuses, the invoice simply stays in Needs
+        Review with the reason, exactly as when auto-confirm is off."""
+        try:
+            return self.confirm_and_route(
+                record.id,
+                company=record.company or "",
+                supplier=record.supplier or "",
+                supplier_invoice_number=record.supplier_invoice_number,
+                purchase_order_number=record.po_number,
+                invoice_date=record.invoice_date,
+                invoice_value=record.invoice_value,
+                currency=record.currency,
+                recorded_by=AUTO_CONFIRM_ACTOR,
+            )
+        except InvoiceLifecycleError as error:
+            held = self.invoice_store.update_fields(
+                record.id,
+                status="Needs Review",
+                review_reason=f"Automatic confirmation was not possible: {error}",
+            )
+            self.activity_feed.add_event(
+                event_type="needs_review",
+                target_role=ROLE_PURCHASE_LEDGER,
+                message=(
+                    f"Invoice {record.original_filename} could not be confirmed "
+                    "automatically and needs manual confirmation."
+                ),
+                invoice_id=record.id,
+            )
+            return held
 
     # ------------------------------------------------------------------
     # Stage 2: Purchase Ledger confirmation, IRJ numbering, routing, filing

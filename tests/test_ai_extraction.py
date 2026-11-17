@@ -856,3 +856,82 @@ def test_escalation_settings_come_from_the_environment(
             ExtractionSettings(escalation_effort="extreme"),
             client=FakeClient(llm_data()),
         )
+
+
+# --- automatic confirmation of confident invoices -------------------------------
+
+
+def _with_auto_confirm(lifecycle: InvoiceLifecycle, enabled: bool) -> list[dict[str, Any]]:
+    """Switch the setting and record confirm_and_route calls instead of routing."""
+    lifecycle.configuration_getter = lambda key, default=None: (
+        "true" if enabled and key == "ai_auto_confirm" else default
+    )
+    calls: list[dict[str, Any]] = []
+
+    def fake_confirm(invoice_id: int, **kwargs: Any) -> Any:
+        calls.append({"invoice_id": invoice_id, **kwargs})
+        return lifecycle.invoice_store.update_fields(invoice_id, status="Awaiting PO Matching")
+
+    lifecycle.confirm_and_route = fake_confirm  # type: ignore[method-assign]
+    return calls
+
+
+def test_confident_invoice_is_confirmed_automatically_when_switched_on(
+    tmp_path: Path,
+) -> None:
+    extractor, _ = extractor_for(llm_data())
+    lifecycle, _, invoice_id = lifecycle_for(tmp_path, extractor)
+    calls = _with_auto_confirm(lifecycle, True)
+
+    result = lifecycle.run_extraction(invoice_id)
+
+    assert result.status == "Awaiting PO Matching"
+    assert len(calls) == 1
+    assert calls[0]["recorded_by"] == "AI auto-confirm"
+    assert calls[0]["supplier_invoice_number"] == "INV-1001"
+    assert calls[0]["invoice_value"] == 1250.75
+
+
+def test_confident_invoice_still_waits_for_review_when_switched_off(
+    tmp_path: Path,
+) -> None:
+    extractor, _ = extractor_for(llm_data())
+    lifecycle, _, invoice_id = lifecycle_for(tmp_path, extractor)
+    calls = _with_auto_confirm(lifecycle, False)
+
+    result = lifecycle.run_extraction(invoice_id)
+
+    assert result.status == "Needs Review"
+    assert calls == []
+
+
+def test_doubtful_invoice_is_never_auto_confirmed(tmp_path: Path) -> None:
+    extractor, _ = extractor_for(llm_data(invoice_value=field(1250.75, "medium")))
+    lifecycle, _, invoice_id = lifecycle_for(tmp_path, extractor)
+    calls = _with_auto_confirm(lifecycle, True)
+
+    result = lifecycle.run_extraction(invoice_id)
+
+    assert result.status == "Needs Review"
+    assert calls == []
+
+
+def test_refused_auto_confirmation_leaves_invoice_in_needs_review_with_reason(
+    tmp_path: Path,
+) -> None:
+    from app.invoice_lifecycle import InvoiceLifecycleError
+
+    extractor, _ = extractor_for(llm_data())
+    lifecycle, _, invoice_id = lifecycle_for(tmp_path, extractor)
+    _with_auto_confirm(lifecycle, True)
+
+    def refuse(invoice_id: int, **kwargs: Any) -> Any:
+        raise InvoiceLifecycleError("No approver is configured.")
+
+    lifecycle.confirm_and_route = refuse  # type: ignore[method-assign]
+
+    result = lifecycle.run_extraction(invoice_id)
+
+    assert result.status == "Needs Review"
+    assert "Automatic confirmation was not possible" in str(result.review_reason)
+    assert "No approver is configured." in str(result.review_reason)
