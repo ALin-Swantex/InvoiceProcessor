@@ -153,3 +153,16 @@ def test_limit_caps_how_many_pdfs_are_handled(tmp_path: Path) -> None:
     counts = run(client, output=tmp_path, reference=REFERENCE, limit=2, dry_run=True)
 
     assert counts["found"] == 2
+
+
+def test_download_only_saves_every_pdf_by_month_without_reading_any(tmp_path: Path) -> None:
+    client = FakeClient({"one": pdf("1"), "two": pdf("2")})
+
+    counts = run(
+        client, output=tmp_path, reference=None, download_only=True, workers=1,
+        extractor=lambda *a, **k: pytest.fail("nothing may be sent to Claude"),
+    )
+
+    assert counts["saved"] == 2 and counts["unreadable"] == 0
+    names = sorted(p.name for p in (tmp_path / "2026-03").iterdir())
+    assert names == ["2026-03-02_x@y.test_one.pdf", "2026-03-02_x@y.test_two.pdf"]

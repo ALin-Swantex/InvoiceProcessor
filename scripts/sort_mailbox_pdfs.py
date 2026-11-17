@@ -14,6 +14,7 @@ already-sorted attachments are skipped.
 
     python -m scripts.sort_mailbox_pdfs --output ~/Desktop/sorted --dry-run
     python -m scripts.sort_mailbox_pdfs --output ~/Desktop/sorted --limit 25
+    python -m scripts.sort_mailbox_pdfs --output ~/Desktop/all-pdfs --download-only
 
 Each PDF read is a paid API call and the invoice leaves your network, so the
 script shows the count and asks before sending anything (``--yes`` skips that).
@@ -248,10 +249,12 @@ def process(
     *,
     client: Any,
     reference: ReferenceData | None,
-    extractor: Callable[..., ExtractionResult],
+    extractor: Callable[..., ExtractionResult] | None,
 ) -> tuple[bytes, ExtractionResult | None, str]:
     """Download and read one PDF (runs in a worker thread; touches no files)."""
     content = download(client, attachment)
+    if extractor is None:  # download only: nothing is read or sent anywhere
+        return content, None, ""
     try:
         return content, read_pdf(content, reference, extractor), ""
     except ExtractionError as error:  # unreadable: keep the PDF, in _Unreadable
@@ -267,6 +270,7 @@ def save(
     output: Path,
     reference: ReferenceData | None,
     ledger: Ledger,
+    download_only: bool = False,
 ) -> str:
     digest = hashlib.sha256(content).hexdigest()
     row: dict[str, Any] = {
@@ -280,9 +284,18 @@ def save(
         row["note"] = "identical PDF already saved; not copied again"
         ledger.record(attachment, digest, ledger.hashes[digest], row)
         return "duplicate"
-    folder = output / destination(result, reference)
+    if download_only:  # plain copy of the mailbox: one folder per month
+        folder = output / safe_part(attachment.received[:7], "undated")
+        name = (
+            f"{safe_part(attachment.received[:10], 'undated')}_"
+            f"{safe_part(attachment.sender, 'sender')}_"
+            f"{safe_part(Path(attachment.name).stem, 'invoice')}.pdf"
+        )
+    else:
+        folder = output / destination(result, reference)
+        name = file_name(result, attachment)
     folder.mkdir(parents=True, exist_ok=True)
-    target = free_path(folder, file_name(result, attachment))
+    target = free_path(folder, name)
     target.write_bytes(content)
     relative = str(target.relative_to(output))
     if result is not None:
@@ -297,7 +310,7 @@ def save(
         row["note"] = note
     row["saved_as"] = relative
     ledger.record(attachment, digest, relative, row)
-    return "saved" if result is not None else "unreadable"
+    return "saved" if (result is not None or download_only) else "unreadable"
 
 
 def run(
@@ -311,6 +324,7 @@ def run(
     limit: int = 25,
     workers: int = 3,
     dry_run: bool = False,
+    download_only: bool = False,
     confirm: Callable[[int], bool] = lambda count: True,
     say: Callable[[str], None] = print,
 ) -> dict[str, int]:
@@ -329,7 +343,10 @@ def run(
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {
-            pool.submit(process, item, client=client, reference=reference, extractor=extractor): item
+            pool.submit(
+                process, item, client=client, reference=reference,
+                extractor=None if download_only else extractor,
+            ): item
             for item in items
         }
         for number, future in enumerate(as_completed(futures), start=1):
@@ -340,7 +357,10 @@ def run(
                 counts["failed"] += 1
                 say(f"[{number}/{len(items)}] {item.name}: not done ({error}); it will be retried on the next run.")
                 continue
-            outcome = save(item, content, result, note, output=output, reference=reference, ledger=ledger)
+            outcome = save(
+                item, content, result, note, output=output, reference=reference,
+                ledger=ledger, download_only=download_only,
+            )
             counts[outcome] += 1
             say(f"[{number}/{len(items)}] {item.name}: {outcome}")
     return counts
@@ -371,7 +391,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path, help="folder to save into (outside the repository)")
     parser.add_argument("--folder", default="inbox", help="mail folder name, or 'all' for the whole mailbox (default: inbox)")
     parser.add_argument("--since", help="only mail received on or after this date (YYYY-MM-DD)")
-    parser.add_argument("--limit", type=int, default=25, help="most PDFs to sort this run (default 25: a small trial)")
+    parser.add_argument("--limit", type=int, default=None, help="most PDFs to handle this run (default 25 when reading with Claude: a small trial; no limit with --download-only)")
+    parser.add_argument("--download-only", action="store_true", help="just save every PDF into one folder per month; nothing is read by Claude, nothing is sent anywhere, no cost")
     parser.add_argument("--workers", type=int, default=3, help="PDFs read at the same time (default 3)")
     parser.add_argument("--dry-run", action="store_true", help="only count the PDFs; download and send nothing")
     parser.add_argument("--yes", action="store_true", help="do not ask before sending PDFs to Claude")
@@ -379,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     load_project_environment()
-    if not args.dry_run and not ai_extraction_configured():
+    if not args.dry_run and not args.download_only and not ai_extraction_configured():
         print("AI extraction is not configured: set ANTHROPIC_API_KEY in .env first.")
         return 2
     since = (
@@ -388,8 +409,9 @@ def main(argv: list[str] | None = None) -> int:
     from app.outlook_graph import graph_client_from_environment
 
     client = graph_client_from_environment()
-    reference = None if args.no_register else load_reference()
-    if reference is None and not args.no_register:
+    skip_register = args.no_register or args.download_only
+    reference = None if skip_register else load_reference()
+    if reference is None and not skip_register:
         print("Continuing without the lists: names will be used as printed.")
 
     def confirm(count: int) -> bool:
@@ -400,9 +422,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return answer.strip().casefold() in {"y", "yes"}
 
+    limit = args.limit if args.limit is not None else (10**9 if args.download_only else 25)
     counts = run(
         client, output=args.output, reference=reference, folder=args.folder, since=since,
-        limit=args.limit, workers=args.workers, dry_run=args.dry_run, confirm=confirm,
+        limit=limit, workers=args.workers, dry_run=args.dry_run,
+        download_only=args.download_only,
+        confirm=(lambda count: True) if args.download_only else confirm,
     )
     print(counts)
     return 0
