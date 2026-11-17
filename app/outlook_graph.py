@@ -12,7 +12,6 @@ from urllib.parse import quote
 import httpx
 
 from app.graph_http import (
-    GRAPH_BASE_URL as GRAPH_BASE_URL,  # re-exported for existing importers
     GraphSession,
     MsalClientCredentialTokenProvider,
     shared_token_provider,
