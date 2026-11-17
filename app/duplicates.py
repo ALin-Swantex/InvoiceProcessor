@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.invoices import InvoiceRecord, InvoiceStore
+from app.invoices import InvoiceStore
 
 
 # ---------------------------------------------------------------------------

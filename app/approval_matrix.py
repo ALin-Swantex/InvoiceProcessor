@@ -260,9 +260,5 @@ def _store() -> ApprovalMatrixStore:
     return _default_store
 
 
-def list_matrix() -> list[ApprovalMatrixEntry]:
-    return _store().list()
-
-
 def find_approvers(company: str, supplier: str) -> ApprovalMatrixEntry | None:
     return _store().find(company, supplier)
