@@ -184,6 +184,29 @@ class PostgresInvoiceStore:
             (statuses, limit),
         )
 
+    def list_all_with_status(self, statuses: list[str]) -> list[InvoiceRecord]:
+        """Every invoice in the given statuses (no row limit)."""
+        if not statuses:
+            return []
+        return self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices "
+            "WHERE status = ANY(%s) ORDER BY created_at DESC",
+            (list(statuses),),
+        )
+
+    def highest_irj_number(self, company: str) -> int | None:
+        """The highest all-digit IRJ number assigned to the company, if any."""
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT max(CASE WHEN irj_number ~ '^[0-9]+$' "
+                    "THEN irj_number::bigint END) AS highest FROM invoices "
+                    "WHERE lower(company) = lower(%s)",
+                    (company,),
+                )
+                row = cursor.fetchone()
+        return int(row["highest"]) if row and row["highest"] is not None else None
+
     def get(self, invoice_id: int) -> InvoiceRecord | None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:

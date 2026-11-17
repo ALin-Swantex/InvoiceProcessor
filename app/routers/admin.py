@@ -504,20 +504,13 @@ def admin_set_irj_configuration(
                 status_code=422,
                 detail="The latest paper IRJ must contain exactly six digits.",
             )
-        assigned = [
-            int(invoice.irj_number)
-            for invoice in app.state.invoice_store.list_all()
-            if invoice.company
-            and invoice.company.casefold() == company.name.casefold()
-            and invoice.irj_number
-            and invoice.irj_number.isdigit()
-        ]
-        if assigned and int(current_irj) < max(assigned):
+        highest = app.state.invoice_store.highest_irj_number(company.name)
+        if highest is not None and int(current_irj) < highest:
             raise HTTPException(
                 status_code=422,
                 detail=(
                     f"The latest paper IRJ cannot be below the highest "
-                    f"digitally assigned IRJ ({max(assigned):06d})."
+                    f"digitally assigned IRJ ({highest:06d})."
                 ),
             )
         app.state.irj_generator.set_current(company.name, current_irj)

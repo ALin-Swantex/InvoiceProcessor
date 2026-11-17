@@ -267,11 +267,11 @@ class InvoiceLifecycle:
         """Send due recurring approval reminders and retry rejection notices."""
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         sent = 0
-        for invoice in self.invoice_store.list_all():
+        for invoice in self.invoice_store.list_all_with_status(
+            ["Rejected", "Awaiting Approval 1", "Awaiting Approval 2"]
+        ):
             if invoice.status == "Rejected":
                 self._notify_purchase_ledger_rejection(invoice)
-                continue
-            if invoice.status not in ("Awaiting Approval 1", "Awaiting Approval 2"):
                 continue
             level = 1 if invoice.status.endswith("1") else 2
             recipient = getattr(invoice, f"approver{level}_email")

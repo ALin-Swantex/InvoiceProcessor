@@ -329,6 +329,30 @@ class InvoiceStore:
             ).fetchall()
         return [InvoiceRecord(**dict(row)) for row in rows]
 
+    def list_all_with_status(self, statuses: list[str]) -> list[InvoiceRecord]:
+        """Every invoice in the given statuses (no row limit)."""
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM invoices WHERE status IN ({placeholders}) "
+                "ORDER BY created_at DESC",
+                tuple(statuses),
+            ).fetchall()
+        return [InvoiceRecord(**dict(row)) for row in rows]
+
+    def highest_irj_number(self, company: str) -> int | None:
+        """The highest all-digit IRJ number assigned to the company, if any."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT irj_number FROM invoices "
+                "WHERE lower(company) = lower(?) AND irj_number IS NOT NULL",
+                (company,),
+            ).fetchall()
+        numbers = [int(r[0]) for r in rows if str(r[0]).isdigit()]
+        return max(numbers) if numbers else None
+
     def get(self, invoice_id: int) -> InvoiceRecord | None:
         with self._connect() as connection:
             row = connection.execute(
