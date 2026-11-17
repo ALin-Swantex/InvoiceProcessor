@@ -170,10 +170,6 @@ def confidence_threshold(
     return min(max(value, 0.0), 1.0)
 
 
-def meets_confidence_threshold(confidence: float) -> bool:
-    return confidence >= confidence_threshold()
-
-
 def settings_from_environment() -> ExtractionSettings:
     try:
         timeout = float(
@@ -366,17 +362,15 @@ class ClaudeInvoiceExtractor:
         settings = self.settings
 
         first: ExtractionResult | None = None
-        first_error: ExtractionError | None = None
         try:
             first = self._extract_once(
                 analysis_bytes, text_layer, reference, settings.model, settings.effort
             )
-        except ExtractionError as error:
+        except ExtractionError:
             # The document could not be read by the first model (cut-off answer,
             # unreadable JSON, a refusal). A stronger model may do better.
             if not settings.escalation_enabled:
                 raise
-            first_error = error
 
         if not settings.escalation_enabled:
             assert first is not None

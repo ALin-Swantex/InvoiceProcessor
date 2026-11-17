@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
-from app.invoices import InvoiceRecord
+from app.invoices import InvoiceRecord, InvoiceStore
 from app.postgres_settings import (
     ConnectionFactory,
     PostgresSettings,
@@ -339,32 +339,14 @@ class PostgresInvoiceStore:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= maximum:
             raise ValueError(f"Invoice limit must be between 1 and {maximum}.")
 
-    @staticmethod
-    def _required_string(data: dict[str, object], key: str) -> str:
-        value = data.get(key)
-        if not isinstance(value, str) or not value:
-            raise ValueError(f"Outlook data is missing required field '{key}'.")
-        return value
-
-    @staticmethod
-    def _optional_string(value: object) -> str | None:
-        return value if isinstance(value, str) else None
+    _required_string = staticmethod(InvoiceStore._required_string)
+    _optional_string = staticmethod(InvoiceStore._optional_string)
 
     @staticmethod
     def _optional_int(value: object) -> int | None:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    @classmethod
-    def _sender(cls, message: dict[str, object]) -> tuple[str | None, str | None]:
-        sender = message.get("from")
-        if not isinstance(sender, dict):
-            return None, None
-        email = sender.get("emailAddress")
-        if not isinstance(email, dict):
-            return None, None
-        return cls._optional_string(email.get("name")), cls._optional_string(
-            email.get("address")
-        )
+    _sender = InvoiceStore._sender
 
 
 def create_postgres_invoice_store(
