@@ -61,10 +61,6 @@ def _default_sleep(seconds: float) -> None:
 sleep_function: Callable[[float], None] = _default_sleep
 
 
-class GraphResponseTooLarge(Exception):
-    """Internal marker: a streamed body exceeded its byte limit."""
-
-
 class MsalClientCredentialTokenProvider:
     """Client-credential token provider for Microsoft Graph.
 
