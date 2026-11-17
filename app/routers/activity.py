@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -51,6 +52,21 @@ def activity_latest(
     return {"latest_id": int(http_request.app.state.activity_feed.latest_id())}
 
 
+STREAM_TICK_SECONDS = 0.5
+
+
+async def _latest_activity_id(app) -> int:
+    """Newest event id, looked up at most once per tick however many browsers
+    are connected, so a faster tick does not multiply database queries."""
+    cached = getattr(app.state, "_latest_activity_cache", None)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < STREAM_TICK_SECONDS * 0.8:
+        return cached[1]
+    value = await asyncio.to_thread(app.state.activity_feed.latest_id)
+    app.state._latest_activity_cache = (now, value)
+    return value
+
+
 @router.get("/api/activity/stream")
 async def activity_stream(
     request: Request,
@@ -64,19 +80,17 @@ async def activity_stream(
         cursor = since_id
         heartbeat_ticks = 0
         while not await request.is_disconnected():
-            latest = await asyncio.to_thread(
-                app.state.activity_feed.latest_id
-            )
+            latest = await _latest_activity_id(app)
             if latest > cursor:
                 cursor = latest
                 yield f"event: invoice-update\ndata: {cursor}\n\n"
                 heartbeat_ticks = 0
             else:
                 heartbeat_ticks += 1
-                if heartbeat_ticks >= 30:
+                if heartbeat_ticks >= 120:
                     yield ": keep-alive\n\n"
                     heartbeat_ticks = 0
-            await asyncio.sleep(2)
+            await asyncio.sleep(STREAM_TICK_SECONDS)
 
     return StreamingResponse(
         events(),

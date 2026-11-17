@@ -1904,7 +1904,21 @@
               if (!response.ok) {
                 throw new Error(detail.detail || `Request failed (${response.status}).`);
               }
+              showUpdatedInvoice(detail);
               return detail;
+            }
+
+            // An action's reply is the updated invoice. Show it straight away
+            // instead of waiting for the full list to reload.
+            function showUpdatedInvoice(record) {
+              if (!record || typeof record !== "object") return;
+              if (!Number.isInteger(record.id) || typeof record.status !== "string") return;
+              if (!("message_id" in record)) return;
+              const index = invoices.findIndex(invoice => invoice.id === record.id);
+              if (index === -1) return;
+              invoices[index] = record;
+              renderAllSections();
+              updateCounts();
             }
 
             async function postJson(url, body) {
