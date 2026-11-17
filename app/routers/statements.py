@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
 from app.auth import User, get_current_user
-from app.deps import get_lifecycle
+from app.deps import require_sharepoint_client
 from app.pdf_validation import InvalidPdfError, validate_pdf
 from app.sharepoint import SharePointError
 
@@ -52,12 +52,7 @@ def list_statements(
     user: User = Depends(get_current_user),
 ) -> dict[str, list[dict[str, object]]]:
     app = http_request.app
-    client = get_lifecycle(app).sharepoint_client
-    if client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="SharePoint is not configured or accessible.",
-        )
+    client = require_sharepoint_client(app)
     try:
         library = client.list_statement_library()
     except SharePointError as error:
@@ -74,12 +69,7 @@ def get_statement_pdf(
     user: User = Depends(get_current_user),
 ) -> Response:
     app = http_request.app
-    client = get_lifecycle(app).sharepoint_client
-    if client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="SharePoint is not configured or accessible.",
-        )
+    client = require_sharepoint_client(app)
     try:
         # Validating the id needs the whole statement library (up to
         # thousands of items), so reuse a recent listing. A miss always

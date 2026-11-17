@@ -11,6 +11,7 @@ from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 
+from app.approval_matrix import ApprovalMatrixEntry
 from app.auth import ROLE_ADMIN, User, require_role
 from app.bulk_import import find_existing_supplier_imports, import_supplier_workbook
 from app.company_folders import (
@@ -22,8 +23,8 @@ from app.company_folders import (
 )
 from app.deps import (
     company_response,
-    get_lifecycle,
     irj_configuration,
+    require_sharepoint_client,
     sync_sharepoint_companies,
 )
 from app.metrics import build_metrics
@@ -53,22 +54,21 @@ def admin_list_companies(
     return [company_response(profile) for profile in app.state.companies_store.list()]
 
 
+def _sharepoint_folder_paths(app: FastAPI) -> list[str]:
+    client = require_sharepoint_client(app)
+    try:
+        return client.list_folder_paths()
+    except SharePointError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
 @router.get("/api/admin/sharepoint/folders")
 def admin_list_sharepoint_folders(
     http_request: Request,
     user: User = Depends(require_role(ROLE_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
-    client = get_lifecycle(app).sharepoint_client
-    if client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="SharePoint is not configured or accessible.",
-        )
-    try:
-        folders = client.list_folder_paths()
-    except SharePointError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
+    folders = _sharepoint_folder_paths(app)
     app.state.sharepoint_folder_paths = frozenset(folders)
     structures = discover_company_folder_structures(folders)
     app.state.sharepoint_company_structures = {
@@ -86,19 +86,11 @@ def admin_list_sharepoint_folders(
 
 
 def _available_company_folder_structures(app: FastAPI) -> dict[str, CompanyFolderStructure]:
-    client = get_lifecycle(app).sharepoint_client
-    if client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="SharePoint is not configured or accessible.",
-        )
-    try:
-        folders = client.list_folder_paths()
-    except SharePointError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
     return {
         structure.root: structure
-        for structure in discover_company_folder_structures(folders)
+        for structure in discover_company_folder_structures(
+            _sharepoint_folder_paths(app)
+        )
     }
 
 
@@ -234,6 +226,18 @@ def admin_delete_supplier(
     return {"status": "deleted"}
 
 
+def _matrix_entry_response(entry: ApprovalMatrixEntry) -> dict[str, object]:
+    return {
+        "id": entry.id,
+        "company": entry.company,
+        "supplier": entry.supplier,
+        "approver1_name": entry.approver1.name,
+        "approver1_email": entry.approver1.email,
+        "approver2_name": entry.approver2.name if entry.approver2 else None,
+        "approver2_email": entry.approver2.email if entry.approver2 else None,
+    }
+
+
 @router.get("/api/admin/approval-matrix")
 def admin_list_approval_matrix(
     http_request: Request,
@@ -241,15 +245,7 @@ def admin_list_approval_matrix(
 ) -> list[dict[str, object]]:
     app = http_request.app
     return [
-        {
-            "id": entry.id,
-            "company": entry.company,
-            "supplier": entry.supplier,
-            "approver1_name": entry.approver1.name,
-            "approver1_email": entry.approver1.email,
-            "approver2_name": entry.approver2.name if entry.approver2 else None,
-            "approver2_email": entry.approver2.email if entry.approver2 else None,
-        }
+        _matrix_entry_response(entry)
         for entry in app.state.approval_matrix_store.list()
     ]
 
@@ -271,15 +267,7 @@ def admin_create_approval_matrix_entry(
             entry = app.state.approval_matrix_store.update(existing.id, **fields)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    return {
-        "id": entry.id,
-        "company": entry.company,
-        "supplier": entry.supplier,
-        "approver1_name": entry.approver1.name,
-        "approver1_email": entry.approver1.email,
-        "approver2_name": entry.approver2.name if entry.approver2 else None,
-        "approver2_email": entry.approver2.email if entry.approver2 else None,
-    }
+    return _matrix_entry_response(entry)
 
 
 @router.put("/api/admin/approval-matrix/{entry_id}")
@@ -297,15 +285,7 @@ def admin_update_approval_matrix_entry(
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    return {
-        "id": entry.id,
-        "company": entry.company,
-        "supplier": entry.supplier,
-        "approver1_name": entry.approver1.name,
-        "approver1_email": entry.approver1.email,
-        "approver2_name": entry.approver2.name if entry.approver2 else None,
-        "approver2_email": entry.approver2.email if entry.approver2 else None,
-    }
+    return _matrix_entry_response(entry)
 
 
 @router.delete("/api/admin/approval-matrix/{entry_id}")
