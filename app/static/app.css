@@ -599,10 +599,6 @@ button[aria-busy="true"]::before {
 @keyframes spin { to { transform: rotate(360deg); } }
 button:disabled { opacity: .5; cursor: not-allowed; }
 button[aria-busy="true"]:disabled { opacity: .8; cursor: progress; }
-button.ghost {
-  background: transparent; border-color: transparent; color: var(--text-2); box-shadow: none;
-}
-button.ghost:not(:disabled):hover { background: var(--surface-3); color: var(--text); }
 button.primary {
   background: var(--accent); border-color: var(--accent); color: var(--on-accent);
   box-shadow: var(--shadow-xs);
@@ -704,7 +700,6 @@ button.success {
 /* ------------------------------------------------------------------------
    Incoming review layout
    ------------------------------------------------------------------------ */
-.manual-upload-card > summary,
 .manual-upload > summary {
   display: flex; align-items: center; gap: var(--space-3);
   padding: var(--space-3) var(--space-5); min-height: 52px;
@@ -1345,8 +1340,7 @@ details.admin-company-group > summary:hover { background: var(--surface-3); }
   }
   table.invoice-table tr.invoice-summary-row td.invoice-description-cell,
   table.invoice-table tr.invoice-summary-row td.row-actions,
-  table.invoice-table tr.invoice-summary-row td.cell-file,
-  table.invoice-table tr.invoice-summary-row td.cell-wide { grid-column: 1 / -1; }
+  table.invoice-table tr.invoice-summary-row td.cell-file { grid-column: 1 / -1; }
   table.invoice-table tr.invoice-summary-row td.row-actions::before { display: none; }
   table.invoice-table tr.invoice-summary-row td.row-actions { min-width: 0; padding-top: var(--space-2); border-top: 1px dashed var(--border); }
   table.invoice-table tr.invoice-summary-row[aria-expanded="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
