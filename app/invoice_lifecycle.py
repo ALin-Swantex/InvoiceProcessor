@@ -199,10 +199,19 @@ class InvoiceLifecycle:
             self.activity_feed.release_email_stage(invoice_id, stage)
             return
         self.activity_feed.mark_email_stage_sent(invoice_id, stage)
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="stage_email_sent",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=f"Stage email '{stage}' sent to {recipient}.",
+            invoice_id=invoice_id,
+        )
+
+    def _log_purchase_ledger(
+        self, *, event_type: str, message: str, invoice_id: int | None = None
+    ) -> None:
+        self.activity_feed.add_event(
+            event_type=event_type,
+            target_role=ROLE_PURCHASE_LEDGER,
+            message=message,
             invoice_id=invoice_id,
         )
 
@@ -237,9 +246,8 @@ class InvoiceLifecycle:
                 ),
             )
         except Exception as error:
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="email_notification_failed",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=f"Purchase Ledger rejection email failed: {error}",
                 invoice_id=invoice.id,
             )
@@ -371,9 +379,8 @@ class InvoiceLifecycle:
             ExtractionConfigurationError,
             ExtractionServiceError,
         ) as error:
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="extraction_unavailable",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Automatic extraction for {invoice.original_filename} "
                     "is temporarily unavailable and will need retrying."
@@ -389,9 +396,8 @@ class InvoiceLifecycle:
                 review_return_status=None,
                 review_reason=f"The PDF could not be read automatically: {error}",
             )
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="needs_review",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {invoice.original_filename} could not be read "
                     "and needs manual review."
@@ -697,9 +703,8 @@ class InvoiceLifecycle:
                     ),
                     **review_metadata,
                 )
-                self.activity_feed.add_event(
+                self._log_purchase_ledger(
                     event_type="possible_duplicate",
-                    target_role=ROLE_PURCHASE_LEDGER,
                     message=(
                         f"Invoice {invoice.original_filename} looks like a possible "
                         f"duplicate of {reference} "
@@ -786,9 +791,8 @@ class InvoiceLifecycle:
                     f"{purchase_order_number}."
                 ),
             )
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="po_awaiting_match",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {irj_number or invoice.original_filename} ({supplier}) is awaiting PO matching "
                     f"against PO {purchase_order_number}."
@@ -808,9 +812,8 @@ class InvoiceLifecycle:
                 "nominal invoice to Sage Registration."
             ),
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="sage_registration_pending",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice {irj_number} ({supplier}) is awaiting Sage registration.",
             invoice_id=invoice_id,
         )
@@ -856,9 +859,8 @@ class InvoiceLifecycle:
                 po_query_category=None,
                 po_query_contact=None,
             )
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="sage_registration_pending",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {invoice.irj_number} matched against its PO and is "
                     "awaiting Sage registration."
@@ -974,9 +976,8 @@ class InvoiceLifecycle:
             record = self.invoice_store.update_fields(
                 invoice_id, status="Approved", review_reason=None
             )
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="approved",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {invoice.irj_number} registered in Sage and approved "
                     "for payment."
@@ -1020,9 +1021,8 @@ class InvoiceLifecycle:
                 review_return_status=None,
                 review_reason=f"{missing_route_detail} Configure the route, then retry.",
             )
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="needs_review",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {invoice.irj_number}: {missing_route_detail} "
                     "Purchase Ledger must update the approval matrix."
@@ -1121,9 +1121,8 @@ class InvoiceLifecycle:
             status="Rejected",
             rejection_reason=reason.strip(),
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="rejected",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Invoice {invoice.irj_number} rejected by {recorded_by}: "
                 f"{reason.strip()}"
@@ -1165,9 +1164,8 @@ class InvoiceLifecycle:
             cancelled_by=recorded_by,
             cancellation_reason=reason,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="duplicate_cancelled",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice {invoice.id} cancelled: {reason}",
             invoice_id=invoice_id,
         )
@@ -1269,9 +1267,8 @@ class InvoiceLifecycle:
                 ),
             }
             record = commit_decision(**fields)
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="approval_on_hold",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {invoice.irj_number}: {recorded_by} placed it "
                     f"on hold — {comments}"
@@ -1306,9 +1303,8 @@ class InvoiceLifecycle:
                 self._rejected_filename(invoice),
             )
             record = commit_decision(**fields)
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="rejected",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=f"Invoice {invoice.irj_number} rejected by {recorded_by}.",
                 invoice_id=invoice_id,
             )
@@ -1405,9 +1401,8 @@ class InvoiceLifecycle:
                 "all required nominal approvals and is ready for payment."
             ),
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="approved",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice {invoice.irj_number} fully approved and ready for payment.",
             invoice_id=invoice_id,
         )
@@ -1439,9 +1434,8 @@ class InvoiceLifecycle:
                     resolution_notes or "Resolved without additional notes.",
                 ),
             )
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="workflow_resumed",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {invoice.irj_number or invoice.original_filename} issue "
                     f"resolved; returned to {return_status}."
@@ -1532,9 +1526,8 @@ class InvoiceLifecycle:
             review_reason=None,
             review_return_status=None,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="statement_filed",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Statement '{document.original_filename}' filed to "
                 f"{destination} by {recorded_by}."
@@ -1562,9 +1555,8 @@ class InvoiceLifecycle:
             ai_review_warnings=None,
             review_return_status=None,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="document_reclassified",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"'{document.original_filename}' was marked as an invoice "
                 f"by {recorded_by}."
@@ -1603,9 +1595,8 @@ class InvoiceLifecycle:
             ),
             review_return_status=invoice.status,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="needs_review",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice flagged for review: {reason}",
             invoice_id=invoice_id,
         )
@@ -1640,9 +1631,8 @@ class InvoiceLifecycle:
                 review_reason=None,
                 review_return_status=None,
             )
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="review_accepted",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     f"Invoice {invoice.irj_number or invoice.original_filename} "
                     f"accepted by {recorded_by} and returned to {return_status}."
@@ -1665,9 +1655,8 @@ class InvoiceLifecycle:
             review_reason=None,
             review_return_status=None,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="rejected",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Invoice {invoice.irj_number or invoice.original_filename} "
                 f"rejected during review by {recorded_by}: {reason.strip()}"
@@ -1699,9 +1688,8 @@ class InvoiceLifecycle:
             review_reason=None,
             review_return_status=None,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="rejected",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Flagged invoice {invoice.irj_number or invoice.original_filename} "
                 f"rejected by {recorded_by}: {reason.strip()}"
@@ -1765,9 +1753,8 @@ class InvoiceLifecycle:
             foreign_allocated_by=None,
             hold_reason=None,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="payment_route_selected",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Invoice {invoice.irj_number} routed to {payment_method} "
                 f"by {recorded_by}."
@@ -1839,9 +1826,8 @@ class InvoiceLifecycle:
             payment_route_decided_at=None,
             payment_route_decided_by=None,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="payment_routing_on_hold",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Invoice {invoice.irj_number or invoice.original_filename} is on hold: "
                 f"{reason}"
@@ -1880,7 +1866,6 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError("A payment reference is required.")
         if not payment_date.strip():
             raise InvoiceLifecycleError("A payment date is required.")
-        now = datetime.now(timezone.utc).isoformat()
         self._move_pdf_in_sharepoint(
             invoice,
             self._company_folders(invoice).paid,
@@ -1897,9 +1882,8 @@ class InvoiceLifecycle:
             payment_method=payable_statuses[invoice.status],
             paid_by=recorded_by,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="paid",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice {invoice.irj_number} paid; awaiting bank reconciliation.",
             invoice_id=invoice_id,
         )
@@ -1949,9 +1933,8 @@ class InvoiceLifecycle:
             foreign_allocation_reference=allocation_reference.strip(),
             foreign_allocated_by=recorded_by,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="foreign_payment_allocated",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Foreign payment for invoice {invoice.irj_number} allocated and "
                 "is awaiting bank reconciliation."
@@ -1984,9 +1967,8 @@ class InvoiceLifecycle:
             foreign_allocation_reference=None,
             foreign_allocated_by=None,
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="foreign_payment_reverted",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"Invoice {invoice.irj_number} returned to domestic payment by "
                 f"{recorded_by}."
@@ -2027,9 +2009,8 @@ class InvoiceLifecycle:
             reconciled_by=recorded_by,
             reconciled_at=datetime.now(timezone.utc).isoformat(),
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="reconciled",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=f"Invoice {invoice.irj_number} reconciled and filed.",
             invoice_id=invoice_id,
         )
@@ -2066,9 +2047,8 @@ class InvoiceLifecycle:
             self.invoice_store.delete(invoice_id)
         except KeyError as error:
             raise InvoiceLifecycleError(str(error)) from error
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="invoice_deleted",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"'{invoice.original_filename}' was permanently deleted by "
                 f"{recorded_by} before approval/payment processing."
@@ -2105,9 +2085,8 @@ class InvoiceLifecycle:
                 "file it to SharePoint after manual review."
             ),
         )
-        self.activity_feed.add_event(
+        self._log_purchase_ledger(
             event_type="statement_detected",
-            target_role=ROLE_PURCHASE_LEDGER,
             message=(
                 f"'{document.original_filename}' was detected as a supplier "
                 "statement and needs manual filing."
@@ -2170,9 +2149,8 @@ class InvoiceLifecycle:
         destination_filename: str,
     ) -> None:
         if self.sharepoint_client is None:
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="sharepoint_pending",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=(
                     "SharePoint is not configured; the PDF was routed but not "
                     "moved. Set SHAREPOINT_SITE_ID / SHAREPOINT_DRIVE_ID to "
@@ -2207,9 +2185,8 @@ class InvoiceLifecycle:
                 sharepoint_web_url=self.sharepoint_client.get_item_web_url(item),
             )
         except SharePointError as error:
-            self.activity_feed.add_event(
+            self._log_purchase_ledger(
                 event_type="sharepoint_error",
-                target_role=ROLE_PURCHASE_LEDGER,
                 message=f"SharePoint move failed for invoice {invoice.id}: {error}",
                 invoice_id=invoice.id,
             )
