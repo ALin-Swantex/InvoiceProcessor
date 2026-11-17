@@ -935,3 +935,172 @@ def test_refused_auto_confirmation_leaves_invoice_in_needs_review_with_reason(
     assert result.status == "Needs Review"
     assert "Automatic confirmation was not possible" in str(result.review_reason)
     assert "No approver is configured." in str(result.review_reason)
+
+
+# --- matching printed names to the known names ---------------------------------
+
+
+class SequenceMessages:
+    """Replies in order: the extraction first, then any name double-checks."""
+
+    def __init__(self, replies: list[dict[str, Any] | Exception]) -> None:
+        self.replies = list(replies)
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> object:
+        self.calls.append(kwargs)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text=json.dumps(reply))],
+        )
+
+
+def _extract_names(
+    tmp_path: Path,
+    replies: list[dict[str, Any] | Exception],
+    *,
+    company: str = "Acme Trading Ltd",
+    supplier: str = "Supplier Ltd",
+    text_layer_name: str | None = None,
+):
+    messages = SequenceMessages(replies)
+    client = SimpleNamespace(messages=messages)
+    extractor = ClaudeInvoiceExtractor(ExtractionSettings(), client=client)
+    reference = ReferenceData(
+        companies=(("Acme Trading Ltd", ("Acme",)),),
+        suppliers=(
+            ("Smith & Sons Limited", ("Smiths",)),
+            ("Smith Engineering Ltd", ()),
+            ("Bolt Supplies Ltd", ()),
+        ),
+    )
+    pdf = write_pdf(tmp_path / "invoice.pdf")
+    result = extractor.extract(pdf, reference=reference)
+    return result, messages
+
+
+def test_names_that_differ_only_in_case_or_alias_become_the_exact_known_name(
+    tmp_path: Path,
+) -> None:
+    data = llm_data(
+        company=field("ACME"), supplier=field("BOLT SUPPLIES LTD")
+    )
+    result, messages = _extract_names(tmp_path, [data])
+
+    assert result.company == "Acme Trading Ltd"
+    assert result.supplier == "Bolt Supplies Ltd"
+    assert len(messages.calls) == 1  # no second look needed
+
+
+@pytest.mark.parametrize(
+    "printed",
+    ["Smith and Sons Ltd", "smith & sons limited.", "The Smith & Sons Ltd"],
+)
+def test_ampersand_and_legal_form_differences_resolve_without_the_model(
+    tmp_path: Path, printed: str
+) -> None:
+    result, messages = _extract_names(
+        tmp_path, [llm_data(supplier=field(printed))]
+    )
+
+    assert result.supplier == "Smith & Sons Limited"
+    assert len(messages.calls) == 1
+
+
+def test_a_close_but_unmatched_name_is_checked_and_must_be_an_exact_known_name(
+    tmp_path: Path,
+) -> None:
+    extraction = llm_data(supplier=field("Boltt Suplies"))
+    answer = {"match": "Bolt Supplies Ltd", "certainty": "high"}
+    result, messages = _extract_names(tmp_path, [extraction, answer])
+
+    assert result.supplier == "Bolt Supplies Ltd"
+    check = messages.calls[1]
+    schema = check["output_config"]["format"]["schema"]
+    assert "Bolt Supplies Ltd" in schema["properties"]["match"]["enum"]
+    assert "NONE" in schema["properties"]["match"]["enum"]
+    assert check["model"] == "claude-opus-5-5"
+
+
+def test_a_model_answer_outside_the_known_names_is_rejected(tmp_path: Path) -> None:
+    extraction = llm_data(supplier=field("Boltt Suplies"))
+    answer = {"match": "Bolt Supplies Limited", "certainty": "high"}  # not exact
+    result, _ = _extract_names(tmp_path, [extraction, answer])
+
+    assert result.supplier == "Boltt Suplies"  # kept as printed, then warned about
+
+
+def test_the_model_saying_none_keeps_the_printed_name(tmp_path: Path) -> None:
+    extraction = llm_data(supplier=field("Boltt Suplies"))
+    result, _ = _extract_names(
+        tmp_path, [extraction, {"match": "NONE", "certainty": "high"}]
+    )
+
+    assert result.supplier == "Boltt Suplies"
+
+
+def test_an_unsure_name_match_lowers_the_confidence_below_the_threshold(
+    tmp_path: Path,
+) -> None:
+    extraction = llm_data(supplier=field("Boltt Suplies"))
+    result, _ = _extract_names(
+        tmp_path, [extraction, {"match": "Bolt Supplies Ltd", "certainty": "medium"}]
+    )
+
+    assert result.supplier == "Bolt Supplies Ltd"
+    assert result.field_confidences["supplier"] == CERTAINTY_SCORES["medium"]
+    assert result.needs_review is True
+
+
+def test_a_failed_name_check_does_not_fail_the_extraction(tmp_path: Path) -> None:
+    extraction = llm_data(supplier=field("Boltt Suplies"))
+    result, _ = _extract_names(
+        tmp_path, [extraction, ExtractionServiceError("temporarily unavailable")]
+    )
+
+    assert result.supplier == "Boltt Suplies"
+    assert result.document_type == "invoice"
+
+
+def test_a_name_with_nothing_similar_is_not_sent_to_the_model(tmp_path: Path) -> None:
+    extraction = llm_data(supplier=field("Zenith Quarries Group"))
+    result, messages = _extract_names(tmp_path, [extraction])
+
+    assert result.supplier == "Zenith Quarries Group"
+    assert len(messages.calls) == 1
+
+
+def test_ambiguous_normalised_names_go_to_the_model_not_a_guess(
+    tmp_path: Path,
+) -> None:
+    from app.ai_extraction import resolve_known_name
+
+    entries = (("Acme Ltd", ()), ("Acme Plc", ()))
+    canonical, candidates = resolve_known_name("ACME", entries)
+
+    assert canonical is None
+    assert set(candidates) == {"Acme Ltd", "Acme Plc"}
+
+
+def test_supplier_is_checked_against_the_document_as_printed_not_as_registered(
+    tmp_path: Path,
+) -> None:
+    extractor, _ = extractor_for(llm_data())
+    reference = ReferenceData(suppliers=(("Smith & Sons Limited", ()),))
+    text = "Invoice from SMITH AND SONS LTD invoice number INV-1001 total 1250.75 " * 3
+
+    result = extractor._to_result(
+        llm_data(
+            supplier=field("Smith and Sons Ltd"),
+            supplier_invoice_number=field("INV-1001"),
+        ),
+        text_layer=text,
+        reference=reference,
+        model="claude-opus-5-5",
+    )
+
+    assert result.supplier == "Smith & Sons Limited"
+    assert not any("supplier name" in warning for warning in result.warnings)
