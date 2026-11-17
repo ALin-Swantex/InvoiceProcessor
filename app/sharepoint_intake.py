@@ -204,9 +204,11 @@ class SharePointIncomingMonitor:
         self, invoice: InvoiceRecord, content: bytes
     ) -> InvoiceRecord | None:
         content_digest = hashlib.sha256(content).digest()
-        for candidate in self.invoice_store.list(limit=500):
-            if candidate.id == invoice.id:
-                continue
+        # Identical content implies identical size, so only same-size invoices
+        # (across all invoices) need their stored file read and hashed.
+        for candidate in self.invoice_store.list_by_size(
+            len(content), invoice.id
+        ):
             try:
                 candidate_digest = hashlib.sha256(
                     Path(candidate.stored_path).read_bytes()

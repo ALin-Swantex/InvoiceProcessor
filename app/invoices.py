@@ -190,6 +190,41 @@ class InvoiceRecord:
     corrected_fields_json: str | None = None
 
 
+# Statuses where an invoice needs no further action. The work queues show every
+# invoice NOT in this set, plus only the most recent finished ones, so an old
+# invoice that is still waiting on someone never drops out of view.
+TERMINAL_STATUSES = (
+    "Reconciled / Complete",
+    "Statement Filed",
+    "Rejected",
+    "Cancelled - Duplicate",
+)
+
+
+@dataclass(frozen=True)
+class MetricInvoice:
+    """The few columns the Admin metrics need (not the full 80-column record)."""
+
+    id: int
+    irj_number: str | None
+    company: str | None
+    supplier: str | None
+    invoice_date: str | None
+    invoice_value: float | None
+    currency: str | None
+    status: str
+    document_type: str
+    created_at: str
+    supplier_account_number: str | None
+
+
+METRIC_COLUMNS = tuple(MetricInvoice.__dataclass_fields__)
+
+
+def _norm(value: object) -> str:
+    return str(value or "").strip().casefold()
+
+
 class InvoiceStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -352,6 +387,128 @@ class InvoiceStore:
             ).fetchall()
         numbers = [int(r[0]) for r in rows if str(r[0]).isdigit()]
         return max(numbers) if numbers else None
+
+    def list_workqueue(
+        self,
+        limit: int = 500,
+        approver: tuple[int, str] | None = None,
+    ) -> list[InvoiceRecord]:
+        """All unfinished invoices plus the newest `limit` finished ones."""
+        if limit < 1 or limit > 500:
+            raise ValueError("Invoice limit must be between 1 and 500.")
+        terminal = ",".join("?" for _ in TERMINAL_STATUSES)
+        scope, scope_args = "", ()
+        if approver is not None:
+            level, email = approver
+            if level not in (1, 2):
+                raise ValueError("Approval level must be 1 or 2.")
+            scope = f"lower(trim(approver{level}_email)) = lower(trim(?)) AND "
+            scope_args = (email,)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM invoices WHERE {scope}(status NOT IN ({terminal}) "
+                f"OR id IN (SELECT id FROM invoices WHERE {scope}status IN ({terminal}) "
+                "ORDER BY created_at DESC LIMIT ?)) ORDER BY created_at DESC",
+                (*scope_args, *TERMINAL_STATUSES, *scope_args, *TERMINAL_STATUSES, limit),
+            ).fetchall()
+        return [InvoiceRecord(**dict(row)) for row in rows]
+
+    def search(
+        self,
+        *,
+        irj_number: str | None = None,
+        company: str | None = None,
+        supplier: str | None = None,
+        approver: tuple[int, str] | None = None,
+    ) -> list[InvoiceRecord]:
+        """Exact (trimmed, case-insensitive) match on the filters given."""
+        clauses: list[str] = []
+        args: list[object] = []
+        if irj_number:
+            clauses.append("irj_number = ?")
+            args.append(irj_number)
+        if company:
+            clauses.append("lower(trim(company)) = ?")
+            args.append(_norm(company))
+        if supplier:
+            clauses.append("lower(trim(supplier)) = ?")
+            args.append(_norm(supplier))
+        if approver is not None:
+            level, email = approver
+            if level not in (1, 2):
+                raise ValueError("Approval level must be 1 or 2.")
+            clauses.append(f"lower(trim(approver{level}_email)) = lower(trim(?))")
+            args.append(email)
+        if not clauses:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM invoices WHERE {' AND '.join(clauses)} "
+                "ORDER BY created_at DESC",
+                tuple(args),
+            ).fetchall()
+        return [InvoiceRecord(**dict(row)) for row in rows]
+
+    def find_duplicate_by_number(
+        self, *, exclude_id: int, company: str, supplier: str, number: str
+    ) -> InvoiceRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM invoices WHERE id <> ? "
+                "AND lower(trim(coalesce(company, ''))) = ? "
+                "AND lower(trim(coalesce(supplier, ''))) = ? "
+                "AND lower(trim(coalesce(supplier_invoice_number, ''))) = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (exclude_id, _norm(company), _norm(supplier), _norm(number)),
+            ).fetchone()
+        return InvoiceRecord(**dict(row)) if row is not None else None
+
+    def find_duplicate_by_source(
+        self, invoice: InvoiceRecord, company: str
+    ) -> InvoiceRecord | None:
+        """Newest other invoice in the company from the same email attachment,
+        or with the same filename and size."""
+        filename = _norm(invoice.original_filename)
+        conditions: list[str] = []
+        args: list[object] = []
+        if invoice.internet_message_id:
+            conditions.append("(internet_message_id = ? AND attachment_id = ?)")
+            args += [invoice.internet_message_id, invoice.attachment_id]
+        if filename and invoice.size_bytes is not None:
+            conditions.append(
+                "(lower(trim(coalesce(original_filename, ''))) = ? AND size_bytes = ?)"
+            )
+            args += [filename, invoice.size_bytes]
+        if not conditions:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM invoices WHERE id <> ? "
+                "AND lower(trim(coalesce(company, ''))) = ? "
+                f"AND ({' OR '.join(conditions)}) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (invoice.id, _norm(company), *args),
+            ).fetchone()
+        return InvoiceRecord(**dict(row)) if row is not None else None
+
+    def list_by_size(self, size_bytes: int, exclude_id: int) -> list[InvoiceRecord]:
+        """Invoices of this size, plus any whose size was never recorded."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM invoices WHERE (size_bytes = ? OR size_bytes IS NULL) "
+                "AND id <> ? "
+                "ORDER BY created_at DESC",
+                (size_bytes, exclude_id),
+            ).fetchall()
+        return [InvoiceRecord(**dict(row)) for row in rows]
+
+    def list_for_metrics(self) -> list[MetricInvoice]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {', '.join(METRIC_COLUMNS)} FROM invoices "
+                "WHERE document_type = 'invoice'"
+            ).fetchall()
+        return [MetricInvoice(**dict(row)) for row in rows]
 
     def get(self, invoice_id: int) -> InvoiceRecord | None:
         with self._connect() as connection:

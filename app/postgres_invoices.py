@@ -6,7 +6,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
-from app.invoices import InvoiceRecord, InvoiceStore
+from app.invoices import (
+    METRIC_COLUMNS,
+    TERMINAL_STATUSES,
+    InvoiceRecord,
+    InvoiceStore,
+    MetricInvoice,
+    _norm,
+)
 from app.postgres_settings import (
     ConnectionFactory,
     PostgresSettings,
@@ -206,6 +213,123 @@ class PostgresInvoiceStore:
                 )
                 row = cursor.fetchone()
         return int(row["highest"]) if row and row["highest"] is not None else None
+
+    def list_workqueue(
+        self,
+        limit: int = 500,
+        approver: tuple[int, str] | None = None,
+    ) -> list[InvoiceRecord]:
+        """All unfinished invoices plus the newest `limit` finished ones."""
+        self._validate_limit(limit, maximum=500)
+        scope, scope_args = "", ()
+        if approver is not None:
+            level, email = approver
+            if level not in (1, 2):
+                raise ValueError("Approval level must be 1 or 2.")
+            scope = f"lower(btrim(approver{level}_email)) = lower(btrim(%s)) AND "
+            scope_args = (email,)
+        terminal = list(TERMINAL_STATUSES)
+        return self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE {scope}"
+            "(status <> ALL(%s) OR id IN (SELECT id FROM invoices "
+            f"WHERE {scope}status = ANY(%s) ORDER BY created_at DESC LIMIT %s)) "
+            "ORDER BY created_at DESC",
+            (*scope_args, terminal, *scope_args, terminal, limit),
+        )
+
+    def search(
+        self,
+        *,
+        irj_number: str | None = None,
+        company: str | None = None,
+        supplier: str | None = None,
+        approver: tuple[int, str] | None = None,
+    ) -> list[InvoiceRecord]:
+        """Exact (trimmed, case-insensitive) match on the filters given."""
+        clauses: list[str] = []
+        args: list[object] = []
+        if irj_number:
+            clauses.append("irj_number = %s")
+            args.append(irj_number)
+        if company:
+            clauses.append("lower(btrim(company)) = %s")
+            args.append(_norm(company))
+        if supplier:
+            clauses.append("lower(btrim(supplier)) = %s")
+            args.append(_norm(supplier))
+        if approver is not None:
+            level, email = approver
+            if level not in (1, 2):
+                raise ValueError("Approval level must be 1 or 2.")
+            clauses.append(f"lower(btrim(approver{level}_email)) = lower(btrim(%s))")
+            args.append(email)
+        if not clauses:
+            return []
+        return self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC",
+            tuple(args),
+        )
+
+    def find_duplicate_by_number(
+        self, *, exclude_id: int, company: str, supplier: str, number: str
+    ) -> InvoiceRecord | None:
+        rows = self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE id <> %s "
+            "AND lower(btrim(coalesce(company, ''))) = %s "
+            "AND lower(btrim(coalesce(supplier, ''))) = %s "
+            "AND lower(btrim(coalesce(supplier_invoice_number, ''))) = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (exclude_id, _norm(company), _norm(supplier), _norm(number)),
+        )
+        return rows[0] if rows else None
+
+    def find_duplicate_by_source(
+        self, invoice: InvoiceRecord, company: str
+    ) -> InvoiceRecord | None:
+        """Newest other invoice in the company from the same email attachment,
+        or with the same filename and size."""
+        filename = _norm(invoice.original_filename)
+        conditions: list[str] = []
+        args: list[object] = []
+        if invoice.internet_message_id:
+            conditions.append("(internet_message_id = %s AND attachment_id = %s)")
+            args += [invoice.internet_message_id, invoice.attachment_id]
+        if filename and invoice.size_bytes is not None:
+            conditions.append(
+                "(lower(btrim(coalesce(original_filename, ''))) = %s "
+                "AND size_bytes = %s)"
+            )
+            args += [filename, invoice.size_bytes]
+        if not conditions:
+            return None
+        rows = self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE id <> %s "
+            "AND lower(btrim(coalesce(company, ''))) = %s "
+            f"AND ({' OR '.join(conditions)}) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (invoice.id, _norm(company), *args),
+        )
+        return rows[0] if rows else None
+
+    def list_by_size(self, size_bytes: int, exclude_id: int) -> list[InvoiceRecord]:
+        """Invoices of this size, plus any whose size was never recorded."""
+        return self._query_many(
+            f"SELECT {_SELECT_COLUMNS} FROM invoices "
+            "WHERE (size_bytes = %s OR size_bytes IS NULL) AND id <> %s "
+            "ORDER BY created_at DESC",
+            (size_bytes, exclude_id),
+        )
+
+    def list_for_metrics(self) -> list[MetricInvoice]:
+        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT {', '.join(METRIC_COLUMNS)} FROM invoices "
+                    "WHERE document_type = 'invoice'"
+                )
+                rows = cursor.fetchall()
+        return [MetricInvoice(**{c: row[c] for c in METRIC_COLUMNS}) for row in rows]
 
     def get(self, invoice_id: int) -> InvoiceRecord | None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]

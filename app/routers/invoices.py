@@ -14,6 +14,8 @@ from fastapi.responses import FileResponse
 from app.activity_feed import ROLE_PURCHASE_LEDGER
 from app.auth import ROLE_APPROVER_1, ROLE_APPROVER_2, User, get_current_user, require_role
 from app.deps import (
+    approver_scope,
+    normalized_email,
     get_lifecycle,
     invoice_for_user,
     invoice_is_visible_to_user,
@@ -342,25 +344,16 @@ def filter_invoices(
             status_code=422,
             detail="Provide an IRJ number, company, or supplier.",
         )
+    scope = approver_scope(user)
+    if scope is not None and not normalized_email(user.email):
+        return []
     matches = []
-    candidates = (
-        invoices_for_user(app, user, 500)
-        if user.role in {ROLE_APPROVER_1, ROLE_APPROVER_2}
-        else app.state.invoice_store.list_all()
-    )
-    for invoice in candidates:
-        if normalized_irj and invoice.irj_number != normalized_irj:
-            continue
-        if normalized_company and (
-            not invoice.company
-            or invoice.company.strip().casefold() != normalized_company
-        ):
-            continue
-        if normalized_supplier and (
-            not invoice.supplier
-            or invoice.supplier.strip().casefold() != normalized_supplier
-        ):
-            continue
+    for invoice in app.state.invoice_store.search(
+        irj_number=normalized_irj,
+        company=normalized_company,
+        supplier=normalized_supplier,
+        approver=scope,
+    ):
         result = asdict(invoice)
         if normalized_irj:
             result["audit_trail"] = [

@@ -205,20 +205,21 @@ def invoice_for_user(app: FastAPI, invoice_id: int, user: User) -> InvoiceRecord
     return invoice
 
 
-def invoices_for_user(app: FastAPI, user: User, limit: int) -> list[InvoiceRecord]:
+def approver_scope(user: User) -> tuple[int, str] | None:
+    """(level, email) when the user is an approver, else None."""
     if user.role == ROLE_APPROVER_1:
-        return (
-            app.state.invoice_store.list_for_approver(1, user.email, limit)
-            if normalized_email(user.email)
-            else []
-        )
+        return (1, user.email)
     if user.role == ROLE_APPROVER_2:
-        return (
-            app.state.invoice_store.list_for_approver(2, user.email, limit)
-            if normalized_email(user.email)
-            else []
-        )
-    return app.state.invoice_store.list(limit)
+        return (2, user.email)
+    return None
+
+
+def invoices_for_user(app: FastAPI, user: User, limit: int) -> list[InvoiceRecord]:
+    """Everything still in progress plus the newest `limit` finished invoices."""
+    scope = approver_scope(user)
+    if scope is not None and not normalized_email(user.email):
+        return []
+    return app.state.invoice_store.list_workqueue(limit, scope)
 
 
 def require_assigned_approver(

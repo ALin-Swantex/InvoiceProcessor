@@ -319,7 +319,7 @@ def admin_metrics(
     app = http_request.app
     del user
     return build_metrics(
-        app.state.invoice_store.list_all(),
+        app.state.invoice_store.list_for_metrics(),
         app.state.supplier_terms_store.list(),
         granularity=granularity,
     )

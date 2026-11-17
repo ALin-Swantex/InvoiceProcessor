@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.invoices import InvoiceStore
+from app.invoices import InvoiceRecord, InvoiceStore
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ def find_possible_duplicate(
     supplier: str,
     supplier_invoice_number: str | None,
 ) -> DuplicateMatch | None:
-    """Return the first existing invoice that shares the duplicate key
+    """Return the newest existing invoice that shares the duplicate key
     (company + supplier + supplier invoice number), if any, excluding the
     invoice currently being confirmed.
 
@@ -69,86 +69,44 @@ def find_possible_duplicate(
     source file identity (same email message/attachment, or same filename
     + size) within the same company, so a duplicate is still caught even
     when there is no invoice number to key on.
+
+    Both checks are indexed queries over every invoice, not a scan of the
+    newest few hundred.
     """
-    company_key = company.strip().casefold()
-    supplier_key = supplier.strip().casefold()
+    if (supplier_invoice_number or "").strip():
+        candidate = invoice_store.find_duplicate_by_number(
+            exclude_id=exclude_invoice_id,
+            company=company,
+            supplier=supplier,
+            number=supplier_invoice_number or "",
+        )
+        return _match(candidate, "supplier invoice number")
 
-    key_number = (supplier_invoice_number or "").strip().casefold()
-    if key_number:
-        for candidate in invoice_store.list(limit=500):
-            if candidate.id == exclude_invoice_id:
-                continue
-            if (candidate.company or "").strip().casefold() != company_key:
-                continue
-            if (candidate.supplier or "").strip().casefold() != supplier_key:
-                continue
-            if (candidate.supplier_invoice_number or "").strip().casefold() != key_number:
-                continue
-            return DuplicateMatch(
-                invoice_id=candidate.id,
-                irj_number=candidate.irj_number,
-                status=candidate.status,
-                invoice_value=candidate.invoice_value,
-                invoice_date=candidate.invoice_date,
-                match_basis="supplier invoice number",
-            )
-        return None
-
-    return _find_duplicate_by_source_file(
-        invoice_store,
-        exclude_invoice_id=exclude_invoice_id,
-        company_key=company_key,
-    )
-
-
-def _find_duplicate_by_source_file(
-    invoice_store: InvoiceStore,
-    *,
-    exclude_invoice_id: int,
-    company_key: str,
-) -> DuplicateMatch | None:
     invoice = invoice_store.get(exclude_invoice_id)
     if invoice is None:
         return None
+    candidate = invoice_store.find_duplicate_by_source(invoice, company)
+    if candidate is None:
+        return None
+    # Same source email attachment is the strongest signal that this is a
+    # re-processed duplicate rather than a coincidence.
+    if (
+        invoice.internet_message_id
+        and candidate.internet_message_id == invoice.internet_message_id
+        and candidate.attachment_id == invoice.attachment_id
+    ):
+        return _match(candidate, "source email attachment")
+    return _match(candidate, "matching filename and file size")
 
-    filename_key = (invoice.original_filename or "").strip().casefold()
 
-    for candidate in invoice_store.list(limit=500):
-        if candidate.id == exclude_invoice_id:
-            continue
-        if (candidate.company or "").strip().casefold() != company_key:
-            continue
-
-        # Same source email attachment -- the strongest possible signal
-        # that this is a re-processed duplicate rather than a coincidence.
-        if (
-            invoice.internet_message_id
-            and candidate.internet_message_id == invoice.internet_message_id
-            and candidate.attachment_id == invoice.attachment_id
-        ):
-            return DuplicateMatch(
-                invoice_id=candidate.id,
-                irj_number=candidate.irj_number,
-                status=candidate.status,
-                invoice_value=candidate.invoice_value,
-                invoice_date=candidate.invoice_date,
-                match_basis="source email attachment",
-            )
-
-        # Same filename and file size -- a strong proxy for "the same PDF"
-        # when there's no supplier invoice number to compare.
-        if (
-            filename_key
-            and (candidate.original_filename or "").strip().casefold() == filename_key
-            and candidate.size_bytes is not None
-            and candidate.size_bytes == invoice.size_bytes
-        ):
-            return DuplicateMatch(
-                invoice_id=candidate.id,
-                irj_number=candidate.irj_number,
-                status=candidate.status,
-                invoice_value=candidate.invoice_value,
-                invoice_date=candidate.invoice_date,
-                match_basis="matching filename and file size",
-            )
-    return None
+def _match(candidate: InvoiceRecord | None, basis: str) -> DuplicateMatch | None:
+    if candidate is None:
+        return None
+    return DuplicateMatch(
+        invoice_id=candidate.id,
+        irj_number=candidate.irj_number,
+        status=candidate.status,
+        invoice_value=candidate.invoice_value,
+        invoice_date=candidate.invoice_date,
+        match_basis=basis,
+    )

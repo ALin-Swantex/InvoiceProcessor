@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from typing import Iterable
 
 from app.approval_matrix import ALL_COMPANIES
-from app.invoices import InvoiceRecord
+from app.invoices import InvoiceRecord, MetricInvoice
 from app.supplier_terms import SupplierTerms
 
 
@@ -24,7 +24,7 @@ PAID_STATUSES = {
 
 
 def build_metrics(
-    invoices: Iterable[InvoiceRecord],
+    invoices: Iterable[InvoiceRecord | MetricInvoice],
     supplier_terms: Iterable[SupplierTerms],
     *,
     granularity: str,
