@@ -185,7 +185,7 @@ workflow stage:
 
 ```bash
 python -m app.demo            # http://localhost:8000, Ctrl+C to stop
-docker compose --profile demo up demo   # http://localhost:8001
+docker compose -f docker/docker-compose.yml --profile demo up demo   # http://localhost:8001
 ```
 
 It prints the demo accounts and passwords on start-up. Demo mode uses local
@@ -196,17 +196,18 @@ real systems, and its data is discarded when it stops (`--data-dir` keeps it).
 ## Run with Docker
 
 The application is containerised: one image (Python 3.12, non-root, working
-files on a `/data` volume) runs every service, and `docker-compose.yml` starts
+files on a `/data` volume) runs every service, and `docker/docker-compose.yml` starts
 the web application and the Outlook worker with your settings from `.env`
 (never copied into the image). It needs Docker Desktop or Docker Engine with
-Compose.
+Compose. The Docker files live in `docker/`; run these commands from the
+repository root.
 
 ```bash
 cp .env.example .env                              # then fill in the values
-docker compose --profile tools run --rm migrate   # apply database migrations
-docker compose up -d --build                      # web app + worker
-docker compose logs -f web worker                 # follow the logs
-docker compose down                               # stop
+docker compose -f docker/docker-compose.yml --profile tools run --rm migrate   # apply migrations
+docker compose -f docker/docker-compose.yml up -d --build                      # web app + worker
+docker compose -f docker/docker-compose.yml logs -f web worker                 # follow the logs
+docker compose -f docker/docker-compose.yml down                               # stop
 ```
 
 Open <http://localhost:8000>. Notes:

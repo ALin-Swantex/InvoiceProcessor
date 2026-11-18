@@ -1,5 +1,6 @@
 # One image serves the web app, the Outlook worker and the migration job; the
 # command chosen in docker-compose.yml decides which role a container plays.
+# Build from the repository root: docker build -f docker/Dockerfile .
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

@@ -1,16 +1,23 @@
-# Invoice Processor containers.
+# Invoice Processor containers. Run from the repository root:
 #
-#   docker compose up -d --build            web app + Outlook worker
-#   docker compose --profile tools run --rm migrate    apply database migrations
+#   docker compose -f docker/docker-compose.yml up -d --build    web app + Outlook worker
+#   docker compose -f docker/docker-compose.yml --profile tools run --rm migrate
 #
-# Configuration comes from .env (never copied into the image). The database is
-# Azure PostgreSQL, so the host running these containers must be able to
-# resolve and reach it (VPN, private network or an allowed IP).
+# Paths below are relative to this file. Configuration comes from the
+# repository's .env (never copied into the image). PostgreSQL runs outside
+# these containers: use host.docker.internal for a server on this machine, or
+# make sure an Azure server is reachable (VPN, private network or allowed IP).
+
+# Fixed project name, so containers and the volume keep the same names
+# although this file lives in docker/.
+name: invoiceprocessor
 
 x-app: &app
-  build: .
+  build: &build
+    context: ..
+    dockerfile: docker/Dockerfile
   image: invoice-processor:local
-  env_file: .env
+  env_file: ../.env
   # Explicit values win over .env, so working files always land on the volume.
   environment:
     OUTLOOK_DOWNLOAD_DIR: /data/outlook_downloads
@@ -40,9 +47,9 @@ services:
         condition: service_healthy
 
   # Sample data and local sign-in only: no .env, no secrets, no Azure.
-  #   docker compose --profile demo up demo      then open http://localhost:8001
+  #   docker compose -f docker/docker-compose.yml --profile demo up demo   then open http://localhost:8001
   demo:
-    build: .
+    build: *build
     image: invoice-processor:local
     command: ["python", "-m", "app.demo", "--host", "0.0.0.0", "--port", "8000", "--public-url", "http://localhost:8001"]
     ports:

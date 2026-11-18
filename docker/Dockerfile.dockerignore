@@ -1,0 +1,19 @@
+# Never bake secrets or local state into the image. Docker reads this file
+# because it sits next to docker/Dockerfile; paths are relative to the
+# repository root (the build context).
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.venv
+**/__pycache__
+.pytest_cache
+*.egg-info
+runtime_data
+outlook_downloads
+manual_uploads
+tests
+scripts
+*.md
+.DS_Store
