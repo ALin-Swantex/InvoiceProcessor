@@ -167,30 +167,6 @@ class PostgresInvoiceStore:
             (),
         )
 
-    def list_for_approver(
-        self, level: int, email: str, limit: int = 500
-    ) -> list[InvoiceRecord]:
-        if level not in (1, 2):
-            raise ValueError("Approval level must be 1 or 2.")
-        self._validate_limit(limit, maximum=500)
-        column = f"approver{level}_email"
-        return self._query_many(
-            f"SELECT {_SELECT_COLUMNS} FROM invoices "
-            f"WHERE lower(btrim({column})) = lower(btrim(%s)) "
-            "ORDER BY created_at DESC LIMIT %s",
-            (email, limit),
-        )
-
-    def list_by_status(self, statuses: list[str], limit: int = 200) -> list[InvoiceRecord]:
-        if not statuses:
-            return []
-        self._validate_limit(limit, maximum=500)
-        return self._query_many(
-            f"SELECT {_SELECT_COLUMNS} FROM invoices "
-            "WHERE status = ANY(%s) ORDER BY created_at DESC LIMIT %s",
-            (statuses, limit),
-        )
-
     def list_all_with_status(self, statuses: list[str]) -> list[InvoiceRecord]:
         """Every invoice in the given statuses (no row limit)."""
         if not statuses:
@@ -386,24 +362,6 @@ class PostgresInvoiceStore:
                 )
                 row = cursor.fetchone()
         return self._record(row) if row is not None else None
-
-    def update_status(self, invoice_id: int, status: str) -> None:
-        self.update_fields(invoice_id, status=status)
-
-    def update_sharepoint(
-        self,
-        invoice_id: int,
-        *,
-        sharepoint_item_id: str,
-        sharepoint_web_url: str | None,
-        status: str,
-    ) -> None:
-        self.update_fields(
-            invoice_id,
-            sharepoint_item_id=sharepoint_item_id,
-            sharepoint_web_url=sharepoint_web_url,
-            status=status,
-        )
 
     def update_fields(self, invoice_id: int, **fields: object) -> InvoiceRecord:
         unknown = set(fields) - _UPDATABLE_COLUMNS

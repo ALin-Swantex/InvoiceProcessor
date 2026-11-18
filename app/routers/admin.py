@@ -70,11 +70,7 @@ def admin_list_sharepoint_folders(
 ) -> dict[str, object]:
     app = http_request.app
     folders = _sharepoint_folder_paths(app)
-    app.state.sharepoint_folder_paths = frozenset(folders)
     structures = discover_company_folder_structures(folders)
-    app.state.sharepoint_company_structures = {
-        structure.root: structure for structure in structures
-    }
     return {
         "folders": folders,
         "company_roots": [structure.as_dict() for structure in structures],

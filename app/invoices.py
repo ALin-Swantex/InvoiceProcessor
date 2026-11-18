@@ -331,39 +331,6 @@ class InvoiceStore:
             ).fetchall()
         return [InvoiceRecord(**dict(row)) for row in rows]
 
-    def list_for_approver(
-        self, level: int, email: str, limit: int = 500
-    ) -> list[InvoiceRecord]:
-        if level not in (1, 2):
-            raise ValueError("Approval level must be 1 or 2.")
-        if limit < 1 or limit > 500:
-            raise ValueError("Invoice limit must be between 1 and 500.")
-        column = f"approver{level}_email"
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"SELECT * FROM invoices "
-                f"WHERE lower(trim({column})) = lower(trim(?)) "
-                "ORDER BY created_at DESC LIMIT ?",
-                (email, limit),
-            ).fetchall()
-        return [InvoiceRecord(**dict(row)) for row in rows]
-
-    def list_by_status(self, statuses: list[str], limit: int = 200) -> list[InvoiceRecord]:
-        if not statuses:
-            return []
-        placeholders = ",".join("?" for _ in statuses)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT * FROM invoices
-                WHERE status IN ({placeholders})
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (*statuses, limit),
-            ).fetchall()
-        return [InvoiceRecord(**dict(row)) for row in rows]
-
     def list_all_with_status(self, statuses: list[str]) -> list[InvoiceRecord]:
         """Every invoice in the given statuses (no row limit)."""
         if not statuses:
@@ -563,26 +530,6 @@ class InvoiceStore:
                 (message_id, attachment_id),
             ).fetchone()
         return InvoiceRecord(**dict(row)) if row is not None else None
-
-    def update_status(self, invoice_id: int, status: str) -> None:
-        self.update_fields(invoice_id, status=status)
-
-    def update_sharepoint(
-        self,
-        invoice_id: int,
-        *,
-        sharepoint_item_id: str,
-        sharepoint_web_url: str | None,
-        status: str,
-    ) -> None:
-        """Record the SharePoint item ID and web URL after a successful upload
-        or move, and update the processing status."""
-        self.update_fields(
-            invoice_id,
-            sharepoint_item_id=sharepoint_item_id,
-            sharepoint_web_url=sharepoint_web_url,
-            status=status,
-        )
 
     def update_fields(self, invoice_id: int, **fields: object) -> InvoiceRecord:
         """Generic column update used by the invoice lifecycle module for

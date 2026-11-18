@@ -41,7 +41,6 @@ ROLE_PURCHASE_LEDGER = "purchase_ledger"
 ROLE_APPROVER_1 = "approver1"
 ROLE_APPROVER_2 = "approver2"
 ROLE_PURCHASING = "purchasing"
-ROLE_ALL = "all"
 
 
 @dataclass(frozen=True)

@@ -89,8 +89,7 @@ The runtime identity should use the narrower grants documented in
 
 Invoice source, extraction, review, approval, payment, reconciliation, queue,
 session, and configuration metadata are stored in PostgreSQL. The canonical PDF
-remains in SharePoint. For read-only Power BI reporting, see
-[POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md).
+remains in SharePoint.
 
 ## Demo mode (no Azure needed)
 
@@ -288,7 +287,5 @@ python3 -m app.outlook_subscription renew "$OUTLOOK_SUBSCRIPTION_ID"
   workflow and implementation mapping
 - [GRAPH_SETUP.md](GRAPH_SETUP.md) — Microsoft Graph mailbox and
   webhook configuration
-- [POWER_BI_INTEGRATION.md](POWER_BI_INTEGRATION.md) — reporting views and
-  Power BI connection instructions
 - [USER_ACCEPTANCE_TEST_CASES.md](USER_ACCEPTANCE_TEST_CASES.md) — pilot test
   checklist and release criteria

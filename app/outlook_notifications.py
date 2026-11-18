@@ -31,7 +31,6 @@ ON outlook_notifications(status, received_at);
 # so the claim time is recorded inside the JSON ``payload`` column, which the
 # application never reads back. Rows claimed before this field existed fall
 # back to ``received_at`` when deciding whether they are stale.
-CLAIMED_AT_KEY = "claimed_at"
 DEFAULT_MAX_ATTEMPTS = 5
 
 

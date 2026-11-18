@@ -317,7 +317,6 @@ def run_gui(configuration: LauncherConfiguration) -> int:
 
     base = tkfont.nametofont("TkDefaultFont").actual("family")
     title_font = (base, 20, "bold")
-    body_font = (base, 12)
     small_font = (base, 11)
     bold_font = (base, 12, "bold")
     mono = "Menlo" if sys.platform == "darwin" else "Consolas" if os.name == "nt" else "Monospace"

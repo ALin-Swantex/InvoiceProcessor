@@ -208,8 +208,6 @@ def create_app(
                 "ACTIVITY_FEED_DB_PATH", "runtime_data/activity_feed.db"
             )
         )
-    app.state.sharepoint_folder_paths = None
-    app.state.sharepoint_company_structures = None
     app.state.auth_store = auth_store or auth_store_from_environment()
     app.state.entra_auth_client = (
         entra_auth_client
