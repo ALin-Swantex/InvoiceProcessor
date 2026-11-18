@@ -71,11 +71,8 @@ def manual_upload_invoice(
     user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     """Manually add an invoice PDF into the same Incoming Invoices
-    workflow used for Outlook-sourced invoices, per SOFTWARE_SPEC.md
-    section 3: "There should also be a way of manually adding an
-    invoice to the Incoming Invoices folder so that invoices received
-    outside of the normal email process can still enter the same
-    workflow."
+    workflow used for Outlook-sourced invoices, so invoices received
+    outside the normal email process still enter the same workflow.
 
     In the connected deployment, the PDF is uploaded to SharePoint
     Incoming first and registered from its DriveItem identity. A local

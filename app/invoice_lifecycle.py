@@ -88,8 +88,7 @@ def _append_history_entry(
 
 
 class InvoiceLifecycle:
-    """Orchestrates every stage of the invoice workflow described in
-    SOFTWARE_SPEC.md: AI extraction, company/IRJ/routing, SharePoint filing,
+    """Orchestrates every stage of the invoice workflow: AI extraction, company/IRJ/routing, SharePoint filing,
     PO matching, nominal approvals (Approver 1 / Approver 2), payment, and
     bank reconciliation.
 
@@ -363,8 +362,7 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError(
                 "AI extraction may only run while an invoice is awaiting extraction."
             )
-        # SOFTWARE_SPEC.md exception rules list "the
-        # PDF cannot be read" as a scenario the system must handle sensibly
+        # "The PDF cannot be read" is a scenario the system must handle sensibly
         # rather than crash on. Once real AI extraction (Azure Document
         # Intelligence) is wired into run_ai_extraction, a corrupt/unreadable
         # PDF should flag the invoice for review, not raise an unhandled
@@ -709,7 +707,7 @@ class InvoiceLifecycle:
         if number_warnings:
             raise InvoiceLifecycleError(" ".join(number_warnings))
 
-        # Stage 6 (GENERAL_PROCESS.md): duplicate detection on
+        # Duplicate detection on
         # Company + Supplier + Supplier Invoice Number. A possible duplicate
         # is NEVER silently dropped or auto-merged -- it is flagged for
         # Purchase Ledger, who can then set override_duplicate=True (via the
@@ -1431,9 +1429,8 @@ class InvoiceLifecycle:
             self._filed_filename(invoice),
         )
         record = commit_decision(**fields)
-        # SOFTWARE_SPEC.md: "Once fully approved... The Purchase
-        # Ledger team should receive an email notification where
-        # appropriate." Purchase Ledger isn't the one clicking approve here
+        # Once fully approved, the Purchase Ledger team should receive an
+        # email notification where appropriate. Purchase Ledger isn't the one clicking approve here
         # (an approver is), so -- unlike the PO-matched branch above, where
         # Purchase Ledger performed the action themselves -- they need an
         # actual email, not just an activity feed entry they'd have to go
@@ -1921,8 +1918,7 @@ class InvoiceLifecycle:
             self._company_folders(invoice).paid,
             self._filed_filename(invoice),
         )
-        # SOFTWARE_SPEC.md: "Doing this should automatically:
-        # Record who marked the invoice as paid".
+        # Record who marked the invoice as paid.
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Paid / Awaiting Bank Reconciliation",
@@ -2046,8 +2042,7 @@ class InvoiceLifecycle:
             self._company_folders(invoice).reconciled,
             self._filed_filename(invoice),
         )
-        # SOFTWARE_SPEC.md: "The system should record: ...Who
-        # completed the reconciliation, where practical".
+        # Record who completed the reconciliation, where practical.
         # reconciliation_date is the date Purchase Ledger says the payment
         # appears on the bank statement; reconciled_at is the system
         # timestamp of when the invoice was actually marked reconciled here.

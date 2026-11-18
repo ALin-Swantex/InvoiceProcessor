@@ -39,7 +39,7 @@ def test_po_invoice_routes_to_matching_and_plans_notification() -> None:
     assert decision.route == "purchase_order"
     assert decision.status == "Awaiting PO Matching"
     assert decision.destination_folder == "/Companies/Example/PO Matching"
-    # SOFTWARE_SPEC.md: the IRJ number must be visible against the
+    # The IRJ number must be visible against the
     # invoice in SharePoint throughout the whole process -- PO invoices are
     # no exception, so the filename must be reference-prefixed just like nominal
     # invoices are below.

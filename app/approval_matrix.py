@@ -16,7 +16,7 @@ ALL_COMPANIES = "*"
 #
 # If a supplier is not on the matrix for the invoiced company, the invoice
 # must be flagged for manual review rather than automatically sent to
-# somebody (see SOFTWARE_SPEC.md) -- see InvoiceLifecycle.confirm_and_route.
+# somebody -- see InvoiceLifecycle.confirm_and_route.
 # ---------------------------------------------------------------------------
 
 

@@ -17,8 +17,7 @@ from pathlib import Path
 #
 # In a production Microsoft 365 deployment this module would instead read
 # and write a SharePoint List (e.g. "Companies", "Suppliers",
-# "Approval Matrix") through Microsoft Graph, exactly as GENERAL_PROCESS.md
-# describes. The table shapes below intentionally mirror those list designs
+# "Approval Matrix") through Microsoft Graph. The table shapes below intentionally mirror those list designs
 # so that swap is mostly a storage-layer change.
 # ---------------------------------------------------------------------------
 

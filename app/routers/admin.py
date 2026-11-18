@@ -1,7 +1,7 @@
 """Admin configuration: companies, suppliers, approval matrix, supplier
 terms, metrics, operations, bulk import, AI threshold and IRJ configuration.
-All admin-only (see SOFTWARE_SPEC.md: config must be maintainable by an
-authorised staff member without touching code)."""
+All admin-only (config must be maintainable by an authorised staff member
+without touching code)."""
 
 from __future__ import annotations
 

@@ -14,8 +14,8 @@ from app.config_db import connect
 # Company matching is deliberately conservative: a supplied name matches a
 # company only if it equals the company's canonical name or one of its
 # configured aliases (case-insensitively). Anything else is left unmatched
-# so Purchase Ledger is asked to confirm rather than the system guessing —
-# see SOFTWARE_SPEC.md (the application must not guess).
+# so Purchase Ledger is asked to confirm rather than the system guessing
+# (the application must not guess).
 # ---------------------------------------------------------------------------
 
 

@@ -40,9 +40,6 @@ Important behavior:
   of failed queue items, and highlights approval routes with missing emails.
 - Timestamps are displayed in UK time.
 
-See [INVOICE_WORKFLOW_FLOWCHART.md](INVOICE_WORKFLOW_FLOWCHART.md) for the
-complete state flow.
-
 ## Requirements
 
 - Python 3.11 or newer (3.12 is used in the Docker image)
@@ -50,7 +47,7 @@ complete state flow.
   for PostgreSQL for a connected deployment
 - An Anthropic API key (`ANTHROPIC_API_KEY`) for invoice extraction
 - For live intake: access to the Microsoft 365 tenant, the shared mailbox and
-  the SharePoint site (see [GRAPH_SETUP.md](GRAPH_SETUP.md))
+  the SharePoint site
 - Excel attachments are converted to PDF through Microsoft Graph, so no local
   LibreOffice is needed
 
@@ -324,14 +321,3 @@ Webhook subscription commands:
 python3 -m app.outlook_subscription create
 python3 -m app.outlook_subscription renew "$OUTLOOK_SUBSCRIPTION_ID"
 ```
-
-## Reference documents
-
-- [SOFTWARE_SPEC.md](SOFTWARE_SPEC.md) — current requirements, architecture,
-  delivery status, and remaining work
-- [GENERAL_PROCESS.md](GENERAL_PROCESS.md) — current business process and
-  operational rules
-- [INVOICE_WORKFLOW_FLOWCHART.md](INVOICE_WORKFLOW_FLOWCHART.md) — current
-  workflow and implementation mapping
-- [GRAPH_SETUP.md](GRAPH_SETUP.md) — Microsoft Graph mailbox and
-  webhook configuration

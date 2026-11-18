@@ -1,6 +1,6 @@
 # InvoiceProcessor
 
-Internal invoice-processing app (FastAPI + vanilla JS UI + a background worker). Invoices arrive by Outlook or manual upload, PDFs are filed in SharePoint, fields are extracted by Claude, and Purchase Ledger / approvers move each invoice through review, PO matching, approval, payment and reconciliation. PostgreSQL holds the data; Microsoft Entra handles login. See `README.md`, `SOFTWARE_SPEC.md` and `INVOICE_WORKFLOW_FLOWCHART.md` for the business process.
+Internal invoice-processing app (FastAPI + vanilla JS UI + a background worker). Invoices arrive by Outlook or manual upload, PDFs are filed in SharePoint, fields are extracted by Claude, and Purchase Ledger / approvers move each invoice through review, PO matching, approval, payment and reconciliation. PostgreSQL holds the data; Microsoft Entra handles login. See `README.md` for the workflow, installation and operations.
 
 ## Working guidelines
 These bias toward caution over speed; use judgment on trivial tasks.
