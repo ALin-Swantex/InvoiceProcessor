@@ -141,10 +141,16 @@ After installing the project, the easiest cross-platform option is:
 invoice-processor
 ```
 
-This opens a small desktop launcher on Windows, macOS, and Linux. Its **Start**
-button starts both the web application and Outlook worker, **Open web app**
-opens the browser, and closing it stops both processes. For a server without a
-desktop environment, use `invoice-processor --headless --open-browser`.
+This opens a desktop launcher on Windows, macOS, and Linux (also
+`python3 start.py` from the repository root, or double-click `start.py` on
+Windows). One **Start** click
+applies the database migrations, then starts the web application and the
+Outlook worker, and opens the browser once the web app answers. Each service
+shows its status, and all output appears in one colour-coded log that is also
+saved to `runtime_data/launcher.log`. **Stop**, or closing the window, stops
+everything. The worker acts on the real mailbox and SharePoint, so Start
+processes real files. For a server without a desktop environment, use
+`invoice-processor --headless --open-browser`.
 
 The launcher is installed by the existing setup command:
 
