@@ -23,7 +23,7 @@ Outlook or manual upload
 Important behavior:
 
 - SharePoint is the canonical PDF store.
-- Azure PostgreSQL stores invoices, companies, suppliers, approval routes,
+- PostgreSQL stores invoices, companies, suppliers, approval routes,
   payment settings, audit events, IRJ sequences, and email-stage claims.
 - Microsoft Entra provides login and application roles.
 - Queries and approval holds do not move an invoice or change its workflow
@@ -45,51 +45,140 @@ complete state flow.
 
 ## Requirements
 
-- Python 3.11 or newer
-- Access to the configured Microsoft 365 tenant and SharePoint site
-- Azure Database for PostgreSQL for the connected deployment
-- Excel attachments are converted to PDF through Microsoft Graph (no local
-  LibreOffice is needed)
+- Python 3.11 or newer (3.12 is used in the Docker image)
+- PostgreSQL 16: a local server for development and testing, or Azure Database
+  for PostgreSQL for a connected deployment
+- An Anthropic API key (`ANTHROPIC_API_KEY`) for invoice extraction
+- For live intake: access to the Microsoft 365 tenant, the shared mailbox and
+  the SharePoint site (see [GRAPH_SETUP.md](GRAPH_SETUP.md))
+- Excel attachments are converted to PDF through Microsoft Graph, so no local
+  LibreOffice is needed
 
-## Initial setup
+## Installation
 
-From the repository root:
+### 1. Get the code and install it
+
+macOS or Linux:
 
 ```bash
+git clone https://github.com/ALin-Swantex/InvoiceProcessor.git
+cd InvoiceProcessor
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -e '.[azure,test]'
+```
+
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/ALin-Swantex/InvoiceProcessor.git
+cd InvoiceProcessor
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+py -m pip install -e ".[azure,test]"
+```
+
+The `azure` extra installs the PostgreSQL driver as well as the Azure sign-in
+libraries, so it is needed even with a local database.
+
+### 2. Create a PostgreSQL database
+
+For a local database (macOS with Homebrew shown; on Windows use the
+installer from postgresql.org):
+
+```bash
+brew install postgresql@16
+brew services start postgresql@16
+createdb invoice_processing_dev
+```
+
+### 3. Configure `.env`
+
+```bash
 cp .env.example .env
 ```
 
-Configure `.env` with the required Entra, Microsoft Graph, SharePoint, Azure
-PostgreSQL, and `ANTHROPIC_API_KEY` settings. Never commit `.env` or secrets.
-
-The application runtime uses PostgreSQL for invoices, configuration, sessions,
-activity, IRJ sequences, and the Outlook processing queue:
+Fill in the values. The essentials are:
 
 ```dotenv
 INVOICE_STORE_BACKEND=postgres
 CONFIG_STORE_BACKEND=postgres
-AUTH_LOCAL_LOGIN_ENABLED=false
-AUTH_COOKIE_SECURE=true
+DATABASE_URL=postgresql://USER:PASSWORD@127.0.0.1:5432/invoice_processing_dev?sslmode=disable
+ANTHROPIC_API_KEY=...
 ```
 
-## Database migrations
+plus the `GRAPH_*` and `SHAREPOINT_*` settings for the mailbox and SharePoint.
+`.env.example` explains every setting. For an Azure database, use the Azure
+`DATABASE_URL` with `sslmode=verify-full` instead. Never commit `.env` or
+secrets.
 
-Apply migrations after initial setup and whenever new migrations are pulled:
+For a local, plain-HTTP setup you can sign in with the development accounts in
+`app/auth.py` by setting `AUTH_LOCAL_LOGIN_ENABLED=true` and
+`AUTH_COOKIE_SECURE=false`. Never enable local login on a deployment others can
+reach; there, use Microsoft Entra sign-in with `AUTH_COOKIE_SECURE=true`.
+
+### 4. Apply the database migrations
 
 ```bash
 python3 -m app.postgres_migrate
 ```
 
-The deployment identity applying migrations requires schema-change permission.
-The runtime identity should use the narrower grants documented in
+Run this again whenever new migrations are pulled (the launcher below also
+runs it on every start). The identity applying migrations needs schema-change
+permission; the runtime identity should use the narrower grants in
 `app/postgres_runtime_grants.sql.template`.
 
-Invoice source, extraction, review, approval, payment, reconciliation, queue,
-session, and configuration metadata are stored in PostgreSQL. The canonical PDF
-remains in SharePoint.
+### 5. Check the setup
+
+```bash
+python3 -m pytest -q                          # mocked; needs no cloud access
+python3 -m scripts.check_live_azure           # read-only live checks
+python3 -m scripts.check_live_azure --extraction   # plus one small paid AI call
+```
+
+## Running the application
+
+### One click: the launcher
+
+```bash
+python3 start.py
+```
+
+On Windows you can also double-click `start.py`. On macOS you can make a
+double-click Desktop app that opens the launcher without a Terminal window
+(adjust the two paths):
+
+```bash
+osacompile -o ~/Desktop/"Invoice Processor.app" -e 'do shell script "cd /path/to/InvoiceProcessor && /path/to/python3 -m app.launcher > /dev/null 2>&1 &"'
+```
+
+One **Start** click applies the database migrations, then starts the web
+application and the Outlook worker, and opens <http://127.0.0.1:8000> once the
+web app answers. Each service shows its status, and all output appears in one
+colour-coded log that is also saved to `runtime_data/launcher.log`. **Stop**,
+or closing the window, stops everything.
+
+**The worker acts on the real mailbox and SharePoint**, so Start processes
+real files. Pointed at a fresh database it registers and moves every PDF in
+SharePoint Incoming.
+
+Without a desktop (a server, or a terminal session):
+
+```bash
+python3 start.py --headless --open-browser   # Ctrl+C stops everything
+```
+
+### Services one at a time
+
+For diagnosing one component, run each in its own terminal from the
+repository root, with the virtual environment active:
+
+```bash
+python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000   # web app
+python3 -m app.outlook_worker                                  # worker
+```
+
+Run exactly one worker per mailbox.
 
 ## Demo mode (no Azure needed)
 
@@ -109,78 +198,38 @@ real systems, and its data is discarded when it stops (`--data-dir` keeps it).
 
 ## Run with Docker
 
-One image runs everything; `docker-compose.yml` starts the web application and
-the Outlook worker, and reads your settings from `.env` (never copied into the
-image):
+The application is containerised: one image (Python 3.12, non-root, working
+files on a `/data` volume) runs every service, and `docker-compose.yml` starts
+the web application and the Outlook worker with your settings from `.env`
+(never copied into the image). It needs Docker Desktop or Docker Engine with
+Compose.
 
 ```bash
-cp .env.example .env        # then fill in the values
-docker compose up -d --build
+cp .env.example .env                              # then fill in the values
 docker compose --profile tools run --rm migrate   # apply database migrations
+docker compose up -d --build                      # web app + worker
+docker compose logs -f web worker                 # follow the logs
+docker compose down                               # stop
 ```
 
 Open <http://localhost:8000>. Notes:
 
-- The containers must be able to resolve and reach Azure PostgreSQL (VPN,
-  private network or an allowed IP) and make outbound HTTPS calls to the
-  Anthropic API for invoice extraction.
+- **The database is not in a container.** Compose expects PostgreSQL to run
+  elsewhere. Inside a container `127.0.0.1` is the container itself, so for a
+  PostgreSQL server on the same machine use `host.docker.internal` as the host
+  in `DATABASE_URL` (Docker Desktop on macOS and Windows). For Azure PostgreSQL
+  the containers must be able to resolve and reach the server (VPN, private
+  network or an allowed IP).
+- The containers make outbound HTTPS calls to Microsoft Graph and the
+  Anthropic API.
 - Run exactly one `worker` per mailbox; do not scale it.
 - Working files live on the `invoice-data` volume (`/data`). SharePoint stays
   the canonical PDF store, so the volume can be rebuilt.
-- `docker compose logs -f web worker` shows logs; the web container reports
-  health through `/api/health`, which includes the worker heartbeat.
+- The web container reports health through `/api/health`, which includes the
+  worker heartbeat.
 - Behind HTTPS set `AUTH_COOKIE_SECURE=true` and a public `APP_PUBLIC_URL`; use
   `false` only for plain-HTTP local testing.
-
-## Run the application without Docker
-
-After installing the project, the easiest cross-platform option is:
-
-```bash
-invoice-processor
-```
-
-This opens a desktop launcher on Windows, macOS, and Linux (also
-`python3 start.py` from the repository root, or double-click `start.py` on
-Windows). One **Start** click
-applies the database migrations, then starts the web application and the
-Outlook worker, and opens the browser once the web app answers. Each service
-shows its status, and all output appears in one colour-coded log that is also
-saved to `runtime_data/launcher.log`. **Stop**, or closing the window, stops
-everything. The worker acts on the real mailbox and SharePoint, so Start
-processes real files. For a server without a desktop environment, use
-`invoice-processor --headless --open-browser`.
-
-The launcher is installed by the existing setup command:
-
-```bash
-python3 -m pip install -e '.[azure,test]'
-```
-
-You can still run the services separately when diagnosing an individual
-component:
-
-Run the web application and worker in separate terminals from the repository
-root.
-
-**Terminal 1 — web application**
-
-```bash
-source .venv/bin/activate
-python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-**Terminal 2 — Outlook and SharePoint worker**
-
-```bash
-source .venv/bin/activate
-python3 -m app.outlook_worker
-```
-
-Open <http://127.0.0.1:8000>.
-
-Do not run multiple worker instances against the same mailbox unless deployment
-coordination explicitly supports it.
+- The desktop launcher is not used with Docker; Compose does its job.
 
 ## Health check
 
@@ -197,8 +246,7 @@ Expected response:
 ## Tests
 
 ```bash
-source .venv/bin/activate
-pytest -q
+python3 -m pytest -q
 ```
 
 The suite uses local and mocked services; passing tests do not establish live
