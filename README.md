@@ -335,5 +335,3 @@ python3 -m app.outlook_subscription renew "$OUTLOOK_SUBSCRIPTION_ID"
   workflow and implementation mapping
 - [GRAPH_SETUP.md](GRAPH_SETUP.md) — Microsoft Graph mailbox and
   webhook configuration
-- [USER_ACCEPTANCE_TEST_CASES.md](USER_ACCEPTANCE_TEST_CASES.md) — pilot test
-  checklist and release criteria

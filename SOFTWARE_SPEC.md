@@ -117,7 +117,6 @@ remain only as isolated test doubles.
 | Sage 200 | Sandbox posting, idempotency, and recovery verified |
 | Power BI deployment | Reader, published model, refresh, counts, and access verified |
 | Production hosting | HTTPS, supervision, secrets, alerts, backup/restore complete |
-| UAT | Required cases in `USER_ACCEPTANCE_TEST_CASES.md` signed off |
 
 Passing local tests does not prove live Azure, Graph, SharePoint, extraction, or
 Power BI service connectivity. Live smoke checks must use approved credentials
