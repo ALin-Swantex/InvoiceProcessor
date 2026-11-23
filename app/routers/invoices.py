@@ -273,6 +273,33 @@ def get_invoice(http_request: Request, invoice_id: int, user: User = Depends(get
     return asdict(invoice)
 
 
+@router.get("/api/invoices/{invoice_id}/company-options")
+def invoice_company_options(
+    http_request: Request,
+    invoice_id: int,
+    user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+) -> dict[str, object]:
+    """Whether the invoice's company has an approval route for its supplier,
+    and which companies do, so review can ask Purchase Ledger to choose."""
+    app = http_request.app
+    invoice = invoice_for_user(app, invoice_id, user)
+    supplier = (invoice.supplier or "").strip()
+    matrix = app.state.approval_matrix_store
+    return {
+        "supplier": supplier,
+        "has_route": bool(
+            supplier
+            and invoice.company
+            and matrix.find(invoice.company, supplier) is not None
+        ),
+        "companies": [
+            company.name
+            for company in app.state.companies_store.list()
+            if supplier and matrix.find(company.name, supplier) is not None
+        ],
+    }
+
+
 @router.delete("/api/invoices/{invoice_id}")
 def delete_invoice(
     http_request: Request,

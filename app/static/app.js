@@ -418,9 +418,46 @@
                 setValue("correction-reason", invoice.correction_reason);
                 applyPreviewConfidence(invoice);
                 pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
+                await offerCompanyChoice(invoice);
               }
               pdfFrame.style.display = "block";
               pdfEmpty.style.display = "none";
+            }
+
+            // When the extracted company has no approval route for the
+            // supplier, ask which of the companies that do is invoiced.
+            async function offerCompanyChoice(invoice) {
+              if (!invoice.supplier) return;
+              const response = await fetch(`/api/invoices/${invoice.id}/company-options`);
+              if (!response.ok) return;
+              const options = await response.json();
+              if (options.has_route || !options.companies.length) return;
+              if (displayedInvoiceId !== invoice.id) return;
+              const dialog = document.getElementById("company-choice-dialog");
+              document.getElementById("company-choice-context").textContent =
+                (invoice.company
+                  ? `${options.supplier} has no approval route under ${invoice.company}.`
+                  : `The company could not be read from this ${options.supplier} invoice.`) +
+                " Check who the invoice is addressed to and choose the company.";
+              document.getElementById("company-choice-pdf").src =
+                `/api/invoices/${invoice.id}/pdf`;
+              const container = document.getElementById("company-choice-options");
+              container.innerHTML = "";
+              for (const company of options.companies) {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "primary";
+                button.textContent = company;
+                button.onclick = async () => {
+                  dialog.close();
+                  if (displayedInvoiceId !== invoice.id) return;
+                  previewCompanyWanted = company;
+                  setValue("preview-company", company);
+                  await loadSuppliers(company, options.supplier);
+                };
+                container.appendChild(button);
+              }
+              dialog.showModal();
             }
 
             function isFlaggedInvoice(invoice) {

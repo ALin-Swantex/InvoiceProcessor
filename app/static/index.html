@@ -126,6 +126,18 @@
     </form>
   </dialog>
 
+  <dialog id="company-choice-dialog" class="company-choice-dialog" aria-labelledby="company-choice-title">
+    <form method="dialog" class="dialog-content">
+      <h2 id="company-choice-title">Which company is this invoice for?</h2>
+      <p id="company-choice-context"></p>
+      <iframe class="company-choice-pdf" id="company-choice-pdf" title="Invoice PDF"></iframe>
+      <div class="company-choice-options" id="company-choice-options"></div>
+      <div class="actions">
+        <button type="submit" class="secondary">Choose later</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="admin-edit-dialog" class="admin-edit-dialog" aria-labelledby="admin-edit-title">
     <form id="admin-edit-form" class="dialog-content">
       <h2 id="admin-edit-title">Edit record</h2>

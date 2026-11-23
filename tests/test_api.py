@@ -212,6 +212,40 @@ def test_supplier_list_is_filtered_by_selected_company(tmp_path) -> None:
     assert [supplier["name"] for supplier in response.json()] == ["Supplier Ltd"]
 
 
+def test_company_options_list_companies_with_a_route_for_the_supplier(tmp_path) -> None:
+    client = client_for(tmp_path)
+    store = client.app.state.invoice_store
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(VALID_PDF_BYTES)
+    invoice = store.add_from_outlook(
+        message={"id": "message-1"},
+        attachment={"id": "attachment-1", "name": "invoice.pdf"},
+        stored_path=pdf,
+    )
+    # The seed routes "Supplier Ltd" under Acme and Northfield, not Riverside.
+    store.update_fields(
+        invoice.id, company="Riverside Logistics", supplier="Supplier Ltd"
+    )
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    )
+    assert login.status_code == 200
+
+    response = client.get(f"/api/invoices/{invoice.id}/company-options")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "supplier": "Supplier Ltd",
+        "has_route": False,
+        "companies": ["Acme Trading Ltd", "Northfield Manufacturing"],
+    }
+
+    store.update_fields(invoice.id, company="Acme Trading Ltd")
+    response = client.get(f"/api/invoices/{invoice.id}/company-options")
+    assert response.json()["has_route"] is True
+
+
 def test_invoice_search_finds_normalized_irj_number(tmp_path) -> None:
     client = client_for(tmp_path)
     store = client.app.state.invoice_store
