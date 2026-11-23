@@ -1172,7 +1172,7 @@
               }
               html += `<td class="row-actions"><div class="row-action-buttons">` +
                 `${actionsFn(invoice)}</div>` +
-                `<span class="invoice-expand-hint">${expanded ? "Hide" : "View"} PDF and extracted fields</span></td>`;
+                `<span class="invoice-expand-hint">${expanded ? "Hide" : "Show"} details</span></td>`;
               html += "</tr>";
               if (expanded) {
                 html += `<tr class="invoice-analysis-row"><td colspan="${columns.length + 1}" ` +
@@ -1775,7 +1775,7 @@
                   ${invoice.document_type === "statement" ? `
                     <button data-action="mark-invoice" data-id="${invoice.id}" class="secondary">Treat as invoice</button>
                   ` : `
-                    <button data-action="open-review" data-id="${invoice.id}" class="secondary">Open invoice review</button>
+                    <button data-action="open-review" data-id="${invoice.id}" class="secondary">Review</button>
                   `}
                   <select data-statement-company="${invoice.id}" aria-label="Statement company"></select>
                   <button data-action="file-statement" data-id="${invoice.id}">File as statement</button>
@@ -1809,7 +1809,7 @@
                 sectionColumns("sage-registration"),
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="register-sage" data-id="${invoice.id}" data-irj="${escapeHtml(invoice.irj_number || "")}">Confirm Sage registration / IRJ</button>
+                  <button data-action="register-sage" data-id="${invoice.id}" data-irj="${escapeHtml(invoice.irj_number || "")}">Register in Sage</button>
                 `
               );
               renderSectionTable(
@@ -1847,7 +1847,7 @@
                 invoice => `
                   ${pdfLinkButton(invoice)}
                   ${invoice.status === "Payment Routing Issue / On Hold"
-                    ? `<button data-action="retry-payment-route" data-id="${invoice.id}">Retry payment routing</button>`
+                    ? `<button data-action="retry-payment-route" data-id="${invoice.id}">Retry routing</button>`
                     : `<button data-action="resume" data-id="${invoice.id}">${invoice.status === "Workflow Issue / On Hold" ? "Resolve issue" : "Resume approval"}</button>`}
                 `,
                 invoice => invoice.status.includes("On Hold") || Boolean(invoice.hold_level)
