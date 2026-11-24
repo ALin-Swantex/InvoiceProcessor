@@ -5,7 +5,8 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Callable
+from contextlib import contextmanager
+from typing import Callable, Iterator
 from zoneinfo import ZoneInfo
 
 from app.activity_feed import (
@@ -261,6 +262,78 @@ class InvoiceLifecycle:
             message=message,
             invoice_id=invoice_id,
         )
+
+    @contextmanager
+    def _claimed(
+        self,
+        invoice: InvoiceRecord,
+        claim_status: str = Status.PROCESSING_UPDATE,
+        *,
+        refusal: str | None = None,
+    ) -> Iterator[Callable[..., InvoiceRecord]]:
+        """Hold ``invoice`` in ``claim_status`` while a stage works on it.
+
+        Only one caller can move an invoice out of its current status, so a
+        second action on the same invoice (a double click, two people, the web
+        app and the worker) fails cleanly instead of both running. Yields a
+        ``save(**fields)`` that commits only while the claim is held. A save
+        without ``status`` keeps the claim (an intermediate save); the last
+        save must set the status. If anything fails before that, the invoice
+        returns to its original status, so nothing is left in a status no
+        queue shows."""
+        original = invoice.status
+        if self.invoice_store.update_fields_if_status(
+            invoice.id, original, status=claim_status
+        ) is None:
+            current = self._require_invoice(invoice.id)
+            raise InvoiceLifecycleError(
+                f"{refusal or f'Invoice {invoice.id} changed while this action started'} "
+                f"(status: {current.status})."
+            )
+
+        def save(**fields: object) -> InvoiceRecord:
+            record = self.invoice_store.update_fields_if_status(
+                invoice.id, claim_status, **fields
+            )
+            if record is None:
+                current = self._require_invoice(invoice.id)
+                raise InvoiceLifecycleError(
+                    f"Invoice {invoice.id} could not be saved "
+                    f"(status: {current.status})."
+                )
+            return record
+
+        try:
+            yield save
+        except BaseException:
+            # A no-op once save() has run: the claim status is gone by then.
+            self.invoice_store.update_fields_if_status(
+                invoice.id, claim_status, status=original
+            )
+            raise
+
+    def _transition(
+        self,
+        invoice: InvoiceRecord,
+        status: str,
+        *,
+        folder: str | None = None,
+        filename: str | None = None,
+        move_pdf: bool = True,
+        **fields: object,
+    ) -> InvoiceRecord:
+        """Move ``invoice`` to ``status``: claim it, file its PDF (in
+        ``folder``, by default the status's own folder, if it has one), then
+        save ``status`` and ``fields``. See _claimed for what happens on
+        failure."""
+        with self._claimed(invoice) as save:
+            if move_pdf:
+                destination = folder or self._folder_for_status(invoice, status)
+                if destination is not None:
+                    self._move_pdf_in_sharepoint(
+                        invoice, destination, filename or self._filed_filename(invoice)
+                    )
+            return save(status=status, **fields)
 
     @staticmethod
     def _app_url(tab: str) -> str:
@@ -803,31 +876,11 @@ class InvoiceLifecycle:
 
         # Claim the invoice before allocating an IRJ, so a double submit (or
         # a manual confirm racing auto-confirm) cannot allocate two numbers.
-        original_status = invoice.status
-        claimed = self.invoice_store.update_fields_if_status(
-            invoice_id, original_status, status=Status.PROCESSING_CONFIRMATION
-        )
-        if claimed is None:
-            current = self._require_invoice(invoice_id)
-            raise InvoiceLifecycleError(
-                f"Invoice {invoice_id} is not awaiting confirmation "
-                f"(status: {current.status})."
-            )
-        invoice = claimed
-
-        def save_claimed(**fields: object) -> InvoiceRecord:
-            record = self.invoice_store.update_fields_if_status(
-                invoice_id, Status.PROCESSING_CONFIRMATION, **fields
-            )
-            if record is None:
-                current = self._require_invoice(invoice_id)
-                raise InvoiceLifecycleError(
-                    f"Invoice {invoice_id} confirmation could not be completed "
-                    f"(status: {current.status})."
-                )
-            return record
-
-        try:
+        with self._claimed(
+            invoice,
+            Status.PROCESSING_CONFIRMATION,
+            refusal=f"Invoice {invoice_id} is not awaiting confirmation",
+        ) as save_claimed:
             # Duplicate detection on
             # Company + Supplier + Supplier Invoice Number. A possible duplicate
             # is NEVER silently dropped or auto-merged -- it is flagged for
@@ -984,13 +1037,6 @@ class InvoiceLifecycle:
                 invoice_id=invoice_id,
             )
             return record
-        except Exception:
-            # Nothing else knows the claim status; put the invoice back so it
-            # can be retried. A no-op once the final status has been saved.
-            self.invoice_store.update_fields_if_status(
-                invoice_id, Status.PROCESSING_CONFIRMATION, status=original_status
-            )
-            raise
 
     # ------------------------------------------------------------------
     # Stage 3a: PO matching
@@ -1012,12 +1058,6 @@ class InvoiceLifecycle:
                 f"Invoice {invoice_id} is not awaiting PO matching (status: {invoice.status})."
             )
         if matched:
-            if invoice.status == Status.PO_QUERY:
-                self._move_pdf_in_sharepoint(
-                    invoice,
-                    self._company_folders(invoice).po_match,
-                    self._filed_filename(invoice),
-                )
             po_history = invoice.po_query_notes
             if po_history:
                 po_history = _append_history_entry(
@@ -1025,9 +1065,13 @@ class InvoiceLifecycle:
                     f"{recorded_by} resolved PO query / matched",
                     notes or "Matched without additional resolution notes.",
                 )
-            record = self.invoice_store.update_fields(
-                invoice_id,
-                status=Status.AWAITING_SAGE_REGISTRATION,
+            # A queried invoice goes back to the PO matching folder; a matched
+            # one is already there.
+            record = self._transition(
+                invoice,
+                Status.AWAITING_SAGE_REGISTRATION,
+                folder=self._company_folders(invoice).po_match,
+                move_pdf=invoice.status == Status.PO_QUERY,
                 po_query_notes=po_history or notes,
                 po_query_category=None,
                 po_query_contact=None,
@@ -1146,14 +1190,7 @@ class InvoiceLifecycle:
                 raise
 
         if invoice.invoice_type == "po":
-            self._move_pdf_in_sharepoint(
-                invoice,
-                self._company_folders(invoice).approved_for_payment,
-                self._filed_filename(invoice),
-            )
-            record = self.invoice_store.update_fields(
-                invoice_id, status=Status.APPROVED, review_reason=None
-            )
+            record = self._transition(invoice, Status.APPROVED, review_reason=None)
             self._log_purchase_ledger(
                 event_type="approved",
                 message=(
@@ -1192,13 +1229,13 @@ class InvoiceLifecycle:
                     f"{', '.join(missing_recipients)}."
                 )
         if missing_route_detail is not None:
-            self._move_to_flagged(invoice)
-            record = self.invoice_store.update_fields(
-                invoice_id,
-                status=Status.NEEDS_REVIEW,
-                review_return_status=None,
-                review_reason=f"{missing_route_detail} Configure the route, then retry.",
-            )
+            with self._claimed(invoice) as save:
+                self._move_to_flagged(invoice)
+                record = save(
+                    status=Status.NEEDS_REVIEW,
+                    review_return_status=None,
+                    review_reason=f"{missing_route_detail} Configure the route, then retry.",
+                )
             self._log_purchase_ledger(
                 event_type="needs_review",
                 message=(
@@ -1209,14 +1246,9 @@ class InvoiceLifecycle:
             )
             return record
 
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            self._company_folders(invoice).nominal_approver_1,
-            self._filed_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.AWAITING_APPROVAL_1,
+            Status.AWAITING_APPROVAL_1,
             approver1_name=entry.approver1.name,
             approver1_email=entry.approver1.email,
             approver2_name=entry.approver2.name if entry.approver2 else None,
@@ -1289,14 +1321,11 @@ class InvoiceLifecycle:
             )
         if not reason.strip():
             raise InvoiceLifecycleError("A rejection reason is required.")
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            REJECTED_INVOICES_FOLDER,
-            self._rejected_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.REJECTED,
+            Status.REJECTED,
+            folder=REJECTED_INVOICES_FOLDER,
+            filename=self._rejected_filename(invoice),
             rejection_reason=reason.strip(),
         )
         self._log_purchase_ledger(
@@ -1330,14 +1359,11 @@ class InvoiceLifecycle:
             original.irj_number if original is not None else None,
         )
         reason = f"Confirmed duplicate of {reference}."
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            REJECTED_INVOICES_FOLDER,
-            self._rejected_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.CANCELLED_DUPLICATE,
+            Status.CANCELLED_DUPLICATE,
+            folder=REJECTED_INVOICES_FOLDER,
+            filename=self._rejected_filename(invoice),
             cancelled_at=now,
             cancelled_by=recorded_by,
             cancellation_reason=reason,
@@ -1381,216 +1407,172 @@ class InvoiceLifecycle:
             )
 
         now = datetime.now(timezone.utc).isoformat()
-        processing_status = processing_approval(level)
-        claimed = self.invoice_store.update_fields_if_status(
-            invoice_id,
-            expected_status,
-            status=processing_status,
-        )
-        if claimed is None:
-            current = self._require_invoice(invoice_id)
-            raise InvoiceLifecycleError(
-                f"Invoice {invoice_id} is not {expected_status} "
-                f"(status: {current.status})."
-            )
-        invoice = claimed
-
-        def commit_decision(**fields: object) -> InvoiceRecord:
-            record = self.invoice_store.update_fields_if_status(
-                invoice_id,
-                processing_status,
-                **fields,
-            )
-            if record is None:
-                current = self._require_invoice(invoice_id)
-                raise InvoiceLifecycleError(
-                    f"Invoice {invoice_id} approval could not be completed "
-                    f"(status: {current.status})."
+        with self._claimed(
+            invoice,
+            processing_approval(level),
+            refusal=f"Invoice {invoice_id} is not {expected_status}",
+        ) as commit_decision:
+            if decision == "on_hold":
+                # A query is metadata on the current approval stage, not a routing
+                # decision. Do not move the PDF or change its visible stage.
+                history = _append_history_entry(
+                    invoice.hold_reason,
+                    f"{recorded_by} recorded approval query",
+                    comments,
                 )
-            return record
+                fields = {
+                    "status": expected_status,
+                    "hold_level": level,
+                    "hold_reason": history,
+                    "approval_hold_started_at": (
+                        invoice.approval_hold_started_at or now
+                    ),
+                    "approval_hold_reminder_sent_at": None,
+                    f"approver{level}_comments": getattr(
+                        invoice, f"approver{level}_comments"
+                    ),
+                }
+                record = commit_decision(**fields)
+                self._log_purchase_ledger(
+                    event_type="approval_on_hold",
+                    message=(
+                        f"Invoice {invoice.irj_number}: {recorded_by} placed it "
+                        f"on hold — {comments}"
+                    ),
+                    invoice_id=invoice_id,
+                )
+                return record
 
-        def move_pdf(destination: Callable[[], tuple[str, str]]) -> None:
-            # Any failure (a missing company folder, a Graph timeout, a lost
-            # local PDF) must put the invoice back in its queue: nothing else
-            # knows the "Processing Approval N" status, so it would be stuck.
-            try:
-                destination_folder, destination_filename = destination()
+            if decision == "rejected":
+                fields = {
+                    f"approver{level}_decision": "rejected",
+                    f"approver{level}_date": now,
+                    f"approver{level}_comments": (
+                        _append_history_entry(
+                            getattr(invoice, f"approver{level}_comments"),
+                            f"{recorded_by} rejected",
+                            comments,
+                        )
+                        if comments
+                        else getattr(invoice, f"approver{level}_comments")
+                    ),
+                    "status": Status.REJECTED,
+                    "hold_level": None,
+                    "rejection_reason": comments,
+                    "approval_requested_at": None,
+                    "approval_reminder_sent_at": None,
+                    "approval_hold_started_at": None,
+                    "approval_hold_reminder_sent_at": None,
+                }
+                self._move_pdf_in_sharepoint(
+                    invoice, REJECTED_INVOICES_FOLDER, self._rejected_filename(invoice)
+                )
+                record = commit_decision(**fields)
+                self._log_purchase_ledger(
+                    event_type="rejected",
+                    message=f"Invoice {invoice.irj_number} rejected by {recorded_by}.",
+                    invoice_id=invoice_id,
+                )
+                self._notify_purchase_ledger_rejection(record)
+                return record
+
+            if level == 1 and invoice.approver2_name:
+                fields = {
+                    "approver1_decision": "approved",
+                    "approver1_date": now,
+                    "approver1_comments": (
+                        _append_history_entry(
+                            invoice.approver1_comments,
+                            f"{recorded_by} approved",
+                            comments,
+                        )
+                        if comments
+                        else invoice.approver1_comments
+                    ),
+                    "status": Status.AWAITING_APPROVAL_2,
+                    "hold_level": None,
+                    "approval_requested_at": now,
+                    "approval_reminder_sent_at": None,
+                    "approval_hold_started_at": None,
+                    "approval_hold_reminder_sent_at": None,
+                }
                 self._move_pdf_in_sharepoint(
                     invoice,
-                    destination_folder,
-                    destination_filename,
+                    self._company_folders(invoice).nominal_approver_2,
+                    self._filed_filename(invoice),
                 )
-            except Exception:
-                self.invoice_store.update_fields_if_status(
+                record = commit_decision(**fields)
+                self._send_stage_email(
                     invoice_id,
-                    processing_status,
-                    status=expected_status,
+                    "approval_2",
+                    recipient=str(invoice.approver2_email),
+                    subject=(
+                        f"New invoice ({invoice.original_filename}) waiting for "
+                        "approval"
+                    ),
+                    body=self._approval_email_body(record, 2, reminder=False),
                 )
-                raise
+                self.activity_feed.add_event(
+                    event_type="approval_pending",
+                    target_role=ROLE_APPROVER_2,
+                    message=(
+                        f"Invoice {invoice.irj_number} ({invoice.supplier}) is "
+                        "awaiting Approver 2 approval."
+                    ),
+                    invoice_id=invoice_id,
+                )
+                return record
 
-        if decision == "on_hold":
-            # A query is metadata on the current approval stage, not a routing
-            # decision. Do not move the PDF or change its visible stage.
-            history = _append_history_entry(
-                invoice.hold_reason,
-                f"{recorded_by} recorded approval query",
-                comments,
-            )
             fields = {
-                "status": expected_status,
-                "hold_level": level,
-                "hold_reason": history,
-                "approval_hold_started_at": (
-                    invoice.approval_hold_started_at or now
-                ),
-                "approval_hold_reminder_sent_at": None,
-                f"approver{level}_comments": getattr(
-                    invoice, f"approver{level}_comments"
-                ),
-            }
-            record = commit_decision(**fields)
-            self._log_purchase_ledger(
-                event_type="approval_on_hold",
-                message=(
-                    f"Invoice {invoice.irj_number}: {recorded_by} placed it "
-                    f"on hold — {comments}"
-                ),
-                invoice_id=invoice_id,
-            )
-            return record
-
-        if decision == "rejected":
-            fields = {
-                f"approver{level}_decision": "rejected",
+                f"approver{level}_decision": "approved",
                 f"approver{level}_date": now,
                 f"approver{level}_comments": (
                     _append_history_entry(
                         getattr(invoice, f"approver{level}_comments"),
-                        f"{recorded_by} rejected",
+                        f"{recorded_by} approved",
                         comments,
                     )
                     if comments
                     else getattr(invoice, f"approver{level}_comments")
                 ),
-                "status": Status.REJECTED,
+                "status": Status.APPROVED,
                 "hold_level": None,
-                "rejection_reason": comments,
                 "approval_requested_at": None,
                 "approval_reminder_sent_at": None,
                 "approval_hold_started_at": None,
                 "approval_hold_reminder_sent_at": None,
             }
-            move_pdf(
-                lambda: (REJECTED_INVOICES_FOLDER, self._rejected_filename(invoice))
-            )
-            record = commit_decision(**fields)
-            self._log_purchase_ledger(
-                event_type="rejected",
-                message=f"Invoice {invoice.irj_number} rejected by {recorded_by}.",
-                invoice_id=invoice_id,
-            )
-            self._notify_purchase_ledger_rejection(record)
-            return record
-
-        if level == 1 and invoice.approver2_name:
-            fields = {
-                "approver1_decision": "approved",
-                "approver1_date": now,
-                "approver1_comments": (
-                    _append_history_entry(
-                        invoice.approver1_comments,
-                        f"{recorded_by} approved",
-                        comments,
-                    )
-                    if comments
-                    else invoice.approver1_comments
-                ),
-                "status": Status.AWAITING_APPROVAL_2,
-                "hold_level": None,
-                "approval_requested_at": now,
-                "approval_reminder_sent_at": None,
-                "approval_hold_started_at": None,
-                "approval_hold_reminder_sent_at": None,
-            }
-            move_pdf(
-                lambda: (
-                    self._company_folders(invoice).nominal_approver_2,
-                    self._filed_filename(invoice),
-                )
-            )
-            record = commit_decision(**fields)
-            self._send_stage_email(
-                invoice_id,
-                "approval_2",
-                recipient=str(invoice.approver2_email),
-                subject=(
-                    f"New invoice ({invoice.original_filename}) waiting for "
-                    "approval"
-                ),
-                body=self._approval_email_body(record, 2, reminder=False),
-            )
-            self.activity_feed.add_event(
-                event_type="approval_pending",
-                target_role=ROLE_APPROVER_2,
-                message=(
-                    f"Invoice {invoice.irj_number} ({invoice.supplier}) is "
-                    "awaiting Approver 2 approval."
-                ),
-                invoice_id=invoice_id,
-            )
-            return record
-
-        fields = {
-            f"approver{level}_decision": "approved",
-            f"approver{level}_date": now,
-            f"approver{level}_comments": (
-                _append_history_entry(
-                    getattr(invoice, f"approver{level}_comments"),
-                    f"{recorded_by} approved",
-                    comments,
-                )
-                if comments
-                else getattr(invoice, f"approver{level}_comments")
-            ),
-            "status": Status.APPROVED,
-            "hold_level": None,
-            "approval_requested_at": None,
-            "approval_reminder_sent_at": None,
-            "approval_hold_started_at": None,
-            "approval_hold_reminder_sent_at": None,
-        }
-        move_pdf(
-            lambda: (
+            self._move_pdf_in_sharepoint(
+                invoice,
                 self._company_folders(invoice).approved_for_payment,
                 self._filed_filename(invoice),
             )
-        )
-        record = commit_decision(**fields)
-        # Once fully approved, the Purchase Ledger team should receive an
-        # email notification where appropriate. Purchase Ledger isn't the one clicking approve here
-        # (an approver is), so -- unlike the PO-matched branch above, where
-        # Purchase Ledger performed the action themselves -- they need an
-        # actual email, not just an activity feed entry they'd have to go
-        # looking for.
-        self._send_stage_email(
-            invoice_id,
-            "approved_for_payment",
-            recipient=os.environ.get(
-                "PURCHASE_LEDGER_NOTIFICATION_EMAIL",
-                "purchase-ledger@example.test",
-            ),
-            subject=f"Invoice ({invoice.original_filename}) fully approved",
-            body=(
-                f"Invoice {invoice.irj_number} ({invoice.supplier}) has completed "
-                "all required nominal approvals and is ready for payment."
-            ),
-        )
-        self._log_purchase_ledger(
-            event_type="approved",
-            message=f"Invoice {invoice.irj_number} fully approved and ready for payment.",
-            invoice_id=invoice_id,
-        )
-        return self.auto_route_for_payment(record.id)
+            record = commit_decision(**fields)
+            # Once fully approved, the Purchase Ledger team should receive an
+            # email notification where appropriate. Purchase Ledger isn't the one clicking approve here
+            # (an approver is), so -- unlike the PO-matched branch above, where
+            # Purchase Ledger performed the action themselves -- they need an
+            # actual email, not just an activity feed entry they'd have to go
+            # looking for.
+            self._send_stage_email(
+                invoice_id,
+                "approved_for_payment",
+                recipient=os.environ.get(
+                    "PURCHASE_LEDGER_NOTIFICATION_EMAIL",
+                    "purchase-ledger@example.test",
+                ),
+                subject=f"Invoice ({invoice.original_filename}) fully approved",
+                body=(
+                    f"Invoice {invoice.irj_number} ({invoice.supplier}) has completed "
+                    "all required nominal approvals and is ready for payment."
+                ),
+            )
+            self._log_purchase_ledger(
+                event_type="approved",
+                message=f"Invoice {invoice.irj_number} fully approved and ready for payment.",
+                invoice_id=invoice_id,
+            )
+            return self.auto_route_for_payment(record.id)
 
     def resume_approval(
         self,
@@ -1603,14 +1585,9 @@ class InvoiceLifecycle:
         invoice = self._require_invoice(invoice_id)
         if invoice.status == Status.WORKFLOW_ISSUE and invoice.review_return_status:
             return_status = invoice.review_return_status
-            destination = self._folder_for_status(invoice, return_status)
-            if destination is not None:
-                self._move_pdf_in_sharepoint(
-                    invoice, destination, self._filed_filename(invoice)
-                )
-            record = self.invoice_store.update_fields(
-                invoice_id,
-                status=return_status,
+            record = self._transition(
+                invoice,
+                return_status,
                 review_return_status=None,
                 hold_reason=_append_history_entry(
                     invoice.hold_reason,
@@ -1636,20 +1613,11 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError(
                 f"Invoice {invoice_id} is not on hold (status: {invoice.status})."
             )
-        if legacy_hold:
-            structure = self._company_folders(invoice)
-            self._move_pdf_in_sharepoint(
-                invoice,
-                (
-                    structure.nominal_approver_1
-                    if level == 1
-                    else structure.nominal_approver_2
-                ),
-                self._filed_filename(invoice),
-            )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=expected_status,
+        # A current hold never moved the PDF; only a legacy hold status did.
+        record = self._transition(
+            invoice,
+            expected_status,
+            move_pdf=legacy_hold,
             hold_level=None,
             hold_reason=_append_history_entry(
                 invoice.hold_reason,
@@ -1697,16 +1665,13 @@ class InvoiceLifecycle:
                 "SharePoint must be configured before a statement can be filed."
             )
         destination = statement_company_folder(company_profile.name)
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             document,
-            destination,
-            document.original_filename,
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
+            Status.STATEMENT_FILED,
+            folder=destination,
+            filename=document.original_filename,
             document_type="statement",
             company=company_profile.name,
-            status=Status.STATEMENT_FILED,
             review_reason=None,
             review_return_status=None,
         )
@@ -1731,10 +1696,11 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError(
                 "Only a flagged supplier statement can be reclassified as an invoice."
             )
-        record = self.invoice_store.update_fields(
-            invoice_id,
+        record = self._transition(
+            document,
+            Status.NEEDS_REVIEW,
+            move_pdf=False,
             document_type="invoice",
-            status=Status.NEEDS_REVIEW,
             review_reason="Awaiting Purchase Ledger invoice confirmation.",
             ai_review_warnings=None,
             review_return_status=None,
@@ -1771,23 +1737,24 @@ class InvoiceLifecycle:
         if not reason.strip():
             raise InvoiceLifecycleError("A review reason is required.")
         if initial_stage:
-            self._move_to_flagged(invoice)
-        else:
-            self._move_pdf_in_sharepoint(
-                invoice,
-                self._company_folders(invoice).nominal_on_hold,
-                self._filed_filename(invoice),
-            )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.NEEDS_REVIEW if initial_stage else Status.WORKFLOW_ISSUE,
-            review_reason=reason.strip() if initial_stage else invoice.review_reason,
-            hold_reason=(
-                invoice.hold_reason
-                if initial_stage
-                else _append_history_entry(
-                    invoice.hold_reason, "Workflow issue recorded", reason
+            with self._claimed(invoice) as save:
+                self._move_to_flagged(invoice)
+                record = save(
+                    status=Status.NEEDS_REVIEW,
+                    review_reason=reason.strip(),
+                    review_return_status=invoice.status,
                 )
+            self._log_purchase_ledger(
+                event_type="needs_review",
+                message=f"Invoice flagged for review: {reason}",
+                invoice_id=invoice_id,
+            )
+            return record
+        record = self._transition(
+            invoice,
+            Status.WORKFLOW_ISSUE,
+            hold_reason=_append_history_entry(
+                invoice.hold_reason, "Workflow issue recorded", reason
             ),
             review_return_status=invoice.status,
         )
@@ -1814,16 +1781,9 @@ class InvoiceLifecycle:
             )
         return_status = invoice.review_return_status
         if accepted:
-            destination = self._folder_for_status(invoice, return_status)
-            if destination is not None:
-                self._move_pdf_in_sharepoint(
-                    invoice,
-                    destination,
-                    self._filed_filename(invoice),
-                )
-            record = self.invoice_store.update_fields(
-                invoice_id,
-                status=return_status,
+            record = self._transition(
+                invoice,
+                return_status,
                 review_reason=None,
                 review_return_status=None,
             )
@@ -1839,14 +1799,11 @@ class InvoiceLifecycle:
 
         if not reason or not reason.strip():
             raise InvoiceLifecycleError("A rejection reason is required.")
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            REJECTED_INVOICES_FOLDER,
-            self._rejected_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.REJECTED,
+            Status.REJECTED,
+            folder=REJECTED_INVOICES_FOLDER,
+            filename=self._rejected_filename(invoice),
             rejection_reason=reason.strip(),
             review_reason=None,
             review_return_status=None,
@@ -1872,14 +1829,11 @@ class InvoiceLifecycle:
             )
         if not reason.strip():
             raise InvoiceLifecycleError("A rejection reason is required.")
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            REJECTED_INVOICES_FOLDER,
-            self._rejected_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.REJECTED,
+            Status.REJECTED,
+            folder=REJECTED_INVOICES_FOLDER,
+            filename=self._rejected_filename(invoice),
             rejection_reason=reason.strip(),
             review_reason=None,
             review_return_status=None,
@@ -1914,15 +1868,9 @@ class InvoiceLifecycle:
                 "Payment route must be BACS, Bankline, or Foreign POA."
             )
         status, payment_method = routes[route]
-        destination = self._folder_for_status(invoice, status)
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            destination,
-            self._filed_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=status,
+            status,
             payment_method=payment_method,
             is_foreign_payment=1 if route == "foreign_poa" else 0,
             payment_route_decided_at=datetime.now(timezone.utc).isoformat(),
@@ -2003,9 +1951,10 @@ class InvoiceLifecycle:
                 route=route,
                 recorded_by="Automatic supplier payment routing",
             )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.PAYMENT_ROUTING_ISSUE,
+        record = self._transition(
+            invoice,
+            Status.PAYMENT_ROUTING_ISSUE,
+            move_pdf=False,
             payment_method=None,
             hold_reason=reason,
             payment_route_decided_at=None,
@@ -2051,15 +2000,10 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError("A payment reference is required.")
         if not payment_date.strip():
             raise InvoiceLifecycleError("A payment date is required.")
-        self._move_pdf_in_sharepoint(
-            invoice,
-            self._company_folders(invoice).paid,
-            self._filed_filename(invoice),
-        )
         # Record who marked the invoice as paid.
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.PAID,
+        record = self._transition(
+            invoice,
+            Status.PAID,
             payment_date=payment_date,
             supplier_account_number=supplier_account_number,
             payment_reference=payment_reference,
@@ -2101,14 +2045,9 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError("An allocation reference is required.")
         if not allocation_date.strip():
             raise InvoiceLifecycleError("An allocation date is required.")
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            self._company_folders(invoice).paid,
-            self._filed_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.PAID,
+            Status.PAID,
             payment_date=allocation_date,
             payment_reference=allocation_reference.strip(),
             payment_method="Foreign POA",
@@ -2139,14 +2078,9 @@ class InvoiceLifecycle:
                 f"Only a foreign payment awaiting allocation can be returned to "
                 f"domestic payment (status: {invoice.status})."
             )
-        self._move_pdf_in_sharepoint(
+        record = self._transition(
             invoice,
-            self._company_folders(invoice).approved_for_payment,
-            self._filed_filename(invoice),
-        )
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.APPROVED,
+            Status.APPROVED,
             payment_method=None,
             is_foreign_payment=None,
             payment_route_decided_at=None,
@@ -2179,18 +2113,13 @@ class InvoiceLifecycle:
                 f"Only invoices awaiting bank reconciliation can be reconciled "
                 f"(status: {invoice.status})."
             )
-        self._move_pdf_in_sharepoint(
-            invoice,
-            self._company_folders(invoice).reconciled,
-            self._filed_filename(invoice),
-        )
         # Record who completed the reconciliation, where practical.
         # reconciliation_date is the date Purchase Ledger says the payment
         # appears on the bank statement; reconciled_at is the system
         # timestamp of when the invoice was actually marked reconciled here.
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            status=Status.RECONCILED,
+        record = self._transition(
+            invoice,
+            Status.RECONCILED,
             reconciliation_date=reconciliation_date,
             reconciliation_notes=notes,
             reconciled_by=recorded_by,

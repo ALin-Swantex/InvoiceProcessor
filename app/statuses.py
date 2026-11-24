@@ -13,6 +13,9 @@ class Status:
     # Held while confirm_and_route works on an invoice, so a second confirm
     # cannot allocate another IRJ number.
     PROCESSING_CONFIRMATION = "Processing Confirmation"
+    # Held while any other stage moves an invoice on (see
+    # InvoiceLifecycle._claimed), so two actions cannot both run.
+    PROCESSING_UPDATE = "Processing Update"
 
     AWAITING_PO_MATCHING = "Awaiting PO Matching"
     PO_QUERY = "PO Query / Matching Issue"

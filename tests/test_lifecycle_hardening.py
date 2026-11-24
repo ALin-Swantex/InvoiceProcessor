@@ -383,3 +383,63 @@ def test_foreign_poa_route_can_be_reverted(tmp_path: Path) -> None:
     assert record.status == "Approved"
     assert record.payment_method is None
     assert record.is_foreign_payment is None
+
+
+# Shared claim (_claimed / _transition) ----------------------------------------
+
+
+def test_a_failed_pdf_move_leaves_the_invoice_where_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle, store, invoice_id = _lifecycle(tmp_path)
+    store.update_fields(
+        invoice_id,
+        status="Paid / Awaiting Bank Reconciliation",
+        company="Acme Trading Ltd",
+        irj_number="000001",
+    )
+
+    def broken_move(*args: object, **kwargs: object) -> None:
+        raise OSError("SharePoint timed out")
+
+    monkeypatch.setattr(lifecycle, "_move_pdf_in_sharepoint", broken_move)
+
+    with pytest.raises(OSError):
+        lifecycle.mark_reconciled(
+            invoice_id, reconciliation_date="2026-11-24", notes=None
+        )
+
+    record = store.get(invoice_id)
+    assert record.status == "Paid / Awaiting Bank Reconciliation"
+    assert record.reconciled_at is None
+
+
+def test_a_second_action_on_a_claimed_invoice_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle, store, invoice_id = _lifecycle(tmp_path)
+    store.update_fields(
+        invoice_id,
+        status="Paid / Awaiting Bank Reconciliation",
+        company="Acme Trading Ltd",
+        irj_number="000001",
+    )
+    seen: list[str] = []
+
+    def reconcile_again_mid_move(*args: object, **kwargs: object) -> None:
+        # While the first reconcile holds the invoice, a second one starts.
+        seen.append(store.get(invoice_id).status)
+        with pytest.raises(InvoiceLifecycleError, match="status: Processing Update"):
+            lifecycle.mark_reconciled(
+                invoice_id, reconciliation_date="2026-11-24", notes="again"
+            )
+
+    monkeypatch.setattr(lifecycle, "_move_pdf_in_sharepoint", reconcile_again_mid_move)
+
+    record = lifecycle.mark_reconciled(
+        invoice_id, reconciliation_date="2026-11-24", notes="first"
+    )
+
+    assert seen == ["Processing Update"]
+    assert record.status == "Reconciled / Complete"
+    assert record.reconciliation_notes == "first"
