@@ -25,7 +25,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from pypdf import PdfReader, PdfWriter
 
-from app.extraction_checks import run_checks
+from app.extraction_checks import UNGROUNDED_CAP, run_checks
 
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.80
@@ -587,13 +587,17 @@ class ClaudeInvoiceExtractor:
         certainty: dict[str, float],
         data: Mapping[str, Any],
         reference: ReferenceData,
-    ) -> None:
+    ) -> list[str]:
         """Replace printed company/supplier names with the exact known names.
 
         Small differences (case, punctuation, Ltd/Limited, &/and) are resolved
         in code. Anything else that looks close is put to the model, which may
         only answer with one of the listed names; the answer is checked here
-        and its certainty can lower the field's confidence."""
+        and its certainty can lower the field's confidence. A company chosen
+        this way always goes to review (returned as a warning): a similar name
+        can be a different legal entity, and the company picks the approval
+        route."""
+        warnings: list[str] = []
         for field_name, entries in (
             ("company", reference.companies),
             ("supplier", reference.suppliers),
@@ -617,6 +621,14 @@ class ClaudeInvoiceExtractor:
             if chosen is not None:
                 values[field_name] = chosen
                 certainty[field_name] = min(certainty[field_name], chosen_certainty)
+                if field_name == "company":
+                    certainty[field_name] = min(certainty[field_name], UNGROUNDED_CAP)
+                    warnings.append(
+                        f"The company '{printed}' is not a known company; "
+                        f"'{chosen}' was chosen from the known companies as the "
+                        "closest match. Check the bill-to name."
+                    )
+        return warnings
 
     def _ask_which_name(
         self,
@@ -723,8 +735,17 @@ class ClaudeInvoiceExtractor:
             certainty[name] = score
 
         printed_supplier = values.get("supplier")
+        company_names: tuple[str, ...] = ()
         if reference is not None:
-            self._resolve_names(values, certainty, data, reference)
+            warnings.extend(self._resolve_names(values, certainty, data, reference))
+            company_names = next(
+                (
+                    (name, *aliases)
+                    for name, aliases in reference.companies
+                    if name == values.get("company")
+                ),
+                (),
+            )
 
         # The supplier name is grounded against the document text as printed,
         # not as it is spelt in the register.
@@ -732,6 +753,7 @@ class ClaudeInvoiceExtractor:
             values={**values, "supplier": printed_supplier},
             text_layer=text_layer,
             known_companies=(reference.known_company_names() if reference else ()),
+            company_names=company_names,
         )
         warnings.extend(outcome.warnings)
         scores = {

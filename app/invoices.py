@@ -248,12 +248,16 @@ class InvoiceStore:
         message: dict[str, object],
         attachment: dict[str, object],
         stored_path: Path,
+        created_at: str | None = None,
     ) -> InvoiceRecord:
+        """Insert the invoice, or return the existing row for the same message
+        and attachment. A caller can pass ``created_at`` and compare it with
+        the returned record's to tell whether this call inserted the row."""
         message_id = self._required_string(message, "id")
         attachment_id = self._required_string(attachment, "id")
         filename = self._required_string(attachment, "name")
         sender_name, sender_address = self._sender(message)
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = created_at or datetime.now(timezone.utc).isoformat()
         sharepoint_item_id = self._optional_string(
             attachment.get("sharepoint_item_id")
         )

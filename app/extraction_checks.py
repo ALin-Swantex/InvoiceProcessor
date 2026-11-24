@@ -45,13 +45,18 @@ def run_checks(
     values: Mapping[str, object],
     text_layer: str,
     known_companies: Iterable[str] = (),
+    company_names: Iterable[str] = (),
     today: date | None = None,
 ) -> CheckOutcome:
-    """Check extracted ``values`` against the document text and each other."""
+    """Check extracted ``values`` against the document text and each other.
+
+    ``company_names`` are the configured name and aliases of the extracted
+    company; one of them must appear in the document text.
+    """
     outcome = CheckOutcome()
     today = today or date.today()
 
-    _check_grounding(values, text_layer, outcome)
+    _check_grounding(values, text_layer, outcome, tuple(company_names))
     _check_arithmetic(values, outcome)
     _check_amount(values, outcome)
     _check_date(values, today, outcome)
@@ -64,13 +69,51 @@ def _alphanumeric(text: str) -> str:
     return re.sub(r"[^0-9a-z]", "", text.casefold())
 
 
+def _reference_found(reference: str, text: str) -> bool:
+    """Is ``reference`` printed in ``text`` as a whole reference?
+
+    Separators may differ ("INV-1001" matches "INV 1001"), but the match may
+    not start or end inside a longer word or number, so "22" is not found in
+    "0115 500 0123"."""
+    characters = _alphanumeric(reference)
+    if not characters:
+        return True
+    pattern = r"[^0-9a-z]{0,3}".join(re.escape(char) for char in characters)
+    return re.search(rf"(?<![0-9a-z]){pattern}(?![0-9a-z])", text.casefold()) is not None
+
+
+_AMOUNT_TOKEN = re.compile(r"\d[\d,.]*")
+
+
+def _printed_amounts(text: str) -> set[float]:
+    """Every amount printed in ``text``: 1,250.75 / 1.250,75 / 1250.75 / 1250."""
+    amounts: set[float] = set()
+    for token in _AMOUNT_TOKEN.findall(text):
+        token = token.rstrip(".,")
+        if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?|\d+(\.\d+)?", token):
+            number = token.replace(",", "")
+        elif re.fullmatch(r"\d{1,3}(\.\d{3})+,\d{1,2}|\d+,\d{1,2}", token):
+            number = token.replace(".", "").replace(",", ".")
+        else:
+            continue
+        amounts.add(round(float(number), 2))
+    return amounts
+
+
+def _name_words(name: str) -> str:
+    words = re.findall(r"[a-z0-9]+", name.casefold().replace("&", " and "))
+    return " ".join(word for word in words if word not in _COMPANY_SUFFIXES)
+
+
 def _check_grounding(
-    values: Mapping[str, object], text_layer: str, outcome: CheckOutcome
+    values: Mapping[str, object],
+    text_layer: str,
+    outcome: CheckOutcome,
+    company_names: tuple[str, ...] = (),
 ) -> None:
     if len(text_layer.strip()) < MIN_TEXT_LAYER_CHARS:
         return  # scanned or empty text layer: nothing to compare against
     squashed = _alphanumeric(text_layer)
-    digits = re.sub(r"\D", "", text_layer)
 
     for name, label in (
         ("supplier_invoice_number", "supplier invoice number"),
@@ -78,8 +121,7 @@ def _check_grounding(
     ):
         value = values.get(name)
         if isinstance(value, str) and value.strip():
-            needle = _alphanumeric(value)
-            if needle and needle not in squashed:
+            if not _reference_found(value, text_layer):
                 outcome.flag(
                     name,
                     UNGROUNDED_CAP,
@@ -102,12 +144,26 @@ def _check_grounding(
 
     total = values.get("invoice_value")
     if isinstance(total, (int, float)) and not isinstance(total, bool):
-        needle = f"{abs(float(total)):.2f}".replace(".", "")
-        if needle not in digits:
+        if round(abs(float(total)), 2) not in _printed_amounts(text_layer):
             outcome.flag(
                 "invoice_value",
                 UNGROUNDED_CAP,
                 f"The invoice total {float(total):.2f} was not found in the document text.",
+            )
+
+    # The company decides the approval route and the SharePoint folder, so
+    # its name (or an alias) must be printed on the invoice, as whole words.
+    company = values.get("company")
+    if isinstance(company, str) and company.strip() and company_names:
+        document_words = f" {_name_words(text_layer)} "
+        if not any(
+            words and f" {words} " in document_words
+            for words in map(_name_words, company_names)
+        ):
+            outcome.flag(
+                "company",
+                UNGROUNDED_CAP,
+                f"The company '{company}' was not found in the document text.",
             )
 
 

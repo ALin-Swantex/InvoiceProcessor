@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -28,6 +29,7 @@ class InvoiceIntakeStore(Protocol):
         message: dict[str, object],
         attachment: dict[str, object],
         stored_path: Path,
+        created_at: str | None = None,
     ) -> InvoiceRecord: ...
 
     def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None: ...
@@ -62,10 +64,15 @@ class SharePointIncomingMonitor:
         self.cache_directory = cache_directory
         self.extraction_runner = extraction_runner
         self.activity_feed = activity_feed
+        # Invalid items that could not be moved out of Incoming. Skipped until
+        # restart, so they are not downloaded and rejected on every scan.
+        self._unmovable_item_ids: set[str] = set()
 
     def scan_once(self) -> int:
         ingested = 0
         for item in self.client.list_incoming_pdfs():
+            if item.get("id") in self._unmovable_item_ids:
+                continue
             try:
                 if self.ingest_item(item) is not None:
                     ingested += 1
@@ -139,11 +146,19 @@ class SharePointIncomingMonitor:
         attachment["contentType"] = "application/pdf"
         attachment["sharepoint_item_id"] = item_id
         attachment["sharepoint_web_url"] = self.client.get_item_web_url(item)
+        created_at = datetime.now(timezone.utc).isoformat()
         record = self.invoice_store.add_from_outlook(
             message=message,
             attachment=attachment,
             stored_path=cached_path,
+            created_at=created_at,
         )
+        if record.created_at != created_at:
+            # The web app (manual upload) and the worker (Incoming scan) can
+            # both get past the "already registered?" check above for the
+            # same file. Only the process whose insert created the row goes
+            # on to duplicate checks and extraction.
+            return None
         if event_type == "outlook_intake":
             duplicate = self._find_identical_pdf(record, pdf_content)
             if duplicate is not None:
@@ -224,19 +239,35 @@ class SharePointIncomingMonitor:
     ) -> None:
         item_id = str(item.get("id") or "")
         filename = str(item.get("name") or "unknown.pdf")
+        logger.warning("%s", error)
+        # A per-item suffix, so a second bad "Invoice.pdf" cannot clash with
+        # the first one already in Rejected (the move would fail with 409).
+        suffix = hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:8]
+        rejected_name = f"{Path(filename).stem} ({suffix}){Path(filename).suffix}"
         try:
             if item_id:
                 self.client.move_to_folder(
                     item_id,
                     REJECTED_INVOICES_FOLDER,
-                    filename,
+                    rejected_name,
                 )
-        except Exception:
+        except Exception as move_error:
             logger.exception(
                 "Invalid SharePoint Incoming item %r could not be moved to Rejected.",
                 item_id,
             )
-        logger.warning("%s", error)
+            self._unmovable_item_ids.add(item_id)
+            if self.activity_feed is not None:
+                self.activity_feed.add_event(
+                    event_type="sharepoint_intake_failed",
+                    target_role=ROLE_PURCHASE_LEDGER,
+                    message=(
+                        f"'{filename}' in Incoming is not a usable PDF ({error}) "
+                        f"and could not be moved to Rejected ({move_error}). "
+                        "Remove it from Incoming by hand."
+                    ),
+                )
+            return
         if self.activity_feed is not None:
             self.activity_feed.add_event(
                 event_type="sharepoint_intake_rejected",

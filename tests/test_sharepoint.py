@@ -448,13 +448,10 @@ def test_incoming_monitor_quarantines_invalid_pdf_and_continues(
 
     assert monitor.scan_once() == 1
     assert [record.sharepoint_item_id for record in store.list()] == ["drive-item-2"]
-    assert fake_client.moves == [
-        (
-            "drive-item-1",
-            "Invoices/Rejected Invoices",
-            "invalid-invoice.pdf",
-        )
-    ]
+    assert len(fake_client.moves) == 1
+    item_id, folder, filename = fake_client.moves[0]
+    assert (item_id, folder) == ("drive-item-1", "Invoices/Rejected Invoices")
+    assert filename.startswith("invalid-invoice (") and filename.endswith(").pdf")
     assert activity.list_since()[0].event_type == "sharepoint_intake_rejected"
 
 
@@ -686,3 +683,74 @@ def test_discovers_all_verified_company_folder_structures() -> None:
     assert [structure.root for structure in structures] == [
         f"Invoices/{code}" for code in company_codes
     ]
+
+
+def test_rejected_pdf_is_moved_under_a_unique_name_and_not_retried(
+    tmp_path: Path,
+) -> None:
+    class BrokenIncomingClient(FakeIncomingClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.downloads = 0
+            self.moves: list[tuple[str, str, str]] = []
+
+        def download_item(self, item_id: str) -> bytes:
+            self.downloads += 1
+            return b"%PDF-1.4\n%%EOF"
+
+        def move_to_folder(
+            self, item_id: str, folder: str, filename: str
+        ) -> dict[str, object]:
+            self.moves.append((item_id, folder, filename))
+            raise SharePointError("409 nameAlreadyExists")
+
+    fake_client = BrokenIncomingClient()
+    activity = ActivityFeedStore(tmp_path / "activity.db")
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, fake_client),
+        InvoiceStore(tmp_path / "invoices.db"),
+        cache_directory=tmp_path / "cache",
+        activity_feed=activity,
+    )
+
+    monitor.scan_once()
+    monitor.scan_once()
+
+    # A clash with an earlier rejected file of the same name cannot happen.
+    _, folder, filename = fake_client.moves[0]
+    assert folder == "Invoices/Rejected Invoices"
+    assert filename.startswith("supplier-invoice (") and filename.endswith(").pdf")
+    # A file that cannot be moved is not downloaded and rejected every scan,
+    # and no "rejected" event claims a move that did not happen.
+    assert fake_client.downloads == 1
+    assert [e.event_type for e in activity.list_since()] == ["sharepoint_intake_failed"]
+
+
+def test_a_file_registered_by_another_process_is_left_to_it(tmp_path: Path) -> None:
+    store = InvoiceStore(tmp_path / "invoices.db")
+    fake_client = FakeIncomingClient()
+    extracted: list[int] = []
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, fake_client),
+        store,
+        cache_directory=tmp_path / "cache",
+        extraction_runner=extracted.append,
+    )
+    # The other process (web app upload or worker scan) inserts the row
+    # between this process's "already registered?" check and its insert.
+    original_get = store.get_by_sharepoint_item_id
+    store.get_by_sharepoint_item_id = lambda item_id: None  # type: ignore[method-assign]
+    store.add_from_outlook(
+        message={"id": "sharepoint:drive-item-1"},
+        attachment={
+            "id": "drive-item-1",
+            "name": "supplier-invoice.pdf",
+            "sharepoint_item_id": "drive-item-1",
+        },
+        stored_path=tmp_path / "other.pdf",
+    )
+
+    assert monitor.ingest_item(fake_client.item) is None
+    assert extracted == []
+    store.get_by_sharepoint_item_id = original_get  # type: ignore[method-assign]
+    assert len(store.list()) == 1

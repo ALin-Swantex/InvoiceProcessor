@@ -1104,3 +1104,82 @@ def test_supplier_is_checked_against_the_document_as_printed_not_as_registered(
 
     assert result.supplier == "Smith & Sons Limited"
     assert not any("supplier name" in warning for warning in result.warnings)
+
+
+# --- grounding: values must appear in the document as values, not as digits
+# --- buried inside other numbers ----------------------------------------------
+
+
+def _grounding_warnings(values: dict[str, Any], text: str, **kwargs: Any) -> list[str]:
+    from app.extraction_checks import run_checks
+
+    return run_checks(values=values, text_layer=text, **kwargs).warnings
+
+
+INVOICE_TEXT = (
+    "Tax invoice from Supplier Ltd. Bill to Acme Trading Ltd. Invoice no INV-1001. "
+    "Tel 0115 500 0123. Net 1,042.29 VAT 208.46 Total payable £1,250.75 GBP."
+)
+
+
+def test_a_total_hidden_in_other_digits_is_not_found() -> None:
+    warnings = _grounding_warnings({"invoice_value": 50.00}, INVOICE_TEXT)
+
+    assert any("50.00 was not found" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [INVOICE_TEXT, INVOICE_TEXT.replace("£1,250.75", "EUR 1.250,75"), "Total 1250.75 " * 5],
+)
+def test_a_printed_total_is_found_in_any_common_format(text: str) -> None:
+    assert _grounding_warnings({"invoice_value": 1250.75}, text) == []
+
+
+def test_an_invoice_number_must_appear_as_a_whole_reference() -> None:
+    warnings = _grounding_warnings({"supplier_invoice_number": "22"}, INVOICE_TEXT)
+
+    assert any("'22' was not found" in warning for warning in warnings)
+
+
+def test_an_invoice_number_with_different_separators_is_found() -> None:
+    text = INVOICE_TEXT.replace("INV-1001", "INV 1001")
+
+    assert _grounding_warnings({"supplier_invoice_number": "INV-1001"}, text) == []
+
+
+def test_a_company_not_named_in_the_document_is_flagged() -> None:
+    text = INVOICE_TEXT.replace("Acme Trading Ltd", "Riverside Logistics")
+
+    warnings = _grounding_warnings(
+        {"company": "Acme Trading Ltd"},
+        text,
+        company_names=("Acme Trading Ltd", "Acme"),
+    )
+
+    assert any("'Acme Trading Ltd' was not found" in warning for warning in warnings)
+
+
+def test_a_company_named_by_its_alias_is_found() -> None:
+    text = INVOICE_TEXT.replace("Acme Trading Ltd", "ACME")
+
+    assert (
+        _grounding_warnings(
+            {"company": "Acme Trading Ltd"},
+            text,
+            company_names=("Acme Trading Ltd", "Acme"),
+        )
+        == []
+    )
+
+
+def test_a_company_chosen_by_the_name_check_goes_to_review(tmp_path: Path) -> None:
+    # The printed company is not a known one; the second model call picks the
+    # closest known name. That choice must be confirmed by a person.
+    extraction = llm_data(company=field("Acme Trading (Scotland) Ltd"))
+    answer = {"match": "Acme Trading Ltd", "certainty": "high"}
+    result, _ = _extract_names(tmp_path, [extraction, answer])
+
+    assert result.company == "Acme Trading Ltd"
+    assert result.needs_review is True
+    assert any("chosen from the known companies" in w for w in result.warnings)

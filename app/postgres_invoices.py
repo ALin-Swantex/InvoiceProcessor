@@ -90,7 +90,11 @@ class PostgresInvoiceStore:
         message: dict[str, object],
         attachment: dict[str, object],
         stored_path: Path,
+        created_at: str | None = None,
     ) -> InvoiceRecord:
+        """Insert the invoice, or return the existing row for the same message
+        and attachment. A caller can pass ``created_at`` and compare it with
+        the returned record's to tell whether this call inserted the row."""
         message_id = self._required_string(message, "id")
         attachment_id = self._required_string(attachment, "id")
         filename = self._required_string(attachment, "name")
@@ -113,7 +117,7 @@ class PostgresInvoiceStore:
             str(stored_path),
             self._optional_int(attachment.get("size")),
             "Awaiting AI Extraction",
-            datetime.now(timezone.utc).isoformat(),
+            created_at or datetime.now(timezone.utc).isoformat(),
             sharepoint_item_id,
             sharepoint_web_url,
         )

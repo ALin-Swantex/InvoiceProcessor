@@ -62,7 +62,14 @@ class FakeOutlookRetriever:
     async def download_invoice_attachment(
         self, message_id: str, attachment_id: str, filename: str
     ) -> str:
-        return str(self.pdf_path)
+        # Like the real client, every download is a new local file.
+        self.downloads = getattr(self, "downloads", [])
+        copy = self.pdf_path.with_name(
+            f"download-{len(self.downloads) + 1}-{self.pdf_path.name}"
+        )
+        copy.write_bytes(self.pdf_path.read_bytes())
+        self.downloads.append(copy)
+        return str(copy)
 
 
 class FakeExcelRetriever(FakeOutlookRetriever):
@@ -418,10 +425,11 @@ def test_worker_persists_converted_excel_as_a_pdf(tmp_path: Path) -> None:
     converted_pdf.write_bytes(VALID_PDF_BYTES)
     notifications = queued_store(tmp_path)
     invoices = InvoiceStore(tmp_path / "invoices.db")
+    retriever = FakeExcelRetriever(converted_pdf)
     worker = OutlookInvoiceWorker(
         notifications,
         invoices,
-        FakeExcelRetriever(converted_pdf),
+        retriever,
     )
 
     assert asyncio.run(worker.process_next()) is True
@@ -429,7 +437,7 @@ def test_worker_persists_converted_excel_as_a_pdf(tmp_path: Path) -> None:
     record = invoices.list()[0]
     assert record.attachment_id == "excel-attachment-1"
     assert record.original_filename == "invoice-1001.pdf"
-    assert record.stored_path == str(converted_pdf)
+    assert record.stored_path == str(retriever.downloads[0])
     assert record.size_bytes == converted_pdf.stat().st_size
 
 
@@ -604,3 +612,61 @@ def test_local_polling_enqueues_unread_outlook_messages(tmp_path: Path) -> None:
     assert len(pending) == 1
     assert pending[0].message_id == "message-1"
     assert pending[0].subscription_id == "local-mcp-polling"
+
+
+def test_upload_name_does_not_depend_on_leftover_local_downloads(
+    tmp_path: Path,
+) -> None:
+    # An earlier interrupted run left invoice-1001.pdf on disk, so this
+    # download was saved as invoice-1001_2.pdf. The SharePoint name must still
+    # be the same as on the first attempt, so 'replace' overwrites that upload
+    # instead of creating a second Incoming file (and a second invoice).
+    pdf_path = tmp_path / "invoice-1001_2.pdf"
+    pdf_path.write_bytes(VALID_PDF_BYTES)
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    fake_sharepoint = FakeSharePointIncomingClient()
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, fake_sharepoint),
+        invoices,
+        cache_directory=tmp_path / "cache",
+    )
+    retriever = FakeOutlookRetriever(pdf_path)
+    worker = OutlookInvoiceWorker(
+        queued_store(tmp_path),
+        invoices,
+        retriever,
+        incoming_monitor=monitor,
+    )
+
+    assert asyncio.run(worker.process_next()) is True
+
+    assert fake_sharepoint.uploads[0][0].endswith("-invoice-1001.pdf")
+    assert not retriever.downloads[0].exists()  # the download is not left behind
+
+
+def test_failed_registration_removes_the_local_download(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "invoice-1001.pdf"
+    pdf_path.write_bytes(VALID_PDF_BYTES)
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, FakeSharePointIncomingClient()),
+        invoices,
+        cache_directory=tmp_path / "cache",
+    )
+
+    def failing_ingest(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    monitor.ingest_item = failing_ingest  # type: ignore[method-assign]
+    retriever = FakeOutlookRetriever(pdf_path)
+    worker = OutlookInvoiceWorker(
+        queued_store(tmp_path),
+        invoices,
+        retriever,
+        incoming_monitor=monitor,
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(worker.process_next())
+
+    assert not retriever.downloads[0].exists()

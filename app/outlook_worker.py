@@ -17,7 +17,11 @@ from app.ai_extraction import ai_extraction_configured
 from app.environment import load_project_environment, project_path_from_environment
 from app.invoice_lifecycle import InvoiceLifecycle
 from app.invoices import InvoiceStore
-from app.outlook_graph import OutlookGraphClient, graph_client_from_environment
+from app.outlook_graph import (
+    SAFE_FILENAME_PATTERN,
+    OutlookGraphClient,
+    graph_client_from_environment,
+)
 from app.outlook_notifications import OutlookNotificationStore
 from app.pdf_validation import validate_pdf
 from app.sharepoint import sharepoint_client_from_environment
@@ -302,10 +306,13 @@ class OutlookInvoiceWorker:
             validate_pdf(content)
             item = await asyncio.to_thread(
                 self.incoming_monitor.client.upload_to_incoming,
+                # From the attachment name, not the local file: that one gets a
+                # "_2" suffix when an earlier download is still on disk, which
+                # would upload a second copy instead of replacing the first.
                 self._outlook_upload_filename(
                     message_id,
                     attachment_id,
-                    stored_path.name,
+                    processed_attachment["name"],
                 ),
                 content,
                 conflict_behavior="replace",
@@ -320,16 +327,20 @@ class OutlookInvoiceWorker:
         stored_path = prepared.stored_path
         if self.incoming_monitor is not None:
             assert prepared.sharepoint_item is not None
-            record = await asyncio.to_thread(
-                self.incoming_monitor.ingest_item,
-                prepared.sharepoint_item,
-                source_message=message,
-                source_attachment=prepared.attachment,
-                content=prepared.content,
-                event_type="outlook_intake",
-            )
-            if record is not None and stored_path != Path(record.stored_path):
-                stored_path.unlink(missing_ok=True)
+            record = None
+            try:
+                record = await asyncio.to_thread(
+                    self.incoming_monitor.ingest_item,
+                    prepared.sharepoint_item,
+                    source_message=message,
+                    source_attachment=prepared.attachment,
+                    content=prepared.content,
+                    event_type="outlook_intake",
+                )
+            finally:
+                # Intake keeps its own copy; a retry downloads again.
+                if record is None or stored_path != Path(record.stored_path):
+                    stored_path.unlink(missing_ok=True)
             return
         record = self.invoice_store.add_from_outlook(
             message=message,
@@ -405,7 +416,8 @@ class OutlookInvoiceWorker:
     ) -> str:
         source_key = f"{message_id}\0{attachment_id}".encode("utf-8")
         digest = hashlib.sha256(source_key).hexdigest()[:20]
-        return f"outlook-{digest}-{Path(filename).name}"
+        safe_name = SAFE_FILENAME_PATTERN.sub("_", Path(filename).name.strip())[:180]
+        return f"outlook-{digest}-{safe_name}"
 
 
 def build_worker_from_environment(
