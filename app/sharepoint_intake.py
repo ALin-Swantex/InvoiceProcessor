@@ -13,6 +13,7 @@ from app.invoice_lifecycle import InvoiceExtractionUnavailableError
 from app.invoices import InvoiceRecord
 from app.pdf_validation import InvalidPdfError, validate_pdf
 from app.sharepoint import SharePointClient, SharePointError
+from app.statuses import Status
 
 
 logger = logging.getLogger(__name__)
@@ -168,7 +169,7 @@ class SharePointIncomingMonitor:
                 # looking like a new invoice. Routing later moves it by item ID.
                 record = self.invoice_store.update_fields(
                     record.id,
-                    status="Needs Review",
+                    status=Status.NEEDS_REVIEW,
                     duplicate_of_invoice_id=duplicate.id,
                     review_reason=(
                         f"It's a duplicate of {reference} "
@@ -207,7 +208,7 @@ class SharePointIncomingMonitor:
             )
         if (
             self.extraction_runner is not None
-            and record.status == "Awaiting AI Extraction"
+            and record.status == Status.AWAITING_EXTRACTION
         ):
             try:
                 self.extraction_runner(record.id)

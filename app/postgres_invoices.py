@@ -19,6 +19,7 @@ from app.postgres_settings import (
     PostgresSettings,
     postgres_connection_factory,
 )
+from app.statuses import Status
 
 
 MIGRATIONS_DIRECTORY = Path(__file__).with_name("postgres_migrations")
@@ -116,7 +117,7 @@ class PostgresInvoiceStore:
             filename,
             str(stored_path),
             self._optional_int(attachment.get("size")),
-            "Awaiting AI Extraction",
+            Status.AWAITING_EXTRACTION,
             created_at or datetime.now(timezone.utc).isoformat(),
             sharepoint_item_id,
             sharepoint_web_url,

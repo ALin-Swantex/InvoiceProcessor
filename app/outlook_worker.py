@@ -26,6 +26,7 @@ from app.outlook_notifications import OutlookNotificationStore
 from app.pdf_validation import validate_pdf
 from app.sharepoint import sharepoint_client_from_environment
 from app.sharepoint_intake import SharePointIncomingMonitor
+from app.statuses import Status
 
 
 logger = logging.getLogger(__name__)
@@ -352,7 +353,7 @@ class OutlookInvoiceWorker:
         )
         if (
             self.extraction_runner is not None
-            and record.status == "Awaiting AI Extraction"
+            and record.status == Status.AWAITING_EXTRACTION
         ):
             await asyncio.to_thread(self.extraction_runner, record.id)
 

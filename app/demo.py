@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import tempfile
+from app.statuses import Status
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
@@ -113,7 +114,7 @@ def _sample_invoices(approver1_email: str, approver2_email: str) -> list[tuple[s
     }
     acme, north = "Acme Trading Ltd", "Northfield Manufacturing"
     return [
-        ("Awaiting AI Extraction", dict(
+        (Status.AWAITING_EXTRACTION, dict(
             company=acme, supplier="Bright Paper", supplier_invoice_number="BP-10442",
             invoice_value=1240.5, currency="GBP", invoice_date="2026-11-02",
             ai_confidence=0.71, ai_field_confidences=json.dumps(low_confidence),
@@ -122,41 +123,41 @@ def _sample_invoices(approver1_email: str, approver2_email: str) -> list[tuple[s
                 "Invoice value confidence 66% is below the 80% threshold."
             ),
         )),
-        ("Awaiting AI Extraction", dict(
+        (Status.AWAITING_EXTRACTION, dict(
             company=north, supplier="Supplier Ltd", supplier_invoice_number="SL-2210",
             invoice_value=88.0, currency="GBP", invoice_date="2026-11-09",
         )),
-        ("Needs Review", dict(
+        (Status.NEEDS_REVIEW, dict(
             company=acme, supplier="Kestrel Logistics", supplier_invoice_number="KL-7781",
             invoice_value=432.0, currency="GBP", invoice_date="2026-11-05",
             review_reason="Possible duplicate of an existing invoice.",
             document_type="invoice", ai_confidence=0.55,
         )),
-        ("Needs Review", dict(
+        (Status.NEEDS_REVIEW, dict(
             document_type="statement",
             review_reason="Looks like a supplier statement.",
             document_classification_confidence=0.62,
         )),
-        ("Awaiting PO Matching", dict(
+        (Status.AWAITING_PO_MATCHING, dict(
             company=acme, supplier="Bright Paper Co", po_number="PO-55120",
             irj_number="004512", invoice_value=3410.0, currency="GBP",
             invoice_date="2026-11-03", supplier_invoice_number="BP-10431",
         )),
-        ("PO Query / Matching Issue", dict(
+        (Status.PO_QUERY, dict(
             company=acme, supplier="Kestrel Logistics", po_number="PO-55211",
             po_query_notes="Quantity on invoice exceeds PO.",
             po_query_category="quantity mismatch", invoice_value=950.0, currency="GBP",
         )),
-        ("Awaiting Sage Registration", dict(
+        (Status.AWAITING_SAGE_REGISTRATION, dict(
             company=north, supplier="Supplier Ltd", irj_number="004513",
             invoice_value=512.2, currency="GBP", supplier_invoice_number="SL-2198",
         )),
-        ("Awaiting Approval 1", dict(
+        (Status.AWAITING_APPROVAL_1, dict(
             company=acme, supplier="Bright Paper Co", irj_number="004514",
             approver1_name="Jordan Blake", approver1_email=approver1_email,
             invoice_value=760.0, currency="GBP", supplier_invoice_number="BP-10440",
         )),
-        ("Awaiting Approval 2", dict(
+        (Status.AWAITING_APPROVAL_2, dict(
             company=acme, supplier="Bright Paper Co", irj_number="004515",
             approver1_name="Jordan Blake", approver1_email=approver1_email,
             approver1_decision="approved",
@@ -169,25 +170,25 @@ def _sample_invoices(approver1_email: str, approver2_email: str) -> list[tuple[s
             approver1_name="Jordan Blake", approver1_email=approver1_email,
             invoice_value=1180.0, currency="GBP",
         )),
-        ("Approved for Payment - BACS", dict(
+        (Status.APPROVED_BACS, dict(
             company=north, supplier="Supplier Ltd", irj_number="004517",
             payment_method="BACS", invoice_value=2200.0, currency="GBP",
         )),
-        ("Approved for Payment - Bankline", dict(
+        (Status.APPROVED_BANKLINE, dict(
             company=acme, supplier="Bright Paper Co", irj_number="004518",
             payment_method="Bankline", invoice_value=640.0, currency="GBP",
         )),
-        ("Paid / Awaiting Bank Reconciliation", dict(
+        (Status.PAID, dict(
             company=acme, supplier="Bright Paper Co", irj_number="004519",
             payment_date="2026-11-10", paid_by="Purchase Ledger",
             invoice_value=315.0, currency="GBP",
         )),
-        ("Reconciled / Complete", dict(
+        (Status.RECONCILED, dict(
             company=acme, supplier="Bright Paper Co", irj_number="004500",
             reconciliation_date="2026-11-12", reconciled_by="Purchase Ledger",
             invoice_value=275.0, currency="GBP",
         )),
-        ("Rejected", dict(
+        (Status.REJECTED, dict(
             company=acme, supplier="Kestrel Logistics", irj_number="004501",
             rejection_reason="Not our order.", invoice_value=99.0, currency="GBP",
         )),

@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.statuses import Status
+
 
 SAFE_REFERENCE = re.compile(r"[^A-Za-z0-9._-]+")
 IRJ_NUMBER = re.compile(r"^[0-9]{6}$")
@@ -56,7 +58,7 @@ def route_confirmed_invoice(invoice: ConfirmedInvoice) -> RoutingDecision:
             )
         return RoutingDecision(
             route="purchase_order",
-            status="Awaiting PO Matching",
+            status=Status.AWAITING_PO_MATCHING,
             destination_folder=str(invoice.po_matching_folder),
             destination_filename=(
                 clean_invoice_filename(invoice.original_filename)
@@ -74,7 +76,7 @@ def route_confirmed_invoice(invoice: ConfirmedInvoice) -> RoutingDecision:
 
     return RoutingDecision(
         route="nominal",
-        status="Awaiting Nominal Processing",
+        status=Status.AWAITING_SAGE_REGISTRATION,
         destination_folder=invoice.company_folder,
         destination_filename=(
             clean_invoice_filename(invoice.original_filename)

@@ -52,7 +52,7 @@ def test_non_po_invoice_routes_to_company_and_prefixes_irj() -> None:
     decision = route_confirmed_invoice(confirmed_invoice())
 
     assert decision.route == "nominal"
-    assert decision.status == "Awaiting Nominal Processing"
+    assert decision.status == "Awaiting Sage Registration"
     assert decision.destination_folder == "/Companies/Example/Invoices"
     assert decision.destination_filename == "001245_supplier-invoice.pdf"
     assert decision.notification_recipient is None

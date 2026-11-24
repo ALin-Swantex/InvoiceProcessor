@@ -9,16 +9,17 @@ from typing import Iterable
 from app.approval_matrix import ALL_COMPANIES
 from app.invoices import InvoiceRecord, MetricInvoice
 from app.supplier_terms import SupplierTerms
+from app.statuses import Status
 
 
 EXCLUDED_FINANCIAL_STATUSES = {
-    "Cancelled - Duplicate",
-    "Rejected",
-    "Statement Filed",
+    Status.CANCELLED_DUPLICATE,
+    Status.REJECTED,
+    Status.STATEMENT_FILED,
 }
 PAID_STATUSES = {
-    "Paid / Awaiting Bank Reconciliation",
-    "Reconciled / Complete",
+    Status.PAID,
+    Status.RECONCILED,
 }
 
 

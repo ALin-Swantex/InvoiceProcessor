@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.statuses import TERMINAL_STATUSES, Status
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS invoices (
@@ -193,12 +195,6 @@ class InvoiceRecord:
 # Statuses where an invoice needs no further action. The work queues show every
 # invoice NOT in this set, plus only the most recent finished ones, so an old
 # invoice that is still waiting on someone never drops out of view.
-TERMINAL_STATUSES = (
-    "Reconciled / Complete",
-    "Statement Filed",
-    "Rejected",
-    "Cancelled - Duplicate",
-)
 
 
 @dataclass(frozen=True)
@@ -303,7 +299,7 @@ class InvoiceStore:
                     filename,
                     str(stored_path),
                     self._optional_int(attachment.get("size")),
-                    "Awaiting AI Extraction",
+                    Status.AWAITING_EXTRACTION,
                     created_at,
                     sharepoint_item_id,
                     sharepoint_web_url,
