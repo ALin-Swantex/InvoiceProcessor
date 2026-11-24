@@ -38,6 +38,10 @@ MIGRATIONS = "Database"
 WEB = "Web application"
 WORKER = "Outlook worker"
 SERVICES = (MIGRATIONS, WEB, WORKER)
+# On SIGTERM the worker finishes the invoice it is on, which can include an
+# AI extraction; killing it part-way leaves the item stuck for 15 minutes and
+# repeats a paid extraction. Same allowance as stop_grace_period in Docker.
+STOP_TIMEOUT_SECONDS = {WORKER: 120}
 
 
 @dataclass(frozen=True)
@@ -238,8 +242,16 @@ class ProcessManager:
             for name, process in running.items():
                 self.log("Launcher", f"Stopping {name}…")
                 process.terminate()
-            deadline = time.monotonic() + PROCESS_STOP_TIMEOUT_SECONDS
+            if WORKER in running:
+                self.log(
+                    "Launcher",
+                    "Waiting for the Outlook worker to finish its current invoice…",
+                )
+            started = time.monotonic()
             for name, process in running.items():
+                deadline = started + STOP_TIMEOUT_SECONDS.get(
+                    name, PROCESS_STOP_TIMEOUT_SECONDS
+                )
                 try:
                     process.wait(timeout=max(0.1, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
@@ -480,11 +492,26 @@ def run_gui(configuration: LauncherConfiguration) -> int:
         set_button(open_button, enabled=ready)
         root.after(200, refresh)
 
+    closing = False
+
     def close() -> None:
+        # Stop in the background and keep the window (and its log) responsive
+        # while the worker finishes its current invoice.
+        nonlocal closing
+        if closing:
+            return
+        closing = True
         root.title("Invoice Processor - stopping…")
-        root.update_idletasks()
-        manager.stop()
-        root.destroy()
+        stopper = threading.Thread(target=manager.stop)
+        stopper.start()
+
+        def destroy_when_stopped() -> None:
+            if stopper.is_alive():
+                root.after(200, destroy_when_stopped)
+            else:
+                root.destroy()
+
+        destroy_when_stopped()
 
     root.protocol("WM_DELETE_WINDOW", close)
     if sys.platform == "darwin":

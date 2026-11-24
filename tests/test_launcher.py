@@ -123,3 +123,38 @@ def test_failed_migrations_start_nothing_else(
     assert manager.states[launcher.MIGRATIONS] == "failed"
     assert set(manager.processes) == {launcher.MIGRATIONS}
     assert "migrations failed" in (tmp_path / "launcher.log").read_text()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM handling is POSIX-only")
+def test_stop_lets_the_worker_finish_its_current_invoice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = fake_manager(tmp_path, monkeypatch, migrate_exit=0)
+    python = sys.executable
+    # Like the real worker: on SIGTERM it finishes the current item (here,
+    # five seconds - longer than the web app's stop timeout) and exits 0.
+    finishing_worker = [
+        python,
+        "-c",
+        "import signal, sys, time\n"
+        "def finish(*_):\n"
+        "    time.sleep(5)\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, finish)\n"
+        "print('up', flush=True)\n"
+        "time.sleep(60)\n",
+    ]
+    sleeper = [python, "-c", "import time; print('up', flush=True); time.sleep(30)"]
+    monkeypatch.setattr(
+        launcher,
+        "process_commands",
+        lambda configuration: {launcher.WEB: sleeper, launcher.WORKER: finishing_worker},
+    )
+    manager.start()
+    wait_until(manager.web_ready.is_set)
+    wait_until(lambda: "[Outlook worker] up" in (tmp_path / "launcher.log").read_text())
+    worker = manager.processes[launcher.WORKER]
+
+    manager.stop()
+
+    assert worker.returncode == 0  # finished, not killed

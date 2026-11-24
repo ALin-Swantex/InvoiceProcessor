@@ -2,6 +2,7 @@
 configuration CRUD, duplicate detection, and the approval on-hold/resume
 flow -- the behaviours added to implement MANUAL_VS_AUTOMATED.md end to end."""
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -805,8 +806,8 @@ def test_full_nominal_approval_hold_resume_and_pay_flow(tmp_path: Path) -> None:
     # distinct from the system-recorded timestamp of when the invoice was
     # marked reconciled.
     assert reconciled.json()["reconciliation_date"] == "2026-01-17"
-    assert reconciled.json()["reconciled_at"] is not None
-    assert reconciled.json()["reconciled_at"].startswith("2026-")
+    reconciled_at = datetime.fromisoformat(reconciled.json()["reconciled_at"])
+    assert abs(datetime.now(timezone.utc) - reconciled_at) < timedelta(minutes=5)
 
 
 def test_concurrent_final_approval_sends_one_email(

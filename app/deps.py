@@ -140,18 +140,21 @@ def company_response(profile: CompanyProfile) -> dict[str, object]:
     }
 
 
-def set_session_cookie(app: FastAPI, response: FastAPIResponse, token: str) -> None:
+def cookies_are_secure(app: FastAPI) -> bool:
     secure_setting = os.environ.get("AUTH_COOKIE_SECURE", "").strip()
-    secure = (
+    return (
         secure_setting.casefold() in {"1", "true", "yes", "on"}
         if secure_setting
         else bool(app.state.entra_auth_client)
     )
+
+
+def set_session_cookie(app: FastAPI, response: FastAPIResponse, token: str) -> None:
     response.set_cookie(
         SESSION_COOKIE_NAME,
         token,
         httponly=True,
-        secure=secure,
+        secure=cookies_are_secure(app),
         samesite="lax",
         max_age=12 * 60 * 60,
     )

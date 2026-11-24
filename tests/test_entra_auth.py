@@ -146,3 +146,34 @@ def test_microsoft_login_callback_creates_application_session(
         follow_redirects=False,
     )
     assert replay.status_code == 400
+
+
+def test_microsoft_callback_must_come_from_the_browser_that_started_sign_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AUTH_LOCAL_LOGIN_ENABLED", raising=False)
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "false")
+    app = create_app(
+        invoice_store=InvoiceStore(tmp_path / "invoices.db"),
+        auth_store=AuthStore(tmp_path / "auth.db"),
+        companies_store=CompanyStore(tmp_path / "config.db"),
+        suppliers_store=SupplierStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+        activity_feed=ActivityFeedStore(tmp_path / "activity.db"),
+        notification_store=OutlookNotificationStore(tmp_path / "notifications.db"),
+        entra_auth_client=FakeEntraClient(),  # type: ignore[arg-type]
+        auto_configure_sharepoint=False,
+    )
+    attacker, victim = TestClient(app), TestClient(app)
+
+    # The attacker starts sign-in, then sends the callback link to a victim.
+    assert attacker.get("/api/auth/microsoft/login", follow_redirects=False).status_code == 302
+    forged = victim.get(
+        "/api/auth/microsoft/callback",
+        params={"state": "expected-state", "code": "code"},
+        follow_redirects=False,
+    )
+
+    assert forged.status_code == 400
+    assert victim.get("/api/auth/me").status_code == 401

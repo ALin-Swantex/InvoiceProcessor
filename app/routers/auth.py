@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 
@@ -9,10 +10,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response as Fast
 from fastapi.responses import RedirectResponse
 
 from app.auth import AuthError, SESSION_COOKIE_NAME, User, get_current_user
-from app.deps import set_session_cookie
+from app.deps import cookies_are_secure, set_session_cookie
 from app.schemas import LoginRequest
 
 logger = logging.getLogger("invoice_processor")
+
+# The browser that starts Microsoft sign-in keeps the flow's state in this
+# cookie; the callback must come from the same browser. Without it, someone
+# could start sign-in, then send their callback link to another person, whose
+# browser would be signed in as them (login CSRF).
+OAUTH_STATE_COOKIE_NAME = "invoice_processor_oauth_state"
 
 router = APIRouter()
 
@@ -62,7 +69,17 @@ def microsoft_login(http_request: Request) -> RedirectResponse:
         app.state.auth_store.save_oauth_flow(str(flow["state"]), flow)
     except AuthError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    return RedirectResponse(str(flow["auth_uri"]), status_code=302)
+    response = RedirectResponse(str(flow["auth_uri"]), status_code=302)
+    # SameSite=lax is still sent on the top-level redirect back from Microsoft.
+    response.set_cookie(
+        OAUTH_STATE_COOKIE_NAME,
+        str(flow["state"]),
+        httponly=True,
+        secure=cookies_are_secure(app),
+        samesite="lax",
+        max_age=10 * 60,
+    )
+    return response
 
 
 @router.get("/api/auth/microsoft/callback")
@@ -75,6 +92,12 @@ def microsoft_callback(request: Request) -> RedirectResponse:
             detail="Microsoft 365 sign-in is not configured.",
         )
     state = request.query_params.get("state", "")
+    expected_state = request.cookies.get(OAUTH_STATE_COOKIE_NAME, "")
+    if not state or not hmac.compare_digest(state, expected_state):
+        raise HTTPException(
+            status_code=400,
+            detail="The Microsoft sign-in was not started in this browser. Sign in again.",
+        )
     flow = app.state.auth_store.pop_oauth_flow(state)
     if flow is None:
         raise HTTPException(
@@ -88,6 +111,7 @@ def microsoft_callback(request: Request) -> RedirectResponse:
     token = app.state.auth_store.create_federated_session(user)
     response = RedirectResponse("/", status_code=302)
     set_session_cookie(app, response, token)
+    response.delete_cookie(OAUTH_STATE_COOKIE_NAME)
     return response
 
 

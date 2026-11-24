@@ -10,7 +10,12 @@ def test_legacy_names_still_work_when_the_new_name_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for new_name, old_name in RENAMED_ENVIRONMENT_VARIABLES.items():
-        monkeypatch.delenv(new_name, raising=False)
+        # setenv first so monkeypatch records the variable and removes the
+        # value apply_renamed_environment_variables() writes; delenv alone
+        # records nothing for an absent variable, and the fake values would
+        # leak into every later test.
+        monkeypatch.setenv(new_name, "")
+        monkeypatch.delenv(new_name)
         monkeypatch.setenv(old_name, f"legacy-{new_name}")
 
     apply_renamed_environment_variables()
