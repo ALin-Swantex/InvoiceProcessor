@@ -648,8 +648,8 @@ def test_approvers_only_see_and_act_on_their_assigned_invoices(
             "comments": "This must not be accepted.",
         },
     )
-    assert forbidden.status_code == 403
-    assert "different approver" in forbidden.json()["detail"]
+    assert forbidden.status_code == 404
+    assert forbidden.json()["detail"] == "Invoice was not found."
 
     allowed = client.post(
         f"/api/invoices/{own_id}/approve",

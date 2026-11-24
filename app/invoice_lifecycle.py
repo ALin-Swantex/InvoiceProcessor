@@ -39,7 +39,7 @@ from app.document_classification import (
 )
 from app.duplicates import duplicate_reference, find_possible_duplicate
 from app.email_notifications import send_email_notification
-from app.invoices import InvoiceRecord, InvoiceStore
+from app.invoices import TERMINAL_STATUSES, InvoiceRecord, InvoiceStore
 from app.invoice_number_validation import invoice_number_warnings
 from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
@@ -69,6 +69,9 @@ def _is_unique_violation(error: BaseException) -> bool:
 
 
 AUTO_CONFIRM_ACTOR = "AI auto-confirm"
+# Held only while confirm_and_route works on an invoice (like "Processing
+# Approval N"), so a second confirm cannot allocate another IRJ number.
+CONFIRMING_STATUS = "Processing Confirmation"
 
 
 class InvoiceExtractionUnavailableError(InvoiceLifecycleError):
@@ -298,7 +301,19 @@ class InvoiceLifecycle:
             ["Rejected", "Awaiting Approval 1", "Awaiting Approval 2"]
         ):
             if invoice.status == "Rejected":
-                self._notify_purchase_ledger_rejection(invoice)
+                # Retry only recent rejections, so enabling emails does not
+                # send one for every rejection ever recorded.
+                rejected_at = self._as_utc(
+                    invoice.approver2_date
+                    if invoice.approver2_decision == "rejected"
+                    else invoice.approver1_date
+                    if invoice.approver1_decision == "rejected"
+                    else invoice.reviewed_at or invoice.created_at
+                )
+                if rejected_at is not None and current - rejected_at <= timedelta(
+                    days=7
+                ):
+                    self._notify_purchase_ledger_rejection(invoice)
                 continue
             level = 1 if invoice.status.endswith("1") else 2
             recipient = getattr(invoice, f"approver{level}_email")
@@ -396,11 +411,11 @@ class InvoiceLifecycle:
             local_classification = self.classification_runner(
                 Path(invoice.stored_path)
             )
-            if local_classification.document_type == "statement":
-                return self._flag_detected_statement(
-                    invoice, local_classification
-                )
-            result = self.extraction_runner(Path(invoice.stored_path))
+            result = (
+                None
+                if local_classification.document_type == "statement"
+                else self.extraction_runner(Path(invoice.stored_path))
+            )
         except (
             ExtractionConfigurationError,
             ExtractionServiceError,
@@ -415,9 +430,8 @@ class InvoiceLifecycle:
             )
             raise InvoiceExtractionUnavailableError(str(error)) from error
         except Exception as error:
-            self._move_to_flagged(invoice)
-            record = self.invoice_store.update_fields(
-                invoice_id,
+            record = self._save_extraction_outcome(
+                invoice,
                 status="Needs Review",
                 review_return_status=None,
                 review_reason=f"The PDF could not be read automatically: {error}",
@@ -431,6 +445,8 @@ class InvoiceLifecycle:
                 invoice_id=invoice_id,
             )
             return record
+        if result is None:
+            return self._flag_detected_statement(invoice, local_classification)
         if result.document_type == "statement":
             return self._flag_detected_statement(
                 invoice,
@@ -519,12 +535,11 @@ class InvoiceLifecycle:
                 extracted_fields, sort_keys=True, separators=(",", ":")
             ),
         }
-        self._move_to_flagged(invoice)
 
         if result.needs_review or warnings:
             warning_text = "\n".join(warnings)
-            record = self.invoice_store.update_fields(
-                invoice_id,
+            record = self._save_extraction_outcome(
+                invoice,
                 company=company,
                 supplier=supplier,
                 supplier_invoice_number=result.supplier_invoice_number,
@@ -575,8 +590,8 @@ class InvoiceLifecycle:
             return record
         # Reached only when extraction is confident: every required field read,
         # no warnings, no duplicate, company and supplier known.
-        record = self.invoice_store.update_fields(
-            invoice_id,
+        record = self._save_extraction_outcome(
+            invoice,
             company=company,
             supplier=supplier,
             supplier_invoice_number=result.supplier_invoice_number,
@@ -607,6 +622,29 @@ class InvoiceLifecycle:
             return self._auto_confirm(record, result)
         return record
 
+    def _save_extraction_outcome(
+        self, invoice: InvoiceRecord, **fields: object
+    ) -> InvoiceRecord:
+        """Save what extraction found, then move the PDF to Flagged.
+
+        Extraction can take a while; if Purchase Ledger confirmed the invoice
+        meanwhile, this stale result must not move its PDF back or overwrite
+        the newer status. The save comes first so that a failed move still
+        leaves the invoice visible for review (nothing retries an invoice
+        left in "Awaiting AI Extraction"); later steps move the PDF by its
+        SharePoint item id from wherever it is."""
+        record = self.invoice_store.update_fields_if_status(
+            invoice.id, "Awaiting AI Extraction", **fields
+        )
+        if record is not None:
+            self._move_to_flagged(invoice)
+            return record
+        current = self._require_invoice(invoice.id)
+        raise InvoiceLifecycleError(
+            f"Invoice {invoice.id} changed while it was being read "
+            f"(status: {current.status}); the extraction result was not saved."
+        )
+
     def _auto_confirm_enabled(self) -> bool:
         if self.configuration_getter is None:
             return False
@@ -634,11 +672,14 @@ class InvoiceLifecycle:
                 recorded_by=AUTO_CONFIRM_ACTOR,
             )
         except InvoiceLifecycleError as error:
-            held = self.invoice_store.update_fields(
+            held = self.invoice_store.update_fields_if_status(
                 record.id,
-                status="Needs Review",
+                "Needs Review",
                 review_reason=f"Automatic confirmation was not possible: {error}",
             )
+            if held is None:
+                # Someone else (a manual confirm) moved it on meanwhile.
+                return self._require_invoice(record.id)
             self.activity_feed.add_event(
                 event_type="needs_review",
                 target_role=ROLE_PURCHASE_LEDGER,
@@ -690,6 +731,9 @@ class InvoiceLifecycle:
                 "(or the production Companies SharePoint List) first."
             )
         supplier_profile = self._get_supplier(supplier)
+        company = company_profile.name
+        if supplier_profile is not None:
+            supplier = supplier_profile.name
         submitted_fields = {
             "company": company,
             "supplier": supplier,
@@ -740,165 +784,196 @@ class InvoiceLifecycle:
         if number_warnings:
             raise InvoiceLifecycleError(" ".join(number_warnings))
 
-        # Duplicate detection on
-        # Company + Supplier + Supplier Invoice Number. A possible duplicate
-        # is NEVER silently dropped or auto-merged -- it is flagged for
-        # Purchase Ledger, who can then set override_duplicate=True (via the
-        # "This is not a duplicate" action) once they have manually
-        # confirmed it is a genuinely separate invoice.
-        if not override_duplicate:
-            duplicate = find_possible_duplicate(
-                self.invoice_store,
-                exclude_invoice_id=invoice_id,
-                company=company,
-                supplier=supplier,
-                supplier_invoice_number=supplier_invoice_number,
+        # Claim the invoice before allocating an IRJ, so a double submit (or
+        # a manual confirm racing auto-confirm) cannot allocate two numbers.
+        original_status = invoice.status
+        claimed = self.invoice_store.update_fields_if_status(
+            invoice_id, original_status, status=CONFIRMING_STATUS
+        )
+        if claimed is None:
+            current = self._require_invoice(invoice_id)
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} is not awaiting confirmation "
+                f"(status: {current.status})."
             )
-            if duplicate is not None:
-                reference = duplicate_reference(
-                    duplicate.invoice_id, duplicate.irj_number
+        invoice = claimed
+
+        def save_claimed(**fields: object) -> InvoiceRecord:
+            record = self.invoice_store.update_fields_if_status(
+                invoice_id, CONFIRMING_STATUS, **fields
+            )
+            if record is None:
+                current = self._require_invoice(invoice_id)
+                raise InvoiceLifecycleError(
+                    f"Invoice {invoice_id} confirmation could not be completed "
+                    f"(status: {current.status})."
                 )
-                self._move_to_flagged(invoice)
-                record = self.invoice_store.update_fields(
-                    invoice_id,
+            return record
+
+        try:
+            # Duplicate detection on
+            # Company + Supplier + Supplier Invoice Number. A possible duplicate
+            # is NEVER silently dropped or auto-merged -- it is flagged for
+            # Purchase Ledger, who can then set override_duplicate=True (via the
+            # "This is not a duplicate" action) once they have manually
+            # confirmed it is a genuinely separate invoice.
+            if not override_duplicate:
+                duplicate = find_possible_duplicate(
+                    self.invoice_store,
+                    exclude_invoice_id=invoice_id,
                     company=company,
                     supplier=supplier,
                     supplier_invoice_number=supplier_invoice_number,
-                    po_number=purchase_order_number or None,
-                    invoice_date=invoice_date,
-                    invoice_value=invoice_value,
-                    currency=currency,
-                    status="Needs Review",
-                    review_return_status=None,
-                    duplicate_of_invoice_id=duplicate.invoice_id,
-                    review_reason=(
-                        f"It's a duplicate of {reference} "
-                        f"(status {duplicate.status}), matched on "
-                        f"{duplicate.match_basis}. Purchase Ledger must "
-                        "confirm this is a genuinely separate invoice before it "
-                        "can be routed."
-                    ),
+                )
+                if duplicate is not None:
+                    reference = duplicate_reference(
+                        duplicate.invoice_id, duplicate.irj_number
+                    )
+                    self._move_to_flagged(invoice)
+                    record = save_claimed(
+                        company=company,
+                        supplier=supplier,
+                        supplier_invoice_number=supplier_invoice_number,
+                        po_number=purchase_order_number or None,
+                        invoice_date=invoice_date,
+                        invoice_value=invoice_value,
+                        currency=currency,
+                        status="Needs Review",
+                        review_return_status=None,
+                        duplicate_of_invoice_id=duplicate.invoice_id,
+                        review_reason=(
+                            f"It's a duplicate of {reference} "
+                            f"(status {duplicate.status}), matched on "
+                            f"{duplicate.match_basis}. Purchase Ledger must "
+                            "confirm this is a genuinely separate invoice before it "
+                            "can be routed."
+                        ),
+                        routing_explanation=(
+                            "Routing paused because the company, supplier and invoice "
+                            "number match an existing invoice."
+                        ),
+                        **review_metadata,
+                    )
+                    self._log_purchase_ledger(
+                        event_type="possible_duplicate",
+                        message=(
+                            f"Invoice {invoice.original_filename} looks like a possible "
+                            f"duplicate of {reference} "
+                            f"(matched on {duplicate.match_basis})."
+                        ),
+                        invoice_id=invoice_id,
+                    )
+                    return record
+
+            manual_irj = self._uses_manual_irj(company_profile.name)
+            irj_number = (
+                invoice.irj_number
+                if self._irj_belongs_to_company(invoice, company_profile.name)
+                else None
+                if manual_irj
+                else self.irj_generator.generate(company_profile.name)
+            )
+            if irj_number and irj_number != invoice.irj_number:
+                # Record the allocation straight away. If routing or SharePoint
+                # filing fails below, a retry reuses this number instead of
+                # allocating another one and leaving a gap in the sequence.
+                invoice = save_claimed(
+                    irj_number=irj_number, company=company_profile.name
+                )
+            try:
+                decision = route_confirmed_invoice(
+                    ConfirmedInvoice(
+                        invoice_id=str(invoice_id),
+                        company=company,
+                        company_folder=company_profile.company_folder,
+                        original_filename=invoice.original_filename,
+                        irj_number=irj_number,
+                        defer_irj=manual_irj,
+                        purchase_order_number=purchase_order_number,
+                        po_matching_folder=company_profile.po_matching_folder,
+                        purchase_ledger_recipient=os.environ.get(
+                            "PURCHASE_LEDGER_NOTIFICATION_EMAIL",
+                            "purchase-ledger@example.test",
+                        ),
+                    )
+                )
+            except RoutingValidationError as error:
+                raise InvoiceLifecycleError(str(error)) from error
+
+            self._move_pdf_in_sharepoint(invoice, decision.destination_folder, decision.destination_filename)
+
+            base_fields: dict[str, object] = {
+                "company": company,
+                "supplier": supplier,
+                "supplier_invoice_number": supplier_invoice_number,
+                "po_number": purchase_order_number or None,
+                "invoice_date": invoice_date,
+                "invoice_value": invoice_value,
+                "currency": currency,
+                "irj_number": irj_number,
+                "duplicate_of_invoice_id": None,
+                "review_return_status": None,
+                **review_metadata,
+            }
+
+            if decision.route == "purchase_order":
+                record = save_claimed(
+                    **base_fields,
+                    invoice_type="po",
+                    status=decision.status,
+                    review_reason=None,
                     routing_explanation=(
-                        "Routing paused because the company, supplier and invoice "
-                        "number match an existing invoice."
+                        f"PO number {purchase_order_number} was confirmed by "
+                        f"{recorded_by}; routed to PO Matching."
                     ),
-                    **review_metadata,
+                )
+                self._send_stage_email(
+                    invoice_id,
+                    "po_matching",
+                    recipient=str(decision.notification_recipient),
+                    subject=(
+                        f"New invoice ({invoice.original_filename}) waiting for "
+                        "PO matching"
+                    ),
+                    body=(
+                        f"New invoice ({invoice.original_filename}) is waiting for "
+                        f"PO matching. IRJ: {irj_number or 'assigned at Sage registration'}. PO: "
+                        f"{purchase_order_number}."
+                    ),
                 )
                 self._log_purchase_ledger(
-                    event_type="possible_duplicate",
+                    event_type="po_awaiting_match",
                     message=(
-                        f"Invoice {invoice.original_filename} looks like a possible "
-                        f"duplicate of {reference} "
-                        f"(matched on {duplicate.match_basis})."
+                        f"Invoice {irj_number or invoice.original_filename} ({supplier}) is awaiting PO matching "
+                        f"against PO {purchase_order_number}."
                     ),
                     invoice_id=invoice_id,
                 )
                 return record
 
-        manual_irj = self._uses_manual_irj(company_profile.name)
-        irj_number = (
-            invoice.irj_number
-            if self._irj_belongs_to_company(invoice, company_profile.name)
-            else None
-            if manual_irj
-            else self.irj_generator.generate(company_profile.name)
-        )
-        if irj_number and irj_number != invoice.irj_number:
-            # Record the allocation straight away. If routing or SharePoint
-            # filing fails below, a retry reuses this number instead of
-            # allocating another one and leaving a gap in the sequence.
-            invoice = self.invoice_store.update_fields(
-                invoice_id, irj_number=irj_number, company=company_profile.name
-            )
-        try:
-            decision = route_confirmed_invoice(
-                ConfirmedInvoice(
-                    invoice_id=str(invoice_id),
-                    company=company,
-                    company_folder=company_profile.company_folder,
-                    original_filename=invoice.original_filename,
-                    irj_number=irj_number,
-                    defer_irj=manual_irj,
-                    purchase_order_number=purchase_order_number,
-                    po_matching_folder=company_profile.po_matching_folder,
-                    purchase_ledger_recipient=os.environ.get(
-                        "PURCHASE_LEDGER_NOTIFICATION_EMAIL",
-                        "purchase-ledger@example.test",
-                    ),
-                )
-            )
-        except RoutingValidationError as error:
-            raise InvoiceLifecycleError(str(error)) from error
-
-        self._move_pdf_in_sharepoint(invoice, decision.destination_folder, decision.destination_filename)
-
-        base_fields: dict[str, object] = {
-            "company": company,
-            "supplier": supplier,
-            "supplier_invoice_number": supplier_invoice_number,
-            "po_number": purchase_order_number or None,
-            "invoice_date": invoice_date,
-            "invoice_value": invoice_value,
-            "currency": currency,
-            "irj_number": irj_number,
-            "duplicate_of_invoice_id": None,
-            "review_return_status": None,
-            **review_metadata,
-        }
-
-        if decision.route == "purchase_order":
-            record = self.invoice_store.update_fields(
-                invoice_id,
+            record = save_claimed(
                 **base_fields,
-                invoice_type="po",
-                status=decision.status,
+                invoice_type="nominal",
+                status="Awaiting Sage Registration",
                 review_reason=None,
                 routing_explanation=(
-                    f"PO number {purchase_order_number} was confirmed by "
-                    f"{recorded_by}; routed to PO Matching."
-                ),
-            )
-            self._send_stage_email(
-                invoice_id,
-                "po_matching",
-                recipient=str(decision.notification_recipient),
-                subject=(
-                    f"New invoice ({invoice.original_filename}) waiting for "
-                    "PO matching"
-                ),
-                body=(
-                    f"New invoice ({invoice.original_filename}) is waiting for "
-                    f"PO matching. IRJ: {irj_number or 'assigned at Sage registration'}. PO: "
-                    f"{purchase_order_number}."
+                    f"No PO number was confirmed by {recorded_by}; routed as a "
+                    "nominal invoice to Sage Registration."
                 ),
             )
             self._log_purchase_ledger(
-                event_type="po_awaiting_match",
-                message=(
-                    f"Invoice {irj_number or invoice.original_filename} ({supplier}) is awaiting PO matching "
-                    f"against PO {purchase_order_number}."
-                ),
+                event_type="sage_registration_pending",
+                message=f"Invoice {irj_number} ({supplier}) is awaiting Sage registration.",
                 invoice_id=invoice_id,
             )
             return record
-
-        record = self.invoice_store.update_fields(
-            invoice_id,
-            **base_fields,
-            invoice_type="nominal",
-            status="Awaiting Sage Registration",
-            review_reason=None,
-            routing_explanation=(
-                f"No PO number was confirmed by {recorded_by}; routed as a "
-                "nominal invoice to Sage Registration."
-            ),
-        )
-        self._log_purchase_ledger(
-            event_type="sage_registration_pending",
-            message=f"Invoice {irj_number} ({supplier}) is awaiting Sage registration.",
-            invoice_id=invoice_id,
-        )
-        return record
+        except Exception:
+            # Nothing else knows the claim status; put the invoice back so it
+            # can be retried. A no-op once the final status has been saved.
+            self.invoice_store.update_fields_if_status(
+                invoice_id, CONFIRMING_STATUS, status=original_status
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Stage 3a: PO matching
@@ -1008,6 +1083,11 @@ class InvoiceLifecycle:
         if len(normalized_irj) != 6 or not normalized_irj.isdigit():
             raise InvoiceLifecycleError(
                 "The IRJ number must contain exactly six digits."
+            )
+        if retrying_missing_route and normalized_irj != (invoice.irj_number or ""):
+            raise InvoiceLifecycleError(
+                f"The IRJ number cannot be changed on retry; invoice {invoice_id} "
+                f"was registered in Sage as IRJ {invoice.irj_number}."
             )
         existing = self.invoice_store.get_by_irj_number(
             normalized_irj, str(invoice.company)
@@ -1658,9 +1738,21 @@ class InvoiceLifecycle:
             raise InvoiceLifecycleError(
                 f"Invoice {invoice_id} is already awaiting review."
             )
+        initial_stage = invoice.status == "Awaiting AI Extraction"
+        # Only an active stage can be held: the hold records it as the stage
+        # to return to, and its PDF needs a folder to go back to.
+        if not initial_stage and (
+            invoice.status in TERMINAL_STATUSES
+            or invoice.status == "Workflow Issue / On Hold"
+            or invoice.status.startswith("Processing ")
+            or self._folder_for_status(invoice, invoice.status) is None
+        ):
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} cannot be flagged for review from status "
+                f"{invoice.status}."
+            )
         if not reason.strip():
             raise InvoiceLifecycleError("A review reason is required.")
-        initial_stage = invoice.status in ("Awaiting AI Extraction", "Needs Review")
         if initial_stage:
             self._move_to_flagged(invoice)
         else:
@@ -2033,7 +2125,10 @@ class InvoiceLifecycle:
         self, invoice_id: int, *, recorded_by: str
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
-        if invoice.status != "Foreign Payment / Awaiting Allocation":
+        if invoice.status not in {
+            "Foreign Payment / Awaiting Allocation",
+            "Approved for Payment - Foreign POA",
+        }:
             raise InvoiceLifecycleError(
                 f"Only a foreign payment awaiting allocation can be returned to "
                 f"domestic payment (status: {invoice.status})."
@@ -2046,6 +2141,7 @@ class InvoiceLifecycle:
         record = self.invoice_store.update_fields(
             invoice_id,
             status="Approved",
+            payment_method=None,
             is_foreign_payment=None,
             payment_route_decided_at=None,
             payment_route_decided_by=None,
@@ -2158,9 +2254,8 @@ class InvoiceLifecycle:
         document: InvoiceRecord,
         classification: DocumentClassification,
     ) -> InvoiceRecord:
-        self._move_to_flagged(document)
-        record = self.invoice_store.update_fields(
-            document.id,
+        record = self._save_extraction_outcome(
+            document,
             document_type="statement",
             document_classification_confidence=classification.confidence,
             document_classification_reason=classification.reason,

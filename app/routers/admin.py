@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import io
 import os
+import zipfile
 from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from openpyxl.utils.exceptions import InvalidFileException
 
 from app.approval_matrix import ApprovalMatrixEntry
 from app.auth import ROLE_ADMIN, User, require_role
@@ -392,7 +394,7 @@ def admin_update_supplier_terms(
 
 
 @router.post("/api/admin/import/supplier-master-data")
-async def admin_import_supplier_master_data(
+def admin_import_supplier_master_data(
     http_request: Request,
     file: UploadFile = File(...),
     company: str = Form(...),
@@ -411,12 +413,21 @@ async def admin_import_supplier_master_data(
         raise HTTPException(
             status_code=422, detail="Please upload an Excel (.xlsx) file."
         )
-    contents = await file.read()
+    contents = file.file.read()
     try:
         duplicates = find_existing_supplier_imports(
             io.BytesIO(contents),
             supplier_store=app.state.suppliers_store,
         )
+    except (zipfile.BadZipFile, InvalidFileException, KeyError) as error:
+        # Not a real workbook (openpyxl raises KeyError for a zip without
+        # the workbook parts). Checked here, before anything is written.
+        raise HTTPException(
+            status_code=422, detail="The file is not a valid Excel workbook."
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    try:
         if duplicates and not replace_existing:
             raise HTTPException(
                 status_code=409,

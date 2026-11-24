@@ -258,6 +258,43 @@ def test_move_resolves_existing_folders_without_unsupported_graph_filter() -> No
     assert requested_paths[-1] == "/v1.0/drives/drive/items/pdf-1"
 
 
+def test_folder_created_concurrently_is_looked_up_instead_of_renamed() -> None:
+    created_payloads: list[dict[str, object]] = []
+    lookups = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal lookups
+        if request.method == "PATCH":
+            body = json.loads(request.content)
+            assert body["parentReference"] == {"id": "paid-by-other-process"}
+            return httpx.Response(200, json={"id": "pdf-1", "name": body["name"]})
+        if request.method == "POST":
+            created_payloads.append(json.loads(request.content))
+            # The web app created "Paid" between our lookup and our create.
+            return httpx.Response(
+                409, json={"error": {"code": "nameAlreadyExists"}}
+            )
+        lookups += 1
+        if lookups == 1:
+            return httpx.Response(200, json={"value": []})
+        return httpx.Response(
+            200,
+            json={"value": [{"id": "paid-by-other-process", "name": "Paid", "folder": {}}]},
+        )
+
+    client = _client(httpx.MockTransport(respond))
+
+    client.move_to_folder("pdf-1", "Paid", "invoice.pdf")
+
+    assert created_payloads == [
+        {
+            "name": "Paid",
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        }
+    ]
+
+
 def test_repeated_moves_reuse_resolved_sharepoint_folder_ids() -> None:
     requested_paths: list[str] = []
 

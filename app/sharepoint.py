@@ -431,8 +431,40 @@ class SharePointClient:
         else:
             url = f"{drive_prefix}/items/{quote(parent_id, safe='')}/children"
 
-        for payload in self.session.paginate(
+        existing_id = self._find_child_folder(url, name)
+        if existing_id is not None:
+            return existing_id
+
+        # Folder does not exist — create it. "fail" rather than "rename": if
+        # another process (web app or worker) creates it first, use theirs
+        # instead of silently filing into "Paid 1".
+        payload = {
+            "name": name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        }
+        created = self.session.request(
+            "POST",
             url,
+            operation="SharePoint request",
+            json=payload,
+            ok_statuses={409},
+        )
+        with self._cache_lock:
+            self._folder_inventory_cache.clear()
+        if created.status_code == 409:
+            existing_id = self._find_child_folder(url, name)
+            if existing_id is None:
+                raise SharePointError(
+                    f"SharePoint folder '{name}' could not be created: an item "
+                    "with that name already exists."
+                )
+            return existing_id
+        return str(created.json()["id"])
+
+    def _find_child_folder(self, children_url: str, name: str) -> str | None:
+        for payload in self.session.paginate(
+            children_url,
             params={"$select": "id,name,folder", "$top": "200"},
             operation="SharePoint folder lookup",
         ):
@@ -448,24 +480,7 @@ class SharePointClient:
                     and str(item.get("name", "")).casefold() == name.casefold()
                 ):
                     return str(item["id"])
-
-        # Folder does not exist — create it
-        if parent_id is None:
-            create_url = f"{drive_prefix}/root/children"
-        else:
-            create_url = f"{drive_prefix}/items/{quote(parent_id, safe='')}/children"
-
-        payload = {
-            "name": name,
-            "folder": {},
-            "@microsoft.graph.conflictBehavior": "rename",
-        }
-        # conflictBehavior=rename makes this non-idempotent: never retried
-        # except on throttling or connection failures.
-        created = self._send_json("POST", create_url, payload)
-        with self._cache_lock:
-            self._folder_inventory_cache.clear()
-        return str(created.json()["id"])
+        return None
 
     def _send_json(
         self,

@@ -746,8 +746,9 @@ def test_supplier_payment_update_rejects_duplicate_company_account(tmp_path) -> 
 def test_deleting_supplier_cascades_payment_profiles_and_routes(tmp_path) -> None:
     client = client_for(tmp_path)
     login(client, "admin", "ChangeMe-Admin1!")
-    client.post("/api/admin/suppliers", json={"name": "Delete Me Ltd"})
-    client.post(
+    created = client.post("/api/admin/suppliers", json={"name": "Delete Me Ltd"})
+    assert created.status_code == 200, created.text
+    route = client.post(
         "/api/admin/approval-matrix",
         json={
             "company": "*",
@@ -756,12 +757,20 @@ def test_deleting_supplier_cascades_payment_profiles_and_routes(tmp_path) -> Non
             "approver1_email": "jordan@example.test",
         },
     )
+    assert route.status_code == 200, route.text
     client.app.state.supplier_terms_store.upsert(
         company="*",
         supplier="Delete Me Ltd",
         supplier_account_number="DEL0001",
         default_payment_method="BACS",
     )
+    # Both exist before the delete, so the checks below cannot pass vacuously.
+    assert client.app.state.approval_matrix_store.find(
+        "Acme Trading Ltd", "Delete Me Ltd"
+    ) is not None
+    assert client.app.state.supplier_terms_store.list_for_supplier(
+        "Acme Trading Ltd", "Delete Me Ltd"
+    ) != []
 
     response = client.delete("/api/admin/suppliers/Delete%20Me%20Ltd")
 
@@ -851,3 +860,21 @@ def test_an_email_cell_that_is_not_an_address_is_treated_as_missing(tmp_path) ->
     route = matrix.find_exact("Brand New Co", "Placeholder Ltd")
     assert route is not None and route.approver1.email == ""
     assert "Add email addresses for: Alice" in summary.rows[0].reason
+
+
+def test_new_supplier_on_two_rows_is_created_once(tmp_path) -> None:
+    summary, matrix = _import_rows(
+        tmp_path,
+        [
+            ["Brand New Co", "Twice Ltd", "ACC-1", "BACS", "30 days", "Main",
+             "Alice", None, "alice@example.test", None],
+            ["Brand New Co", "twice ltd", "ACC-2", "BACS", "30 days", "Main",
+             "Bob", None, "bob@example.test", None],
+        ],
+    )
+
+    assert [row.status for row in summary.rows] == ["imported", "imported"]
+    suppliers = SupplierStore(tmp_path / "config.db")
+    assert [s.name for s in suppliers.list()].count("Twice Ltd") == 1
+    route = matrix.find_exact("Brand New Co", "Twice Ltd")
+    assert route is not None and route.approver1.name == "Bob"  # second row wins

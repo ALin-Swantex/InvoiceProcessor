@@ -231,10 +231,13 @@ class OutlookInvoiceWorker:
             self.retriever.list_invoice_attachments(message_id),
         )
         if not attachments:
-            raise RuntimeError(
-                "The Outlook message contains no supported invoice attachments "
-                "(PDF, XLS, or XLSX)."
+            # The webhook queues every inbox message, so most of these are
+            # ordinary mail: skip them rather than fail the queue item.
+            logger.info(
+                "Outlook message %s has no PDF, XLS or XLSX attachments; skipped.",
+                message_id,
             )
+            return
 
         # Downloads, conversions and SharePoint uploads run concurrently (bounded
         # by the semaphore). Registration - duplicate detection, the invoice row

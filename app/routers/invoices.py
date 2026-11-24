@@ -50,6 +50,9 @@ from app.workflow import ConfirmedInvoice, RoutingValidationError, route_confirm
 
 router = APIRouter()
 
+# Same as the OUTLOOK_MAX_PDF_BYTES default for emailed PDFs.
+MAX_MANUAL_UPLOAD_BYTES = 20 * 1024 * 1024
+
 
 @router.get("/api/invoices")
 def list_invoices(
@@ -85,12 +88,18 @@ def manual_upload_invoice(
     """
     import app.main as main_module
     app = http_request.app
-    if file.content_type not in {"application/pdf", "application/octet-stream"} and not (
-        file.filename or ""
-    ).lower().endswith(".pdf"):
+    # Only the final path component: a client name such as "a/b.pdf" must
+    # not reach the upload directory or SharePoint as a folder path. Ingest
+    # rejects names without ".pdf", so check before uploading anything.
+    client_filename = Path(file.filename or "").name
+    if not client_filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files may be uploaded.")
 
-    content = file.file.read()
+    content = file.file.read(MAX_MANUAL_UPLOAD_BYTES + 1)
+    if len(content) > MAX_MANUAL_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413, detail="The uploaded file is too large."
+        )
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file was empty.")
     try:
@@ -99,7 +108,7 @@ def manual_upload_invoice(
         raise HTTPException(status_code=400, detail=str(error)) from error
 
     unique_id = uuid.uuid4().hex
-    original_filename = file.filename or f"manual-invoice-{unique_id}.pdf"
+    original_filename = client_filename
 
     message = {
         "internetMessageId": None,
@@ -343,8 +352,15 @@ def search_invoice_by_irj(
             status_code=422,
             detail="An IRJ number must contain exactly six digits.",
         )
-    invoice = app.state.invoice_store.get_by_irj_number(normalized)
-    if invoice is None or not invoice_is_visible_to_user(invoice, user):
+    # IRJ numbers are per company, so several invoices can share one; pick
+    # the oldest the user may see (as get_by_irj_number did, by id).
+    visible = [
+        invoice
+        for invoice in app.state.invoice_store.search(irj_number=normalized)
+        if invoice_is_visible_to_user(invoice, user)
+    ]
+    invoice = min(visible, key=lambda record: record.id, default=None)
+    if invoice is None:
         raise HTTPException(
             status_code=404,
             detail=f"No invoice was found for IRJ number '{normalized}'.",

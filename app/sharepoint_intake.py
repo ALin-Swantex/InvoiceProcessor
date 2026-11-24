@@ -163,13 +163,9 @@ class SharePointIncomingMonitor:
             duplicate = self._find_identical_pdf(record, pdf_content)
             if duplicate is not None:
                 reference = duplicate_reference(duplicate.id, duplicate.irj_number)
-                self.client.move_to_folder(
-                    item_id,
-                    self.client.settings.flagged_folder
-                    if hasattr(self.client, "settings")
-                    else FLAGGED_INVOICES_FOLDER,
-                    filename,
-                )
+                # Flag the record before the SharePoint move: a retry skips an
+                # already registered item, so a failed move must not leave it
+                # looking like a new invoice. Routing later moves it by item ID.
                 record = self.invoice_store.update_fields(
                     record.id,
                     status="Needs Review",
@@ -191,6 +187,13 @@ class SharePointIncomingMonitor:
                         ),
                         invoice_id=record.id,
                     )
+                self.client.move_to_folder(
+                    item_id,
+                    self.client.settings.flagged_folder
+                    if hasattr(self.client, "settings")
+                    else FLAGGED_INVOICES_FOLDER,
+                    filename,
+                )
                 return record
         if self.activity_feed is not None:
             self.activity_feed.add_event(

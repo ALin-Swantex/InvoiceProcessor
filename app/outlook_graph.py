@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import uuid
@@ -22,6 +23,10 @@ SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._ -]+")
 PDF_EXTENSIONS = {".pdf"}
 EXCEL_EXTENSIONS = {".xls", ".xlsx"}
 SUPPORTED_INVOICE_EXTENSIONS = PDF_EXTENSIONS | EXCEL_EXTENSIONS
+# Safety cap on one mailbox listing across all pages.
+MAX_LISTED_EMAILS = 1000
+
+logger = logging.getLogger(__name__)
 
 
 class OutlookConfigurationError(RuntimeError):
@@ -132,7 +137,10 @@ class OutlookGraphClient:
         if unread_only:
             filters.append("isRead eq false")
 
-        response = self._get(
+        # limit is the page size; every page is followed (up to a safety cap)
+        # so the oldest waiting emails are not left behind the newest page.
+        messages: list[dict[str, Any]] = []
+        for payload in self.session.paginate(
             f"/users/{quote(self.settings.mailbox, safe='')}/mailFolders('inbox')/messages",
             params={
                 "$top": str(limit),
@@ -143,10 +151,17 @@ class OutlookGraphClient:
                 "$filter": " and ".join(filters),
                 "$orderby": "receivedDateTime desc",
             },
-        )
-        messages = response.json().get("value", [])
-        if not isinstance(messages, list):
-            raise OutlookGraphError("Graph returned an invalid messages response.")
+        ):
+            page = payload.get("value", [])
+            if not isinstance(page, list):
+                raise OutlookGraphError("Graph returned an invalid messages response.")
+            messages.extend(page)
+            if len(messages) >= MAX_LISTED_EMAILS:
+                logger.warning(
+                    "Stopped listing unread invoice emails at %d messages.",
+                    MAX_LISTED_EMAILS,
+                )
+                return messages[:MAX_LISTED_EMAILS]
         return messages
 
     def get_invoice_email(self, message_id: str) -> dict[str, Any]:

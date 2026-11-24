@@ -76,7 +76,11 @@ def suppliers(
 
 
 @router.get("/api/approval-matrix")
-def approval_matrix(http_request: Request, user: User = Depends(get_current_user)) -> list[dict[str, object]]:
+def approval_matrix(
+    http_request: Request,
+    # Every approver's name and email: no approver screen uses it.
+    user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
+) -> list[dict[str, object]]:
     app = http_request.app
     return [
         {

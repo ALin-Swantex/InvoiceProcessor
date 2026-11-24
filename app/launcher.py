@@ -9,6 +9,7 @@ Closing the window stops everything.
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import queue
 import signal
@@ -28,6 +29,8 @@ from typing import Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_FILE = PROJECT_ROOT / "runtime_data" / "launcher.log"
+# On start a log larger than this becomes launcher.log.1 (replacing the older one).
+LOG_ROTATE_BYTES = 5_000_000
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 GRACEFUL_SHUTDOWN_SECONDS = 2
@@ -84,11 +87,20 @@ def migration_command(*, python: str | None = None) -> list[str]:
 
 def port_is_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if os.name != "nt":
+            # Like uvicorn, ignore TIME_WAIT connections left by the last Stop.
+            # (On Windows this option would allow taking over a live port.)
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind((host, port))
         except OSError:
             return False
-    return True
+    # With SO_REUSEADDR, macOS/BSD let 127.0.0.1 bind beside a 0.0.0.0
+    # listener, so also check that nothing answers on the port.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.settimeout(1)
+        target = "127.0.0.1" if host in ("", "0.0.0.0") else host
+        return client.connect_ex((target, port)) != 0
 
 
 def web_is_up(url: str) -> bool:
@@ -134,6 +146,23 @@ class ProcessManager:
     def active(self) -> bool:
         return self._busy or any(p.poll() is None for p in self.processes.values())
 
+    def rotate_log(self) -> None:
+        with self._log_lock:
+            try:
+                if self.log_file.stat().st_size > LOG_ROTATE_BYTES:
+                    os.replace(self.log_file, self.log_file.with_name(self.log_file.name + ".1"))
+            except OSError:
+                pass  # no log yet, or it cannot be moved: keep appending
+
+    def failed(self) -> bool:
+        """True once start-up failed or the web app exited on its own."""
+        if self._stopping:
+            return False
+        if self.states[MIGRATIONS] == "failed" or self.states[WEB] == "failed":
+            return True
+        web = self.processes.get(WEB)
+        return web is not None and web.poll() is not None
+
     def log(self, source: str, text: str) -> None:
         line = text.rstrip("\n")
         self.output.put((source, line))
@@ -164,6 +193,7 @@ class ProcessManager:
     def _start_sequence(self) -> None:
         self.web_ready.clear()
         self.states = {name: "stopped" for name in SERVICES}
+        self.rotate_log()
         self.log("Launcher", "Starting Invoice Processor…")
         config = self.configuration
         if not port_is_free(config.host, config.port):
@@ -321,6 +351,9 @@ def run_gui(configuration: LauncherConfiguration) -> int:
 
     c = COLOURS
     manager = ProcessManager(configuration)
+    # Last resort if the window is never closed normally (an exception, the
+    # interpreter exiting): never leave the worker running on the mailbox.
+    atexit.register(manager.stop)
     root = tk.Tk()
     root.title("Invoice Processor")
     root.geometry("900x620")
@@ -514,6 +547,12 @@ def run_gui(configuration: LauncherConfiguration) -> int:
         destroy_when_stopped()
 
     root.protocol("WM_DELETE_WINDOW", close)
+    if os.name != "nt":
+        # `kill <pid>` or logout: stop the services exactly as closing does.
+        # Tk hands control back to Python on every refresh tick, so the
+        # handler runs within a fraction of a second.
+        for signal_name in ("SIGTERM", "SIGHUP"):
+            signal.signal(getattr(signal, signal_name), lambda _signum, _frame: close())
     if sys.platform == "darwin":
         root.createcommand("::tk::mac::Quit", close)
     append("Launcher", "Press Start to run the database migrations, web app and Outlook worker.")
@@ -523,7 +562,9 @@ def run_gui(configuration: LauncherConfiguration) -> int:
 
 
 def run_headless(configuration: LauncherConfiguration, *, open_browser: bool) -> int:
-    manager = ProcessManager(configuration)
+    """Run until stopped; exit 1 if start-up fails or the web app dies, so a
+    supervisor sees the failure and can restart or alert."""
+    manager = ProcessManager(configuration, log_file=LOG_FILE)
     manager.start()
 
     def stop_processes(signum: int, frame: object) -> None:
@@ -533,18 +574,24 @@ def run_headless(configuration: LauncherConfiguration, *, open_browser: bool) ->
 
     signal.signal(signal.SIGINT, stop_processes)
     signal.signal(signal.SIGTERM, stop_processes)
+    def print_output() -> None:
+        while not manager.output.empty():
+            source, line = manager.output.get()
+            print(f"[{source}] {line}", flush=True)
+
     opened = False
     try:
-        while True:
-            while not manager.output.empty():
-                source, line = manager.output.get()
-                print(f"[{source}] {line}", flush=True)
+        while not manager.failed():
+            print_output()
             if open_browser and not opened and manager.web_ready.is_set():
                 opened = True
                 webbrowser.open(configuration.web_url)
             time.sleep(0.25)
+        manager.log("Launcher", "Error: start-up failed or the web app stopped; exiting.")
+        return 1
     finally:
         manager.stop()
+        print_output()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

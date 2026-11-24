@@ -1,5 +1,6 @@
 """The mailbox sorting script, run against a fake mailbox and a fake reader."""
 
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -166,3 +167,26 @@ def test_download_only_saves_every_pdf_by_month_without_reading_any(tmp_path: Pa
     assert counts["saved"] == 2 and counts["unreadable"] == 0
     names = sorted(p.name for p in (tmp_path / "2026-03").iterdir())
     assert names == ["2026-03-02_x@y.test_one.pdf", "2026-03-02_x@y.test_two.pdf"]
+
+
+def test_ctrl_c_stops_queued_pdfs_from_being_read(tmp_path: Path) -> None:
+    client = FakeClient({f"f{n}": pdf(str(n)) for n in range(5)})
+    read = []
+    interrupted = threading.Event()
+
+    def extractor(path, reference=None):
+        read.append(path)
+        if len(read) > 1:  # keep the worker from racing through the queue
+            interrupted.wait(5)
+        return result()
+
+    def say(line: str) -> None:
+        if line.startswith("["):  # the first finished PDF: the user presses Ctrl+C
+            interrupted.set()
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run(client, output=tmp_path, reference=REFERENCE, extractor=extractor,
+            workers=1, say=say)
+
+    assert len(read) <= 2  # the queued PDFs were never downloaded or sent

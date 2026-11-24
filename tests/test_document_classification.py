@@ -37,6 +37,15 @@ def test_single_invoice_is_not_misclassified_from_balance_due() -> None:
     assert result.document_type == "invoice"
 
 
+def test_invoice_mentioning_a_statement_in_its_footer_stays_an_invoice() -> None:
+    result = classify_document_text(
+        "Tax Invoice Invoice number INV-1001 Invoice date 9 September 2026 "
+        "Total £120.00 Your monthly statement will follow."
+    )
+
+    assert result.document_type == "invoice"
+
+
 class StatementSharePointClient:
     def __init__(self) -> None:
         self.moves: list[tuple[str, str, str]] = []

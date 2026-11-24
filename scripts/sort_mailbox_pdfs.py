@@ -349,20 +349,26 @@ def run(
             ): item
             for item in items
         }
-        for number, future in enumerate(as_completed(futures), start=1):
-            item = futures[future]
-            try:
-                content, result, note = future.result()
-            except Exception as error:  # service down, rate limit, network: retry next run
-                counts["failed"] += 1
-                say(f"[{number}/{len(items)}] {item.name}: not done ({error}); it will be retried on the next run.")
-                continue
-            outcome = save(
-                item, content, result, note, output=output, reference=reference,
-                ledger=ledger, download_only=download_only,
-            )
-            counts[outcome] += 1
-            say(f"[{number}/{len(items)}] {item.name}: {outcome}")
+        try:
+            for number, future in enumerate(as_completed(futures), start=1):
+                item = futures[future]
+                try:
+                    content, result, note = future.result()
+                except Exception as error:  # service down, rate limit, network: retry next run
+                    counts["failed"] += 1
+                    say(f"[{number}/{len(items)}] {item.name}: not done ({error}); it will be retried on the next run.")
+                    continue
+                outcome = save(
+                    item, content, result, note, output=output, reference=reference,
+                    ledger=ledger, download_only=download_only,
+                )
+                counts[outcome] += 1
+                say(f"[{number}/{len(items)}] {item.name}: {outcome}")
+        except KeyboardInterrupt:
+            # Ctrl+C: drop the queued PDFs so none is downloaded or sent to
+            # Claude; the ones already saved are in the index for the next run.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
     return counts
 
 

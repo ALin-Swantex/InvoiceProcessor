@@ -12,6 +12,16 @@ from app.outlook_notifications import extract_message_id
 router = APIRouter()
 
 
+async def _json_body(request: Request) -> object:
+    try:
+        return await request.json()
+    except ValueError as error:
+        # JSONDecodeError and UnicodeDecodeError are both ValueErrors.
+        raise HTTPException(
+            status_code=400, detail="The request body is not valid JSON."
+        ) from error
+
+
 @router.post("/api/outlook/notifications")
 async def outlook_notifications(
     request: Request,
@@ -28,13 +38,16 @@ async def outlook_notifications(
             detail="Outlook webhook client state is not configured.",
         )
 
-    payload = await request.json()
+    payload = await _json_body(request)
     notifications = payload.get("value") if isinstance(payload, dict) else None
     if not isinstance(notifications, list):
         raise HTTPException(
             status_code=400, detail="Invalid Microsoft Graph notification payload."
         )
 
+    # Validate the whole batch before enqueuing anything: a rejected batch
+    # is retried by Graph, so a partial enqueue would be queued twice.
+    validated = []
     for notification in notifications:
         if not isinstance(notification, dict):
             continue
@@ -64,6 +77,11 @@ async def outlook_notifications(
                 detail="Notification is missing required message data.",
             )
 
+        validated.append(
+            (subscription_id, message_id, resource, change_type, notification)
+        )
+
+    for subscription_id, message_id, resource, change_type, notification in validated:
         app.state.notification_store.enqueue(
             subscription_id=subscription_id,
             message_id=message_id,
@@ -90,7 +108,7 @@ async def outlook_lifecycle(
             status_code=503,
             detail="Outlook webhook client state is not configured.",
         )
-    payload = await request.json()
+    payload = await _json_body(request)
     notifications = payload.get("value") if isinstance(payload, dict) else None
     if not isinstance(notifications, list):
         raise HTTPException(

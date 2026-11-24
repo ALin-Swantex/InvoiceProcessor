@@ -21,18 +21,29 @@ def activity(
     since_id: int = Query(0, ge=0), user: User = Depends(get_current_user)
 ) -> list[dict[str, object]]:
     app = http_request.app
-    events = app.state.activity_feed.list_since(since_id)
+    page_size = 50
+    events = app.state.activity_feed.list_since(since_id, page_size)
     if user.role in {ROLE_APPROVER_1, ROLE_APPROVER_2}:
+        # Filter page by page until something is visible or the feed runs
+        # out: the UI only moves its cursor past a non-empty response, so a
+        # full page of other approvers' events must not end the scan.
+        visible_by_invoice: dict[int, bool] = {}
         visible_events = []
-        for event in events:
-            if event.invoice_id is None:
-                continue
-            invoice = app.state.invoice_store.get(event.invoice_id)
-            if (
-                invoice is not None
-                and invoice_is_visible_to_user(invoice, user)
-            ):
-                visible_events.append(event)
+        while True:
+            for event in events:
+                if event.invoice_id is None:
+                    continue
+                if event.invoice_id not in visible_by_invoice:
+                    invoice = app.state.invoice_store.get(event.invoice_id)
+                    visible_by_invoice[event.invoice_id] = (
+                        invoice is not None
+                        and invoice_is_visible_to_user(invoice, user)
+                    )
+                if visible_by_invoice[event.invoice_id]:
+                    visible_events.append(event)
+            if visible_events or len(events) < page_size:
+                break
+            events = app.state.activity_feed.list_since(events[-1].id, page_size)
         events = visible_events
     return [asdict(event) for event in events]
 

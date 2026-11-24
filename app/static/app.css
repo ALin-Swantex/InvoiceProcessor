@@ -439,7 +439,6 @@ body:has(#app-root.hidden) .skip-link { display: none; }
   background: var(--warn-soft); color: var(--warn); font-size: var(--fs-sm);
 }
 .notice.danger { border-color: var(--danger-border); background: var(--danger-soft); color: var(--danger); }
-.notice.info { border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent-text); }
 .notice strong { font-weight: 700; }
 .role-note {
   display: flex; align-items: flex-start; gap: var(--space-2);
@@ -513,7 +512,6 @@ p.empty, .empty {
    Forms
    ------------------------------------------------------------------------ */
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
-.grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid .full, .grid label.full { grid-column: 1 / -1; }
 label {
   display: grid; gap: .35rem; align-content: start; min-width: 0;
@@ -621,9 +619,6 @@ button.warning {
   background: var(--warn-soft); border-color: var(--warn-border); color: var(--warn);
 }
 button.warning:not(:disabled):hover { background: color-mix(in srgb, var(--warn-soft) 55%, var(--warn-border)); }
-button.success {
-  background: var(--success-solid); border-color: var(--success-solid); color: #fff;
-}
 
 .actions {
   display: flex; gap: var(--space-2); justify-content: flex-end; flex-wrap: wrap;
@@ -1246,7 +1241,7 @@ details.admin-company-group > summary:hover { background: var(--surface-3); }
 .search-result-title { display: grid; flex: 1 1 14rem; min-width: 0; }
 .search-result-title strong { font-family: var(--font-mono); font-size: var(--fs-sm); }
 .search-result-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-size: var(--fs-xs); }
-.search-result .invoice-analysis { position: static; width: auto; }
+.search-result .invoice-analysis { position: static; width: auto; grid-template-columns: minmax(0, 1fr); }
 #statement-company { max-width: 360px; }
 .statement-table .cell-file { max-width: 32rem; color: var(--text); }
 .statements-toolbar { margin-bottom: var(--space-4); }
@@ -1291,7 +1286,7 @@ details.admin-company-group > summary:hover { background: var(--surface-3); }
   .page { padding: var(--space-4) var(--gutter) var(--space-8); }
   .content { padding: var(--space-4); }
   .card-header { padding: var(--space-3) var(--space-4); }
-  .grid, .grid.three, .admin-edit-fields { grid-template-columns: minmax(0, 1fr); }
+  .grid, .admin-edit-fields { grid-template-columns: minmax(0, 1fr); }
   .admin-edit-fields label.full-width { grid-column: auto; }
   .actions { padding: var(--space-3) var(--space-4); }
   .actions > button { flex: 1 1 auto; }

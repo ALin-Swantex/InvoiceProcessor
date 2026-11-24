@@ -238,6 +238,12 @@ def create_app(
     app.state.local_login_enabled = os.environ.get(
         "AUTH_LOCAL_LOGIN_ENABLED", "false"
     ).strip().casefold() in {"1", "true", "yes", "on"}
+    if app.state.local_login_enabled and app.state.entra_auth_client:
+        logger.warning(
+            "AUTH_LOCAL_LOGIN_ENABLED is on while Microsoft Entra sign-in is "
+            "configured. The local seed passwords are public in the repository: "
+            "local login must never be enabled on a reachable deployment."
+        )
     use_postgres_config = (
         invoice_store is None
         and companies_store is None

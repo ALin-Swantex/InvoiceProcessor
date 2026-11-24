@@ -380,10 +380,13 @@ def import_supplier_workbook(
                 supplier_default_company or "",
             )
         elif supplier_profile is None:
-            supplier_store.create(
+            # Remember it, so a later row naming the same new supplier
+            # updates it instead of failing to create it twice.
+            created_profile = supplier_store.create(
                 name=supplier,
                 default_company=supplier_default_company,
             )
+            supplier_lookup[created_profile.name.casefold()] = created_profile
         elif supplier_default_company:
             supplier_store.update(
                 supplier_profile.name,
@@ -405,7 +408,9 @@ def import_supplier_workbook(
                     approver2_email,
                 )
             elif existing_entry is None:
-                approval_matrix_store.create(
+                approval_lookup[
+                    (company.strip().casefold(), supplier.strip().casefold())
+                ] = approval_matrix_store.create(
                     company=company,
                     supplier=supplier,
                     approver1_name=approver1_name,
@@ -414,7 +419,9 @@ def import_supplier_workbook(
                     approver2_email=approver2_email,
                 )
             else:
-                approval_matrix_store.update(
+                approval_lookup[
+                    (company.strip().casefold(), supplier.strip().casefold())
+                ] = approval_matrix_store.update(
                     existing_entry.id,
                     approver1_name=approver1_name,
                     approver1_email=approver1_email,

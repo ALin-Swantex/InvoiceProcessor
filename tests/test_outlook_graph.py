@@ -64,6 +64,44 @@ def test_lists_unread_messages_with_attachments(tmp_path: Path) -> None:
     assert messages[0]["id"] == "message-1"
 
 
+def test_lists_unread_messages_across_every_page(tmp_path: Path) -> None:
+    next_link = (
+        "https://graph.microsoft.com/v1.0/users/invoices%40example.test/"
+        "mailFolders('inbox')/messages?$skiptoken=page-2"
+    )
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "$skiptoken" in request.url.params:
+            return httpx.Response(200, json={"value": [{"id": "message-oldest"}]})
+        return httpx.Response(
+            200,
+            json={
+                "value": [{"id": "message-newest"}],
+                "@odata.nextLink": next_link,
+            },
+        )
+
+    client = graph_client(tmp_path, httpx.MockTransport(respond))
+
+    messages = client.list_invoice_emails(
+        limit=1,
+        received_since=datetime(2026, 9, 24, tzinfo=timezone.utc),
+    )
+
+    assert [message["id"] for message in messages] == [
+        "message-newest",
+        "message-oldest",
+    ]
+    assert requests[0].url.params["$filter"] == (
+        "receivedDateTime ge 2026-09-24T00:00:00Z and "
+        "hasAttachments eq true and isRead eq false"
+    )
+    assert requests[0].url.params["$top"] == "1"
+    assert dict(requests[1].url.params) == {"$skiptoken": "page-2"}
+
+
 def test_rejects_naive_received_since_time(tmp_path: Path) -> None:
     client = graph_client(
         tmp_path,

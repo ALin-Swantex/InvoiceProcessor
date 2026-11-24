@@ -245,8 +245,6 @@ def require_assigned_approver(
         or not normalized_email(user.email)
         or normalized_email(user.email) != normalized_email(assigned_email)
     ):
-        raise HTTPException(
-            status_code=403,
-            detail="This invoice is assigned to a different approver.",
-        )
+        # Same response as a missing invoice (see invoice_for_user).
+        raise HTTPException(status_code=404, detail="Invoice was not found.")
     return invoice

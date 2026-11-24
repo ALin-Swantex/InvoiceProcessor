@@ -404,8 +404,9 @@
               if (displayedInvoiceId !== invoice.id) {
                 // Only (re)populate editable AI fields when the
                 // displayed invoice actually changes. showInvoice() is also
-                // called on every periodic refresh (loadInvoices runs every
-                // 5s); without this guard it would keep stomping on
+                // called on every refresh (loadInvoices polls every 120s
+                // and after invoice activity seen by the 30s activity poll
+                // or live events); without this guard it would keep stomping on
                 // whatever the user is actively typing into these fields
                 // with the invoice's last-saved (often blank) values.
                 previewCompanyWanted = invoice.company || "";
@@ -672,6 +673,11 @@
               // Restore selections that existed before the options were rebuilt.
               if (keepCompany) select.value = keepCompany;
               if (keepSearchCompany) searchSelect.value = keepSearchCompany;
+              // The statement-company selects in the section tables are
+              // filled from invoiceCompanies; the company names are part of
+              // the render context, so this only rebuilds tables when the
+              // list changed. Skip it until invoices have loaded.
+              if (renderedInvoiceSnapshot !== null) renderAllSections();
             }
 
             async function loadSearchSuppliers(company = "") {
@@ -885,6 +891,17 @@
               return match ? `${match[3]}/${match[2]}/${match[1]}` : String(value);
             }
 
+            // Today's date as YYYY-MM-DD in the browser's own time zone
+            // (toISOString() would give the UTC date).
+            function localTodayIsoDate() {
+              const now = new Date();
+              return [
+                now.getFullYear(),
+                String(now.getMonth() + 1).padStart(2, "0"),
+                String(now.getDate()).padStart(2, "0"),
+              ].join("-");
+            }
+
             function formatMoney(value, currency) {
               if (value === null || value === undefined || value === "") return "—";
               if (!Number.isFinite(Number(value))) return String(value);
@@ -1052,7 +1069,9 @@
               }
             }
 
-            function invoiceAnalysisHtml(invoice) {
+            // Search results pass includePdf = false: a search can match
+            // hundreds of invoices, and each embedded PDF would load at once.
+            function invoiceAnalysisHtml(invoice, includePdf = true) {
               const confidences = fieldConfidences(invoice);
               const overallConfidence = invoice.ai_confidence === null ||
                   invoice.ai_confidence === undefined
@@ -1061,11 +1080,11 @@
               const warnings = invoice.ai_review_warnings || invoice.review_reason;
               return `
                 <div class="invoice-analysis">
-                  <iframe
+                  ${includePdf ? `<iframe
                     class="invoice-analysis-pdf"
                     src="/api/invoices/${invoice.id}/pdf"
                     title="${invoice.document_type === "statement" ? "Statement" : "Invoice"} ${escapeAttr(invoice.irj_number || invoice.original_filename)} PDF"
-                  ></iframe>
+                  ></iframe>` : ""}
                   <section class="invoice-analysis-fields" aria-label="Invoice analysis">
                     <h3>${invoice.document_type === "statement" ? "Statement classification" : "Extracted invoice analysis"}</h3>
                     <h4>Workflow</h4>
@@ -1526,7 +1545,7 @@
                       `<div class="search-result-title"><strong>${escapeHtml(invoice.irj_number ? `IRJ ${invoice.irj_number}` : invoice.original_filename)}</strong>` +
                       `<span>${escapeHtml([invoice.supplier, invoice.company].filter(Boolean).join(" · ") || "Supplier not recorded")}</span></div>` +
                       `${statusPillHtml(invoice.status)}${pdfLinkButton(invoice)}</div>` +
-                      `${invoiceAnalysisHtml(invoice)}</div>`
+                      `${invoiceAnalysisHtml(invoice, false)}</div>`
                     ).join("");
                 } catch (error) {
                   result.className = "empty-state";
@@ -1845,7 +1864,7 @@
                 sectionColumns("sage-registration"),
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="register-sage" data-id="${invoice.id}" data-irj="${escapeAttr(invoice.irj_number || "")}">Register in Sage</button>
+                  <button data-action="register-sage" data-id="${invoice.id}">Register in Sage</button>
                 `
               );
               renderSectionTable(
@@ -1931,7 +1950,7 @@
                 "complete-table",
                 SECTION_STATUSES["complete"],
                 sectionColumns("complete", [
-                  { label: "Marked reconciled", value: i => formatUkDate(i.reconciled_at ? i.reconciled_at.slice(0, 10) : ""), className: "cell-date" },
+                  { label: "Marked reconciled", value: i => formatUkTimestamp(i.reconciled_at), className: "cell-date" },
                   { label: "Appeared on bank statement", value: i => formatUkDate(i.reconciliation_date), className: "cell-date" },
                   { label: "Completed by", value: i => i.reconciled_by || i.foreign_allocated_by || "—" },
                 ]),
@@ -2030,7 +2049,7 @@
               };
               account.onchange = applyProfile;
               applyProfile();
-              document.getElementById("payment-date").value = new Date().toISOString().slice(0, 10);
+              document.getElementById("payment-date").value = localTodayIsoDate();
               document.getElementById("payment-reference").value = "";
               document.getElementById("payment-supplier-context").textContent = [
                 invoiceAccessibleName(invoice) || invoice.supplier || "Supplier",
@@ -2387,10 +2406,6 @@
                   await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
                 } else if (action === "retry-payment-route") {
                   await postJson(`/api/invoices/${id}/retry-payment-route`, {});
-                } else if (action === "select-payment-route") {
-                  await postJson(`/api/invoices/${id}/payment-route`, {
-                    route: button.dataset.route,
-                  });
                 } else if (action === "pay") {
                   const invoice = invoices.find(item => String(item.id) === String(id));
                   if (!invoice) throw new Error("Invoice could not be found.");
@@ -2407,7 +2422,7 @@
                         name: "date",
                         label: "Date shown on bank statement",
                         type: "date",
-                        value: new Date().toISOString().slice(0, 10),
+                        value: localTodayIsoDate(),
                         required: true,
                       },
                       { name: "notes", label: "Reconciliation notes (optional)", multiline: true },
@@ -2505,18 +2520,20 @@
               }
             });
 
-            document.getElementById("retry-approval-route-button").addEventListener("click", async () => {
+            document.getElementById("retry-approval-route-button").addEventListener("click", async event => {
               const invoice = invoices.find(item => String(item.id) === picker.value);
               if (!invoice || !invoice.irj_number) return;
-              try {
-                await postJson(`/api/invoices/${invoice.id}/register-sage`, {
-                  irj_number: invoice.irj_number,
-                });
-                showToast("Approver route checked again.");
-                await loadInvoices();
-              } catch (error) {
-                showToast(error.message, true);
-              }
+              await withBusyButton(event.currentTarget, async () => {
+                try {
+                  await postJson(`/api/invoices/${invoice.id}/register-sage`, {
+                    irj_number: invoice.irj_number,
+                  });
+                  showToast("Approver route checked again.");
+                  await loadInvoices();
+                } catch (error) {
+                  showToast(error.message, true);
+                }
+              });
             });
 
             async function submitConfirm(overrideDuplicate) {
@@ -2760,7 +2777,11 @@
                       confirmLabel: "Delete",
                       tone: "danger",
                     })) return;
-                    onDelete(row[idKey]);
+                    try {
+                      await onDelete(row[idKey]);
+                    } catch (error) {
+                      showToast(error.message, true);
+                    }
                   });
                 });
               }
@@ -3120,7 +3141,7 @@
                   },
                 ],
                 async id => {
-                  await fetch(`/api/admin/approval-matrix/${id}`, { method: "DELETE" });
+                  await sendJson(`/api/admin/approval-matrix/${id}`, "DELETE");
                   await loadAdminPanel();
                 },
                 "id",
@@ -3226,7 +3247,7 @@
                   ],
                   companies,
                   async name => {
-                    await fetch(`/api/admin/companies/${encodeURIComponent(name)}`, { method: "DELETE" });
+                    await sendJson(`/api/admin/companies/${encodeURIComponent(name)}`, "DELETE");
                     await loadAdminPanel();
                     await loadCompanies();
                     const irjResponse = await fetch("/api/irj-configurations");
@@ -3301,7 +3322,7 @@
                     { label: "Invoice no. pattern", value: s => s.invoice_number_pattern },
                   ],
                   async name => {
-                    await fetch(`/api/admin/suppliers/${encodeURIComponent(name)}`, { method: "DELETE" });
+                    await sendJson(`/api/admin/suppliers/${encodeURIComponent(name)}`, "DELETE");
                     await loadAdminPanel();
                     await loadSuppliers();
                   },
@@ -3756,6 +3777,11 @@ ${duplicates}
               invoicePollTimer = null;
               activityEventSource = null;
               currentUser = null;
+              // Force a full re-render for the next user, even if the
+              // invoice list is identical (action buttons depend on role).
+              invoices = [];
+              renderedInvoiceSnapshot = null;
+              renderedSectionState.clear();
               appRoot.classList.remove("nav-open");
               syncNavigationState();
               appRoot.classList.add("hidden");

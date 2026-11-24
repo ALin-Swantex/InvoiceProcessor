@@ -158,3 +158,78 @@ def test_stop_lets_the_worker_finish_its_current_invoice(
     manager.stop()
 
     assert worker.returncode == 0  # finished, not killed
+
+
+def test_port_check_detects_a_wildcard_listener() -> None:
+    # On macOS/BSD a probe with SO_REUSEADDR can bind 127.0.0.1 next to a
+    # 0.0.0.0 listener, so the check must not rely on bind alone.
+    with socket.socket() as busy:
+        busy.bind(("0.0.0.0", 0))
+        busy.listen()
+        assert not port_is_free("127.0.0.1", busy.getsockname()[1])
+
+
+def test_large_log_is_rotated_when_services_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = fake_manager(tmp_path, monkeypatch, migrate_exit=1)
+    log_file = tmp_path / "launcher.log"
+    log_file.write_text("old line\n" * 10)
+    (tmp_path / "launcher.log.1").write_text("older\n")
+    monkeypatch.setattr(launcher, "LOG_ROTATE_BYTES", 20)
+
+    manager.start()
+    wait_until(lambda: not manager.active)
+
+    assert (tmp_path / "launcher.log.1").read_text() == "old line\n" * 10
+    assert "old line" not in log_file.read_text()
+
+
+def headless(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    monkeypatch.setattr(launcher, "LOG_FILE", tmp_path / "launcher.log")
+    monkeypatch.setattr(launcher.signal, "signal", lambda *args: None)
+    return launcher.run_headless(LauncherConfiguration(port=0), open_browser=False)
+
+
+def test_headless_exits_non_zero_when_migrations_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_manager(tmp_path, monkeypatch, migrate_exit=1)
+
+    assert headless(tmp_path, monkeypatch) == 1
+    assert "migrations failed" in (tmp_path / "launcher.log").read_text()
+
+
+def test_headless_exits_non_zero_when_the_web_app_dies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_manager(tmp_path, monkeypatch, migrate_exit=0)
+    python = sys.executable
+    sleeper = [python, "-c", "import time; print('up', flush=True); time.sleep(30)"]
+    monkeypatch.setattr(
+        launcher,
+        "process_commands",
+        lambda configuration: {
+            launcher.WEB: [python, "-c", "raise SystemExit(3)"],
+            launcher.WORKER: sleeper,
+        },
+    )
+    monkeypatch.setattr(launcher, "web_is_up", lambda url: False)
+
+    assert headless(tmp_path, monkeypatch) == 1
+    assert "All services stopped." in (tmp_path / "launcher.log").read_text()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SO_REUSEADDR is only set on POSIX")
+def test_port_left_in_time_wait_by_the_last_stop_counts_as_free() -> None:
+    with socket.socket() as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        client = socket.create_connection(("127.0.0.1", port))
+        connection, _ = server.accept()
+        connection.close()  # the server closes first: its side enters TIME_WAIT
+        client.close()
+
+    assert port_is_free("127.0.0.1", port)

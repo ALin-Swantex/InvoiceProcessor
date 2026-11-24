@@ -140,6 +140,14 @@ class PostgresIrjNumberGenerator:
         return int(normalized)
 
 
+# Identity ids are taken at INSERT but become visible at COMMIT, and the web
+# app and worker insert concurrently, so id 102 can be visible before 101. A
+# reader that moved its cursor past 101 would never see it. Events are only
+# handed out once they are this old (by the database clock), by which time any
+# lower id has long committed: add_event is a single short transaction.
+ACTIVITY_COMMIT_GRACE_SECONDS = 2.0
+
+
 class PostgresActivityFeedStore:
     def __init__(
         self,
@@ -187,10 +195,11 @@ class PostgresActivityFeedStore:
                            invoice_id, created_at
                     FROM activity_events
                     WHERE id > %s
+                      AND created_at < now() - make_interval(secs => %s)
                     ORDER BY id ASC
                     LIMIT %s
                     """,
-                    (since_id, limit),
+                    (since_id, ACTIVITY_COMMIT_GRACE_SECONDS, limit),
                 )
                 rows = cursor.fetchall()
         return [_activity_event(row) for row in rows]
@@ -275,8 +284,15 @@ class PostgresActivityFeedStore:
     def latest_id(self) -> int:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
+                # Same grace as list_since: the live stream signals an id
+                # only once list_since will return it.
                 cursor.execute(
-                    "SELECT COALESCE(MAX(id), 0) AS latest FROM activity_events"
+                    """
+                    SELECT COALESCE(MAX(id), 0) AS latest
+                    FROM activity_events
+                    WHERE created_at < now() - make_interval(secs => %s)
+                    """,
+                    (ACTIVITY_COMMIT_GRACE_SECONDS,),
                 )
                 row = cursor.fetchone()
         return int(row["latest"]) if row is not None else 0

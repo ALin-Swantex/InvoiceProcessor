@@ -1183,3 +1183,40 @@ def test_a_company_chosen_by_the_name_check_goes_to_review(tmp_path: Path) -> No
     assert result.company == "Acme Trading Ltd"
     assert result.needs_review is True
     assert any("chosen from the known companies" in w for w in result.warnings)
+
+
+def test_auto_confirm_uses_the_real_routing_and_holds_duplicates(
+    tmp_path: Path,
+) -> None:
+    from app.approval_matrix import ApprovalMatrixStore
+
+    extractor, _ = extractor_for(llm_data())
+    lifecycle, invoices, invoice_id = lifecycle_for(tmp_path, extractor)
+    approvals = ApprovalMatrixStore(tmp_path / "config.db")
+    # The store seeds a route for this company and supplier.
+    assert approvals.find("Acme Trading Ltd", "Supplier Ltd") is not None
+    lifecycle.approval_matrix_store = approvals
+    lifecycle.configuration_getter = lambda key, default=None: (
+        "true" if key == "ai_auto_confirm" else default
+    )
+
+    routed = lifecycle.run_extraction(invoice_id)
+
+    assert routed.status == "Awaiting PO Matching"
+    assert routed.irj_number
+    assert routed.reviewed_by == "AI auto-confirm"
+
+    # The same invoice arriving again must wait for Purchase Ledger.
+    second_pdf = write_pdf(tmp_path / "again.pdf")
+    again = invoices.add_from_outlook(
+        message={"id": "message-2"},
+        attachment={"id": "attachment-2", "name": "again.pdf", "size": 10},
+        stored_path=second_pdf,
+    )
+
+    held = lifecycle.run_extraction(again.id)
+
+    assert held.status == "Needs Review"
+    assert held.duplicate_of_invoice_id == invoice_id
+    assert held.irj_number is None  # no IRJ number allocated to a duplicate
+    assert "duplicate" in str(held.review_reason)

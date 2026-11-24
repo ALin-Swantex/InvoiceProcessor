@@ -56,7 +56,9 @@ def classify_document_text(text: str) -> DocumentClassification:
         + min(len(supporting), 2) * 0.10
         + min(len(transaction_columns), 2) * 0.05,
     )
-    if statement_score >= 0.80:
+    # A strong phrase alone ("Your monthly statement will follow") is common on
+    # invoices, so a balance/summary phrase must support it.
+    if strong and supporting and statement_score >= 0.80:
         evidence = strong + supporting + transaction_columns
         return DocumentClassification(
             document_type="statement",

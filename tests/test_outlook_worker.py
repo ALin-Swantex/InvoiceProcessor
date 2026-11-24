@@ -380,6 +380,58 @@ def test_outlook_intake_flags_identical_pdf_before_extraction(
     ]
 
 
+class FailingMoveSharePointIncomingClient(FakeSharePointIncomingClient):
+    def move_to_folder(
+        self, item_id: str, folder: str, filename: str
+    ) -> dict[str, object]:
+        raise RuntimeError("SharePoint move failed")
+
+
+def test_identical_pdf_stays_flagged_when_the_flagged_move_fails(
+    tmp_path: Path,
+) -> None:
+    invoices = InvoiceStore(tmp_path / "invoices.db")
+    first_path = tmp_path / "first.pdf"
+    first_path.write_bytes(VALID_PDF_BYTES)
+    original = invoices.add_from_outlook(
+        message={"id": "earlier-message"},
+        attachment={"id": "earlier-attachment", "name": "original.pdf"},
+        stored_path=first_path,
+    )
+    extracted_ids: list[int] = []
+    monitor = SharePointIncomingMonitor(
+        cast(SharePointClient, FailingMoveSharePointIncomingClient()),
+        invoices,
+        cache_directory=tmp_path / "cache",
+        extraction_runner=extracted_ids.append,
+    )
+    item = {
+        "id": "new-sharepoint-item",
+        "name": "resent.pdf",
+        "size": len(VALID_PDF_BYTES),
+        "webUrl": "https://sharepoint.example/resent.pdf",
+    }
+
+    with pytest.raises(RuntimeError, match="SharePoint move failed"):
+        monitor.ingest_item(
+            item,
+            source_message={"id": "new-message"},
+            source_attachment={"id": "new-attachment", "name": "resent.pdf"},
+            content=VALID_PDF_BYTES,
+            event_type="outlook_intake",
+        )
+
+    record = invoices.get_by_sharepoint_item_id("new-sharepoint-item")
+    assert record is not None
+    assert record.status == "Needs Review"
+    assert record.duplicate_of_invoice_id == original.id
+    assert extracted_ids == []
+    # The Incoming scan finds the PDF still there and leaves it flagged.
+    assert monitor.ingest_item(item) is None
+    assert invoices.get(record.id) == record
+    assert extracted_ids == []
+
+
 def test_worker_repairs_existing_unlinked_outlook_attachment(
     tmp_path: Path,
 ) -> None:
@@ -441,23 +493,26 @@ def test_worker_persists_converted_excel_as_a_pdf(tmp_path: Path) -> None:
     assert record.size_bytes == converted_pdf.stat().st_size
 
 
-def test_worker_places_no_pdf_email_in_failed_queue(tmp_path: Path) -> None:
+def test_worker_completes_email_without_supported_attachments(
+    tmp_path: Path,
+) -> None:
     pdf_path = tmp_path / "unused.pdf"
     pdf_path.write_bytes(VALID_PDF_BYTES)
     notifications = queued_store(tmp_path)
+    invoices = InvoiceStore(tmp_path / "invoices.db")
     worker = OutlookInvoiceWorker(
         notifications,
-        InvoiceStore(tmp_path / "invoices.db"),
+        invoices,
         FakeOutlookRetriever(pdf_path, attachments=False),
     )
 
-    with pytest.raises(RuntimeError, match="no supported invoice attachments"):
-        asyncio.run(worker.process_next())
+    # The webhook queues every inbox message; one with no invoice attachment
+    # is skipped, not failed.
+    assert asyncio.run(worker.process_next()) is True
 
-    failed = notifications.list(status="failed")
-    assert len(failed) == 1
-    assert failed[0].attempts == 1
-    assert "no supported invoice attachments" in str(failed[0].last_error)
+    assert notifications.list(status="failed") == []
+    assert len(notifications.list(status="completed")) == 1
+    assert invoices.list() == []
 
 
 def test_worker_is_idempotent_for_duplicate_invoice_attachment(
