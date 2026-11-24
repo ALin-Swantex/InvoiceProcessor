@@ -136,7 +136,7 @@ class CompanyStore:
         assignments = ", ".join(f"{key} = ?" for key in fields)
         with self._connect() as connection:
             cursor = connection.execute(
-                f"UPDATE companies SET {assignments} WHERE name = ?",
+                f"UPDATE companies SET {assignments} WHERE name = ? COLLATE NOCASE",
                 (*fields.values(), name),
             )
             connection.commit()
@@ -149,7 +149,9 @@ class CompanyStore:
 
     def delete(self, name: str) -> None:
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM companies WHERE name = ?", (name,))
+            cursor = connection.execute(
+                "DELETE FROM companies WHERE name = ? COLLATE NOCASE", (name,)
+            )
             connection.commit()
             if cursor.rowcount == 0:
                 raise KeyError(f"Company '{name}' was not found.")

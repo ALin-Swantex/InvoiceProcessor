@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS suppliers (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_name_nocase
 ON suppliers(name COLLATE NOCASE);
 
+-- Names are unique ignoring case, as in PostgreSQL (tests run on SQLite).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_nocase
+ON companies(name COLLATE NOCASE);
+
 CREATE TABLE IF NOT EXISTS approval_matrix (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     company TEXT NOT NULL,
@@ -53,6 +57,9 @@ CREATE TABLE IF NOT EXISTS approval_matrix (
     approver2_email TEXT,
     UNIQUE(company, supplier)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_matrix_pair_nocase
+ON approval_matrix(company COLLATE NOCASE, supplier COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS supplier_terms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

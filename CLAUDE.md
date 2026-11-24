@@ -16,6 +16,7 @@ These bias toward caution over speed; use judgment on trivial tasks.
 ## Commands
 ```bash
 python3 -m pytest -q                                   # full suite (mocked; no cloud, no .env needed)
+TEST_POSTGRES_URL=postgresql://USER:x@127.0.0.1:5432/SCRATCH_DB python3 -m pytest -q tests/test_store_contract.py   # same store tests on a throwaway Postgres (tables are emptied)
 python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000   # web app (loads .env)
 python3 -m app.outlook_worker                          # Outlook/SharePoint worker (one per mailbox)
 python3 -m app.postgres_migrate                        # apply DB migrations

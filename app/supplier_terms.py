@@ -90,9 +90,12 @@ class SupplierTermsStore:
             existing = connection.execute(
                 """
                 SELECT id FROM supplier_terms
-                WHERE company = ? AND (
+                WHERE company = ? COLLATE NOCASE AND (
                     supplier_account_number = ?
-                    OR (supplier_account_number IS NULL AND ? IS NULL AND supplier = ?)
+                    OR (
+                        supplier_account_number IS NULL AND ? IS NULL
+                        AND supplier = ? COLLATE NOCASE
+                    )
                 )
                 """,
                 (
@@ -184,7 +187,8 @@ class SupplierTermsStore:
     def delete(self, company: str, supplier: str) -> None:
         with self._connect() as connection:
             cursor = connection.execute(
-                "DELETE FROM supplier_terms WHERE company = ? AND supplier = ?",
+                "DELETE FROM supplier_terms WHERE company = ? COLLATE NOCASE "
+                "AND supplier = ? COLLATE NOCASE",
                 (company, supplier),
             )
             connection.commit()
@@ -194,7 +198,7 @@ class SupplierTermsStore:
     def delete_by_supplier(self, supplier: str) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                "DELETE FROM supplier_terms WHERE supplier = ?", (supplier,)
+                "DELETE FROM supplier_terms WHERE supplier = ? COLLATE NOCASE", (supplier,)
             )
             connection.commit()
             return cursor.rowcount
@@ -202,7 +206,7 @@ class SupplierTermsStore:
     def delete_by_company(self, company: str) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                "DELETE FROM supplier_terms WHERE company = ?", (company,)
+                "DELETE FROM supplier_terms WHERE company = ? COLLATE NOCASE", (company,)
             )
             connection.commit()
             return cursor.rowcount

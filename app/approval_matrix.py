@@ -186,7 +186,7 @@ class ApprovalMatrixStore:
     def delete_by_supplier(self, supplier: str) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                "DELETE FROM approval_matrix WHERE supplier = ?", (supplier,)
+                "DELETE FROM approval_matrix WHERE supplier = ? COLLATE NOCASE", (supplier,)
             )
             connection.commit()
             return cursor.rowcount
@@ -194,7 +194,7 @@ class ApprovalMatrixStore:
     def delete_by_company(self, company: str) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
-                "DELETE FROM approval_matrix WHERE company = ?", (company,)
+                "DELETE FROM approval_matrix WHERE company = ? COLLATE NOCASE", (company,)
             )
             connection.commit()
             return cursor.rowcount
