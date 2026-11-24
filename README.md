@@ -150,8 +150,8 @@ osacompile -o ~/Desktop/"Invoice Processor.app" -e 'do shell script "cd /path/to
 ```
 
 One **Start** click applies the database migrations, then starts the web
-application and the Outlook worker, and opens <http://127.0.0.1:8000> once the
-web app answers. Each service shows its status, and all output appears in one
+application and the Outlook worker. **Open web app** opens
+<http://127.0.0.1:8000> once the web app answers. Each service shows its status, and all output appears in one
 colour-coded log that is also saved to `runtime_data/launcher.log`. **Stop**,
 or closing the window, stops everything.
 

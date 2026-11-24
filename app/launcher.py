@@ -2,7 +2,7 @@
 
 Start applies the database migrations, then runs the web application and the
 Outlook worker side by side, streams their output into one log (also saved to
-``runtime_data/launcher.log``) and opens the browser once the web app answers.
+``runtime_data/launcher.log``). "Open web app" is enabled once the web app answers.
 Closing the window stops everything.
 """
 
@@ -460,10 +460,7 @@ def run_gui(configuration: LauncherConfiguration) -> int:
         if at_bottom:
             log.see("end")
 
-    browser_opened = False
-
     def refresh() -> None:
-        nonlocal browser_opened
         for _ in range(500):
             try:
                 source, line = manager.output.get_nowait()
@@ -479,12 +476,8 @@ def run_gui(configuration: LauncherConfiguration) -> int:
             set_button(main_button, text="Stop", colour=c["danger"], hover=c["danger_hover"])
         else:
             set_button(main_button, text="Start", colour=c["primary"], hover=c["primary_hover"])
-            browser_opened = False
         ready = manager.web_ready.is_set()
         set_button(open_button, enabled=ready)
-        if ready and not browser_opened:
-            browser_opened = True
-            webbrowser.open(configuration.web_url)
         root.after(200, refresh)
 
     def close() -> None:
