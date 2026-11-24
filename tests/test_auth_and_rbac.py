@@ -855,7 +855,7 @@ def test_concurrent_final_approval_sends_one_email(
     )
     monkeypatch.setattr(lifecycle, "_move_pdf_in_sharepoint", capture_move)
     monkeypatch.setattr(
-        "app.invoice_lifecycle.send_email_notification",
+        "app.lifecycle.notifications.send_email_notification",
         capture_email,
     )
 
@@ -887,7 +887,7 @@ def test_approval_query_cycle_does_not_repeat_stage_email(
     client = make_client(tmp_path)
     sent_subjects: list[str] = []
     monkeypatch.setattr(
-        "app.invoice_lifecycle.send_email_notification",
+        "app.lifecycle.notifications.send_email_notification",
         lambda *, recipient, subject, body: sent_subjects.append(subject),
     )
 
@@ -939,7 +939,7 @@ def test_failed_stage_email_can_be_retried_once(
         return True
 
     monkeypatch.setattr(
-        "app.invoice_lifecycle.send_email_notification",
+        "app.lifecycle.notifications.send_email_notification",
         fail_once,
     )
 

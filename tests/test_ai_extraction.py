@@ -649,7 +649,7 @@ def test_default_runner_passes_the_configured_names_to_extraction(
         captured["reference"] = reference
         raise ExtractionError("stop here")
 
-    monkeypatch.setattr("app.invoice_lifecycle.run_ai_extraction", fake_run)
+    monkeypatch.setattr("app.lifecycle.base.run_ai_extraction", fake_run)
     pdf = write_pdf(tmp_path / "invoice.pdf")
     lifecycle = InvoiceLifecycle(
         InvoiceStore(tmp_path / "invoices.db"),

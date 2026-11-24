@@ -71,7 +71,7 @@ def test_successful_stage_email_is_marked_sent(
 ) -> None:
     lifecycle, _, invoice_id = _lifecycle(tmp_path)
     monkeypatch.setattr(
-        "app.invoice_lifecycle.send_email_notification",
+        "app.lifecycle.notifications.send_email_notification",
         lambda *, recipient, subject, body: True,
     )
 
@@ -91,7 +91,7 @@ def test_failed_send_releases_the_claim_so_it_can_retry(
     def failing_send(*, recipient: str, subject: str, body: str) -> bool:
         raise RuntimeError("graph unavailable")
 
-    monkeypatch.setattr("app.invoice_lifecycle.send_email_notification", failing_send)
+    monkeypatch.setattr("app.lifecycle.notifications.send_email_notification", failing_send)
     with pytest.raises(RuntimeError):
         lifecycle._send_stage_email_once(
             invoice_id, "po_matching", recipient="a@example.test", subject="s", body="b"

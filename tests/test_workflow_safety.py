@@ -92,7 +92,7 @@ def test_failed_stage_email_does_not_fail_the_step(
     def failing_send(**kwargs: object) -> bool:
         raise RuntimeError("Graph is unavailable")
 
-    monkeypatch.setattr("app.invoice_lifecycle.send_email_notification", failing_send)
+    monkeypatch.setattr("app.lifecycle.notifications.send_email_notification", failing_send)
 
     record = _confirm(lifecycle, invoice_id, purchase_order_number="PO-1")
 

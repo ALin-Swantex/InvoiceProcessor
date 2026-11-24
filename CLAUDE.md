@@ -28,7 +28,7 @@ docker compose -f docker/docker-compose.yml up -d --build   # web + worker; also
 ## Layout
 - `app/main.py` - `create_app(...)` wiring only. Routes are in `app/routers/` (auth, invoices, statements, reference, activity, admin, outlook, ui); shared helpers in `app/deps.py`; request models in `app/schemas.py`.
 - `app/static/` - the whole UI: `index.html`, `app.css`, `app.js` (no build step, no frameworks).
-- `app/invoice_lifecycle.py` - every workflow stage (extraction, review, PO matching, Sage, approvals, payment, reconciliation).
+- `app/invoice_lifecycle.py` - `InvoiceLifecycle`, composed from one module per stage in `app/lifecycle/` (extraction, confirmation and Sage, approval, review, payment, notifications). Every status change goes through `_claimed`/`_transition` in `app/lifecycle/base.py`; statuses are named in `app/statuses.py` and filed per `STATUS_FOLDERS` in `app/lifecycle/common.py`.
 - `app/ai_extraction.py`, `app/extraction_checks.py` - Claude extraction (JSON-schema output, optional escalation to a stronger model) plus deterministic checks.
 - `app/outlook_worker.py`, `app/outlook_graph.py`, `app/sharepoint*.py`, `app/graph_http.py` - intake; `graph_http.py` is the shared Graph client (retries, pagination).
 - `app/postgres_*.py` + `app/postgres_migrations/` - production stores and schema. SQLite twins (`invoices.py`, `companies.py`, ...) exist for tests and demo mode.

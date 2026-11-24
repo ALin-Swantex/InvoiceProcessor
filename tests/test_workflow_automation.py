@@ -37,7 +37,7 @@ def test_approval_reminders_repeat_after_seven_days_and_holds_after_thirty(
     lifecycle, store, invoice_id = lifecycle_with_invoice(tmp_path)
     sent: list[str] = []
     monkeypatch.setattr(
-        "app.invoice_lifecycle.send_email_notification",
+        "app.lifecycle.notifications.send_email_notification",
         lambda *, recipient, subject, body: sent.append(body) or True,
     )
     store.update_fields(
@@ -119,7 +119,7 @@ def test_rejection_emails_purchase_ledger_with_rejected_queue_link(
     sent: list[tuple[str, str]] = []
     monkeypatch.setenv("PURCHASE_LEDGER_NOTIFICATION_EMAIL", "ledger@example.test")
     monkeypatch.setattr(
-        "app.invoice_lifecycle.send_email_notification",
+        "app.lifecycle.notifications.send_email_notification",
         lambda *, recipient, subject, body: sent.append((recipient, body)) or True,
     )
     store.update_fields(

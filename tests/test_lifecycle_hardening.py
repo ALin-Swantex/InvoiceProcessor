@@ -325,7 +325,7 @@ def test_rejection_notice_is_retried_only_for_recent_rejections(
     store.update_fields(old_po.id, status="Rejected", rejection_reason="Wrong PO")
     sent: list[str] = []
     monkeypatch.setattr(
-        "app.invoice_lifecycle.send_email_notification",
+        "app.lifecycle.notifications.send_email_notification",
         lambda *, recipient, subject, body: sent.append(subject) or True,
     )
 
