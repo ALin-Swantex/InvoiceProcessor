@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import FileResponse
 
 from app.activity_feed import ROLE_PURCHASE_LEDGER
+from app.approval_matrix import ALL_COMPANIES
 from app.auth import ROLE_APPROVER_1, ROLE_APPROVER_2, User, get_current_user, require_role
 from app.deps import (
     approver_scope,
@@ -284,18 +285,30 @@ def invoice_company_options(
     app = http_request.app
     invoice = invoice_for_user(app, invoice_id, user)
     supplier = (invoice.supplier or "").strip()
-    matrix = app.state.approval_matrix_store
+    # Same rule as ApprovalMatrixStore.find: an exact company route, or one
+    # for all companies. Read the matrix once rather than per company.
+    route_companies = {
+        entry.company.strip().casefold()
+        for entry in app.state.approval_matrix_store.list()
+        if supplier and entry.supplier.strip().casefold() == supplier.casefold()
+    }
+
+    def has_route(company: str | None) -> bool:
+        return bool(company) and (
+            ALL_COMPANIES in route_companies
+            or company.strip().casefold() in route_companies
+        )
+
+    # A supplier missing from the register cannot be selected in review,
+    # so offering a company for it would not help.
+    registered = bool(supplier) and app.state.suppliers_store.get(supplier) is not None
     return {
         "supplier": supplier,
-        "has_route": bool(
-            supplier
-            and invoice.company
-            and matrix.find(invoice.company, supplier) is not None
-        ),
+        "has_route": has_route(invoice.company),
         "companies": [
             company.name
             for company in app.state.companies_store.list()
-            if supplier and matrix.find(company.name, supplier) is not None
+            if registered and has_route(company.name)
         ],
     }
 

@@ -418,7 +418,8 @@
                 setValue("correction-reason", invoice.correction_reason);
                 applyPreviewConfidence(invoice);
                 pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
-                await offerCompanyChoice(invoice);
+                // Not awaited: the PDF panel must not wait on this check.
+                offerCompanyChoice(invoice).catch(() => {});
               }
               pdfFrame.style.display = "block";
               pdfEmpty.style.display = "none";
@@ -426,13 +427,17 @@
 
             // When the extracted company has no approval route for the
             // supplier, ask which of the companies that do is invoiced.
+            // Asked once per invoice per page load, so reopening it does not
+            // ask again over a choice already made.
+            const companyChoiceOffered = new Set();
             async function offerCompanyChoice(invoice) {
-              if (!invoice.supplier) return;
+              if (!invoice.supplier || companyChoiceOffered.has(invoice.id)) return;
               const response = await fetch(`/api/invoices/${invoice.id}/company-options`);
               if (!response.ok) return;
               const options = await response.json();
               if (options.has_route || !options.companies.length) return;
               if (displayedInvoiceId !== invoice.id) return;
+              companyChoiceOffered.add(invoice.id);
               const dialog = document.getElementById("company-choice-dialog");
               document.getElementById("company-choice-context").textContent =
                 (invoice.company

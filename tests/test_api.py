@@ -104,6 +104,7 @@ def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
     assert "Invoice value" in home.text
     assert "Overall confidence" in home.text
     assert "PDF and extracted fields" in home.text
+    assert '${expanded ? "Hide" : "Show"} details' in home.text
     assert "function invoiceAnalysisHtml" in home.text
     assert "function invoiceHistoryHtml(invoice)" in home.text
     assert "function invoiceAuditHtml(invoice)" in home.text
@@ -244,6 +245,20 @@ def test_company_options_list_companies_with_a_route_for_the_supplier(tmp_path) 
     store.update_fields(invoice.id, company="Acme Trading Ltd")
     response = client.get(f"/api/invoices/{invoice.id}/company-options")
     assert response.json()["has_route"] is True
+
+    # A route for a supplier missing from the register offers no companies:
+    # the review form could not select that supplier anyway.
+    client.app.state.approval_matrix_store.create(
+        company="Riverside Logistics",
+        supplier="Unregistered Paper",
+        approver1_name="Morgan Reyes",
+        approver1_email="morgan.reyes@example.test",
+    )
+    store.update_fields(
+        invoice.id, company="Acme Trading Ltd", supplier="Unregistered Paper"
+    )
+    response = client.get(f"/api/invoices/{invoice.id}/company-options")
+    assert response.json()["companies"] == []
 
 
 def test_invoice_search_finds_normalized_irj_number(tmp_path) -> None:
