@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.activity_feed import ROLE_PURCHASE_LEDGER
 from app.auth import ROLE_ADMIN, ROLE_APPROVER_1, ROLE_APPROVER_2
@@ -50,7 +50,9 @@ class InvoiceConfirmRequest(BaseModel):
     supplier_invoice_number: str | None = None
     purchase_order_number: str | None = None
     invoice_date: str | None = None
-    invoice_value: float | None = None
+    # JSON like 1e999 parses as infinity; once saved it breaks every invoice
+    # list response, so only finite numbers are accepted.
+    invoice_value: float | None = Field(None, allow_inf_nan=False)
     currency: str | None = "GBP"
     override_duplicate: bool = False
     correction_reason: str | None = None

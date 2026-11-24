@@ -68,6 +68,9 @@
             let metricsRefreshTimer = null;
             let activityEventSource = null;
             let openedFlaggedInvoiceId = null;
+            // True only right after "Review" or an upload opens a flagged
+            // invoice, so a later refresh keeps whatever the picker shows.
+            let showFlaggedNext = false;
             const expandedInvoiceIds = new Set();
 
             function storedValue(key) {
@@ -408,8 +411,11 @@
                 previewCompanyWanted = invoice.company || "";
                 setValue("preview-company", previewCompanyWanted);
                 displayedInvoiceId = invoice.id;
-                await loadSuppliers(invoice.company || "", invoice.supplier || "");
-                if (displayedInvoiceId !== invoice.id) return;
+                // Fill every field for this invoice before waiting on the
+                // supplier list: Confirm sends whatever the form holds to
+                // displayedInvoiceId, so it must never hold the previous
+                // invoice's values. The supplier stays empty (Confirm refuses)
+                // until its list has loaded.
                 setValue("preview-supplier-invoice", invoice.supplier_invoice_number);
                 setValue("preview-po", invoice.po_number);
                 setValue("preview-invoice-date", invoice.invoice_date);
@@ -418,8 +424,23 @@
                 setValue("correction-reason", invoice.correction_reason);
                 applyPreviewConfidence(invoice);
                 pdfFrame.src = `/api/invoices/${invoice.id}/pdf`;
-                // Not awaited: the PDF panel must not wait on this check.
-                offerCompanyChoice(invoice).catch(() => {});
+                const supplierSelect = document.getElementById("preview-supplier");
+                supplierSelect.innerHTML = '<option value="">Loading suppliers…</option>';
+                supplierSelect.disabled = true;
+                supplierSelect.dataset.loading = "true";
+                try {
+                  await loadSuppliers(invoice.company || "", invoice.supplier || "");
+                } catch (error) {
+                  // Network failure: handled below like a failed response.
+                }
+                if (displayedInvoiceId !== invoice.id) return;
+                if (supplierSelect.dataset.loading) {
+                  // The list did not load; fill the form again on the next refresh.
+                  displayedInvoiceId = null;
+                } else {
+                  // Not awaited: the PDF panel must not wait on this check.
+                  offerCompanyChoice(invoice).catch(() => {});
+                }
               }
               pdfFrame.style.display = "block";
               pdfEmpty.style.display = "none";
@@ -547,11 +568,14 @@
                   `${invoice.original_filename} — ${invoice.subject || "No subject"}`;
                 picker.appendChild(option);
               }
-              const selected = candidates.find(
+              const flagged = candidates.find(
                 invoice => String(invoice.id) === String(openedFlaggedInvoiceId)
-              ) || candidates.find(
+              );
+              const current = candidates.find(
                 invoice => String(invoice.id) === selectedId
-              ) || candidates[0];
+              );
+              const selected = (showFlaggedNext && flagged) || current || flagged || candidates[0];
+              showFlaggedNext = false;
               picker.value = String(selected.id);
               await showInvoice(selected);
             }
@@ -560,7 +584,12 @@
               const selected = invoices.find(
                 invoice => String(invoice.id) === picker.value
               );
-              if (selected) await showInvoice(selected);
+              if (!selected) return;
+              try {
+                await showInvoice(selected);
+              } catch (error) {
+                showToast(error.message, true);
+              }
             });
 
             async function loadInvoices() {
@@ -677,6 +706,7 @@
               if (!company) {
                 select.innerHTML = '<option value="">Select a company first…</option>';
                 select.disabled = true;
+                delete select.dataset.loading;
                 hideSupplierMatchPrompt();
                 return;
               }
@@ -686,6 +716,7 @@
               if (!response.ok) return;
               const suppliers = await response.json();
               if (requestSequence !== supplierRequestSequence) return;
+              delete select.dataset.loading;
               select.disabled = false;
               select.innerHTML = '<option value="">Select supplier…</option>';
               for (const supplier of suppliers) {
@@ -1814,7 +1845,7 @@
                 sectionColumns("sage-registration"),
                 invoice => `
                   ${pdfLinkButton(invoice)}
-                  <button data-action="register-sage" data-id="${invoice.id}" data-irj="${escapeHtml(invoice.irj_number || "")}">Register in Sage</button>
+                  <button data-action="register-sage" data-id="${invoice.id}" data-irj="${escapeAttr(invoice.irj_number || "")}">Register in Sage</button>
                 `
               );
               renderSectionTable(
@@ -1984,7 +2015,7 @@
               const profiles = terms.profiles || [];
               account.innerHTML = profiles.length
                 ? profiles.map(profile =>
-                    `<option value="${escapeHtml(profile.supplier_account_number || "")}">` +
+                    `<option value="${escapeAttr(profile.supplier_account_number || "")}">` +
                     `${escapeHtml(profile.supplier_account_number || "No account number")} — ` +
                     `${escapeHtml(profile.bank_account || "No bank specified")}` +
                     `</option>`
@@ -2231,6 +2262,7 @@
                   await postJson(`/api/invoices/${id}/po-match`, { matched: true, notes: null });
                 } else if (action === "open-review") {
                   openedFlaggedInvoiceId = id;
+                  showFlaggedNext = true;
                   document.querySelector('#section-nav button[data-tab="incoming"]').click();
                   await refreshPicker();
                   return;
@@ -2557,6 +2589,7 @@
                 showToast(`Invoice manually added to ${destination}.`);
                 if (record.status === "Needs Review") {
                   openedFlaggedInvoiceId = record.id;
+                  showFlaggedNext = true;
                 }
                 await loadInvoices();
                 if (record.status === "Needs Review") {
@@ -3397,24 +3430,24 @@
                     <tr>
                       <td>${escapeHtml(setting.company)}</td>
                       <td>
-                        <select data-irj-mode="${escapeHtml(setting.company)}" aria-label="IRJ mode for ${escapeHtml(setting.company)}">
+                        <select data-irj-mode="${escapeAttr(setting.company)}" aria-label="IRJ mode for ${escapeAttr(setting.company)}">
                           <option value="automatic" ${setting.mode === "automatic" ? "selected" : ""}>Automatic</option>
                           <option value="manual" ${setting.mode === "manual" ? "selected" : ""}>Manual at Sage</option>
                         </select>
                       </td>
                       <td>
                         <input
-                          data-irj-current="${escapeHtml(setting.company)}"
-                          aria-label="Latest paper IRJ for ${escapeHtml(setting.company)}"
+                          data-irj-current="${escapeAttr(setting.company)}"
+                          aria-label="Latest paper IRJ for ${escapeAttr(setting.company)}"
                           inputmode="numeric"
                           pattern="[0-9]{6}"
                           maxlength="6"
-                          value="${escapeHtml(setting.current_irj || "")}"
+                          value="${escapeAttr(setting.current_irj || "")}"
                           placeholder="e.g. 004321"
                           ${setting.mode === "manual" ? "disabled" : ""}
                         >
                       </td>
-                      <td><button data-save-irj="${escapeHtml(setting.company)}" aria-label="Save IRJ settings for ${escapeHtml(setting.company)}">Save</button></td>
+                      <td><button data-save-irj="${escapeAttr(setting.company)}" aria-label="Save IRJ settings for ${escapeAttr(setting.company)}">Save</button></td>
                     </tr>
                   `).join("") + '</tbody></table>';
                 document.querySelectorAll("[data-irj-mode]").forEach(select => {

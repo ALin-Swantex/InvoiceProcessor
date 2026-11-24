@@ -14,7 +14,6 @@ from app.supplier_terms import SupplierTerms
 EXCLUDED_FINANCIAL_STATUSES = {
     "Cancelled - Duplicate",
     "Rejected",
-    "Reconciled / Complete",
     "Statement Filed",
 }
 PAID_STATUSES = {

@@ -151,3 +151,56 @@ def test_supplier_bank_details_are_limited_to_purchase_ledger(tmp_path: Path) ->
         json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
     )
     assert client.get("/api/supplier-terms", params=params).status_code == 200
+
+
+def test_an_infinite_invoice_value_is_rejected(tmp_path: Path) -> None:
+    client: TestClient = client_for(tmp_path)
+    store = client.app.state.invoice_store
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n%%EOF")
+    invoice = store.add_from_outlook(
+        message={"id": "message-1"},
+        attachment={"id": "attachment-1", "name": "invoice.pdf"},
+        stored_path=pdf,
+    )
+    client.post(
+        "/api/auth/login",
+        json={"username": "purchase.ledger", "password": "ChangeMe-PL1!"},
+    )
+
+    response = client.post(
+        f"/api/invoices/{invoice.id}/confirm",
+        content=(
+            '{"company": "Acme Trading Ltd", "supplier": "Supplier Ltd", '
+            '"invoice_value": 1e999}'
+        ),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert store.get(invoice.id).invoice_value is None
+
+
+def test_duplicate_check_matches_names_outside_ascii(tmp_path: Path) -> None:
+    lifecycle, store, first_id = _lifecycle(tmp_path)
+    second = store.add_from_outlook(
+        message={"id": "message-2"},
+        attachment={"id": "attachment-2", "name": "again.pdf"},
+        stored_path=tmp_path / "again.pdf",
+    )
+    store.update_fields(
+        first_id,
+        company="Acme Trading Ltd",
+        supplier="Großhandel GmbH",
+        supplier_invoice_number="RE-1001",
+    )
+
+    duplicate = store.find_duplicate_by_number(
+        exclude_id=second.id,
+        company="Acme Trading Ltd",
+        supplier="Großhandel GmbH",
+        number="RE-1001",
+    )
+
+    assert duplicate is not None and duplicate.id == first_id
+    assert [r.id for r in store.search(supplier="großhandel gmbh")] == [first_id]

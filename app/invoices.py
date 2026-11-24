@@ -222,7 +222,10 @@ METRIC_COLUMNS = tuple(MetricInvoice.__dataclass_fields__)
 
 
 def _norm(value: object) -> str:
-    return str(value or "").strip().casefold()
+    """Trimmed value for a lower(...) = lower(?) comparison. Python's casefold()
+    is not used: it turns "ß" into "ss", which SQL lower() does not, so a
+    German supplier name would never match itself."""
+    return str(value or "").strip()
 
 
 class InvoiceStore:
@@ -399,10 +402,10 @@ class InvoiceStore:
             clauses.append("irj_number = ?")
             args.append(irj_number)
         if company:
-            clauses.append("lower(trim(company)) = ?")
+            clauses.append("lower(trim(company)) = lower(?)")
             args.append(_norm(company))
         if supplier:
-            clauses.append("lower(trim(supplier)) = ?")
+            clauses.append("lower(trim(supplier)) = lower(?)")
             args.append(_norm(supplier))
         if approver is not None:
             level, email = approver
@@ -426,9 +429,9 @@ class InvoiceStore:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM invoices WHERE id <> ? "
-                "AND lower(trim(coalesce(company, ''))) = ? "
-                "AND lower(trim(coalesce(supplier, ''))) = ? "
-                "AND lower(trim(coalesce(supplier_invoice_number, ''))) = ? "
+                "AND lower(trim(coalesce(company, ''))) = lower(?) "
+                "AND lower(trim(coalesce(supplier, ''))) = lower(?) "
+                "AND lower(trim(coalesce(supplier_invoice_number, ''))) = lower(?) "
                 "ORDER BY created_at DESC LIMIT 1",
                 (exclude_id, _norm(company), _norm(supplier), _norm(number)),
             ).fetchone()
@@ -447,7 +450,7 @@ class InvoiceStore:
             args += [invoice.internet_message_id, invoice.attachment_id]
         if filename and invoice.size_bytes is not None:
             conditions.append(
-                "(lower(trim(coalesce(original_filename, ''))) = ? AND size_bytes = ?)"
+                "(lower(trim(coalesce(original_filename, ''))) = lower(?) AND size_bytes = ?)"
             )
             args += [filename, invoice.size_bytes]
         if not conditions:
@@ -455,7 +458,7 @@ class InvoiceStore:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM invoices WHERE id <> ? "
-                "AND lower(trim(coalesce(company, ''))) = ? "
+                "AND lower(trim(coalesce(company, ''))) = lower(?) "
                 f"AND ({' OR '.join(conditions)}) "
                 "ORDER BY created_at DESC LIMIT 1",
                 (invoice.id, _norm(company), *args),

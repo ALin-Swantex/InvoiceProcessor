@@ -86,7 +86,7 @@ class PostgresIrjNumberGenerator:
                     """
                     INSERT INTO company_irj_sequences (company, next_number)
                     VALUES (%s, %s)
-                    ON CONFLICT (company) DO UPDATE
+                    ON CONFLICT ((lower(company))) DO UPDATE
                     SET next_number = excluded.next_number
                     """,
                     (company.strip(), number + 1),
@@ -99,7 +99,7 @@ class PostgresIrjNumberGenerator:
                     """
                     INSERT INTO company_irj_sequences (company, next_number)
                     VALUES (%s, 2)
-                    ON CONFLICT (company) DO UPDATE
+                    ON CONFLICT ((lower(company))) DO UPDATE
                     SET next_number = company_irj_sequences.next_number + 1
                     RETURNING next_number - 1 AS number
                     """,
@@ -123,7 +123,7 @@ class PostgresIrjNumberGenerator:
                     """
                     INSERT INTO company_irj_sequences (company, next_number)
                     VALUES (%s, %s)
-                    ON CONFLICT (company) DO UPDATE
+                    ON CONFLICT ((lower(company))) DO UPDATE
                     SET next_number = GREATEST(
                         company_irj_sequences.next_number,
                         excluded.next_number

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse, Response
@@ -127,6 +130,23 @@ def _register_database_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(OperationalError, database_unavailable)
 
 
+async def _validation_error(request: object, error: RequestValidationError) -> JSONResponse:
+    """FastAPI's default 422, except that a rejected infinity or NaN is echoed
+    back as text: as a number it cannot be written as JSON, and the error
+    response itself would fail with a 500."""
+
+    def printable(value: object) -> object:
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        return value
+
+    errors = [
+        {**item, "input": printable(item["input"])} if "input" in item else item
+        for item in error.errors()
+    ]
+    return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
+
+
 def create_app(
     *,
     notification_store: OutlookNotificationStore | None = None,
@@ -152,6 +172,7 @@ def create_app(
         "/static", RevalidatingStaticFiles(directory=STATIC_DIR), name="static"
     )
     _register_database_error_handlers(app)
+    app.add_exception_handler(RequestValidationError, _validation_error)
     if notification_store is None:
         from app.postgres_notifications import PostgresOutlookNotificationStore
         from app.postgres_monitoring import PostgresWorkerMonitor

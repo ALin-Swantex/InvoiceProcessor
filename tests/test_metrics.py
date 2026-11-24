@@ -158,3 +158,19 @@ def test_volume_excludes_supplier_statements() -> None:
     )
 
     assert metrics["volume"][-1]["count"] == 1
+
+
+def test_reconciled_invoices_still_count_as_spend() -> None:
+    metrics = build_metrics(
+        [
+            invoice(1, status="Paid / Awaiting Bank Reconciliation", value=1000.0),
+            invoice(2, status="Reconciled / Complete", value=500.0),
+            invoice(3, status="Rejected", value=99.0),
+        ],
+        [],
+        granularity="month",
+        today=date(2026, 9, 30),
+    )
+
+    spend = metrics["spend_by_supplier_company"]
+    assert sum(row["value"] for row in spend) == 1500.0

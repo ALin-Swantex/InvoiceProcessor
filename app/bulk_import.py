@@ -301,9 +301,14 @@ def import_supplier_workbook(
         if approver2_raw:
             approver_names.append(approver2_raw)
 
+        # Placeholders such as "TBC" or "N/A" are not addresses: treat them as
+        # missing so the missing-email warning still shows.
         supplied_emails = [
-            _cell(row, mapping, "approver1_email"),
-            _cell(row, mapping, "approver2_email"),
+            email if email and "@" in email and " " not in email.strip() else None
+            for email in (
+                _cell(row, mapping, "approver1_email"),
+                _cell(row, mapping, "approver2_email"),
+            )
         ]
         existing_entry = approval_lookup.get(
             (company.strip().casefold(), supplier.strip().casefold())
@@ -332,7 +337,22 @@ def import_supplier_workbook(
             if not email:
                 missing_emails.append(display_name)
         route_warning: str | None = None
-        if not approver1_raw:
+        if approver2_raw and not approver1_raw:
+            # Names and emails are paired by position, so this Approver 2
+            # would become Approver 1 with the Approver 1 email.
+            resolved = []
+            route_warning = (
+                "An Approver 2 was given without an Approver 1; the approval "
+                "route was not imported."
+            )
+        elif len(approver_names) > 2:
+            # Three names cannot be paired with two email columns safely.
+            resolved = []
+            route_warning = (
+                f"More than two approvers were given ({', '.join(approver_names)}); "
+                "the approval route was not imported."
+            )
+        elif not approver1_raw:
             route_warning = "No first approver was supplied."
         elif missing_emails:
             route_warning = (

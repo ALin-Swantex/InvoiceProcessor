@@ -804,3 +804,50 @@ def test_deleting_internal_company_preserves_global_supplier_settings(tmp_path) 
         "Delete Company Ltd", "Supplier Ltd"
     )
     assert [profile.supplier_account_number for profile in profiles] == ["GLOBAL"]
+
+
+def _import_rows(tmp_path, rows):
+    approval_matrix_store = ApprovalMatrixStore(tmp_path / "config.db")
+    summary = import_supplier_workbook(
+        make_workbook(rows),
+        company_store=CompanyStore(tmp_path / "config.db"),
+        supplier_store=SupplierStore(tmp_path / "config.db"),
+        approval_matrix_store=approval_matrix_store,
+        supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
+    )
+    return summary, approval_matrix_store
+
+
+def test_three_approver_names_do_not_import_a_route(tmp_path) -> None:
+    summary, matrix = _import_rows(
+        tmp_path,
+        [["Brand New Co", "Three Names Ltd", "ACC-1", "BACS", "30 days", "Main",
+          "Alice and Bob", "Carol", "alice@example.test", "carol@example.test"]],
+    )
+
+    assert matrix.find_exact("Brand New Co", "Three Names Ltd") is None
+    assert summary.rows[0].status == "warning"
+    assert "More than two approvers" in summary.rows[0].reason
+
+
+def test_an_approver_2_without_an_approver_1_does_not_import_a_route(tmp_path) -> None:
+    summary, matrix = _import_rows(
+        tmp_path,
+        [["Brand New Co", "Second Only Ltd", "ACC-2", "BACS", "30 days", "Main",
+          None, "Carol", None, "carol@example.test"]],
+    )
+
+    assert matrix.find_exact("Brand New Co", "Second Only Ltd") is None
+    assert "Approver 2 was given without an Approver 1" in summary.rows[0].reason
+
+
+def test_an_email_cell_that_is_not_an_address_is_treated_as_missing(tmp_path) -> None:
+    summary, matrix = _import_rows(
+        tmp_path,
+        [["Brand New Co", "Placeholder Ltd", "ACC-3", "BACS", "30 days", "Main",
+          "Alice", None, "TBC", None]],
+    )
+
+    route = matrix.find_exact("Brand New Co", "Placeholder Ltd")
+    assert route is not None and route.approver1.email == ""
+    assert "Add email addresses for: Alice" in summary.rows[0].reason

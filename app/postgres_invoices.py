@@ -232,10 +232,10 @@ class PostgresInvoiceStore:
             clauses.append("irj_number = %s")
             args.append(irj_number)
         if company:
-            clauses.append("lower(btrim(company)) = %s")
+            clauses.append("lower(btrim(company)) = lower(%s)")
             args.append(_norm(company))
         if supplier:
-            clauses.append("lower(btrim(supplier)) = %s")
+            clauses.append("lower(btrim(supplier)) = lower(%s)")
             args.append(_norm(supplier))
         if approver is not None:
             level, email = approver
@@ -256,9 +256,9 @@ class PostgresInvoiceStore:
     ) -> InvoiceRecord | None:
         rows = self._query_many(
             f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE id <> %s "
-            "AND lower(btrim(coalesce(company, ''))) = %s "
-            "AND lower(btrim(coalesce(supplier, ''))) = %s "
-            "AND lower(btrim(coalesce(supplier_invoice_number, ''))) = %s "
+            "AND lower(btrim(coalesce(company, ''))) = lower(%s) "
+            "AND lower(btrim(coalesce(supplier, ''))) = lower(%s) "
+            "AND lower(btrim(coalesce(supplier_invoice_number, ''))) = lower(%s) "
             "ORDER BY created_at DESC LIMIT 1",
             (exclude_id, _norm(company), _norm(supplier), _norm(number)),
         )
@@ -277,7 +277,7 @@ class PostgresInvoiceStore:
             args += [invoice.internet_message_id, invoice.attachment_id]
         if filename and invoice.size_bytes is not None:
             conditions.append(
-                "(lower(btrim(coalesce(original_filename, ''))) = %s "
+                "(lower(btrim(coalesce(original_filename, ''))) = lower(%s) "
                 "AND size_bytes = %s)"
             )
             args += [filename, invoice.size_bytes]
@@ -285,7 +285,7 @@ class PostgresInvoiceStore:
             return None
         rows = self._query_many(
             f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE id <> %s "
-            "AND lower(btrim(coalesce(company, ''))) = %s "
+            "AND lower(btrim(coalesce(company, ''))) = lower(%s) "
             f"AND ({' OR '.join(conditions)}) "
             "ORDER BY created_at DESC LIMIT 1",
             (invoice.id, _norm(company), *args),
