@@ -418,6 +418,14 @@ class PostgresInvoiceStore:
     def delete(self, invoice_id: int) -> None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
+                # The duplicate_of_invoice_id foreign key has no ON DELETE
+                # action, so clear references to this invoice first (same
+                # transaction).
+                cursor.execute(
+                    "UPDATE invoices SET duplicate_of_invoice_id = NULL "
+                    "WHERE duplicate_of_invoice_id = %s",
+                    (invoice_id,),
+                )
                 cursor.execute(
                     "DELETE FROM invoices WHERE id = %s RETURNING id",
                     (invoice_id,),

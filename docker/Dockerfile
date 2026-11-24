@@ -29,7 +29,10 @@ VOLUME ["/data"]
 EXPOSE 8000
 
 # /api/health always answers 200, so check the status field it reports.
+# "degraded" only means the worker heartbeat is missing or old; the worker
+# waits for web to be healthy before it starts, so treating that as unhealthy
+# would stop the worker ever starting on a fresh database.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import json,sys,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4); sys.exit(0 if json.load(r).get('status') == 'ok' else 1)"
+    CMD python -c "import json,sys,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4); sys.exit(0 if json.load(r).get('status') in ('ok', 'degraded') else 1)"
 
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "10"]

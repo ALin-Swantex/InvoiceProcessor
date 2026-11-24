@@ -141,6 +141,15 @@ class PostgresCompanyStore(_PostgresStore):
     def delete(self, name: str) -> None:
         with self._connection_factory() as connection:  # type: ignore[attr-defined]
             with connection.cursor() as cursor:
+                # suppliers.default_company_id has no ON DELETE action; unlink
+                # it first (same transaction). The supplier keeps its other
+                # settings, as in the SQLite store.
+                cursor.execute(
+                    "UPDATE suppliers SET default_company_id = NULL "
+                    "WHERE default_company_id IN "
+                    "(SELECT id FROM companies WHERE lower(name) = lower(%s))",
+                    (name,),
+                )
                 cursor.execute(
                     "DELETE FROM companies WHERE lower(name) = lower(%s)",
                     (name,),

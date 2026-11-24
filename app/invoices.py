@@ -599,6 +599,13 @@ class InvoiceStore:
 
     def delete(self, invoice_id: int) -> None:
         with self._connect() as connection:
+            # Match PostgreSQL, whose foreign key would refuse the delete
+            # while another invoice is marked as a duplicate of this one.
+            connection.execute(
+                "UPDATE invoices SET duplicate_of_invoice_id = NULL "
+                "WHERE duplicate_of_invoice_id = ?",
+                (invoice_id,),
+            )
             cursor = connection.execute(
                 "DELETE FROM invoices WHERE id = ?",
                 (invoice_id,),

@@ -8,8 +8,9 @@ from dataclasses import asdict
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.approval_matrix import ALL_COMPANIES
-from app.auth import User, get_current_user
+from app.auth import User, get_current_user, require_role
 from app.deps import irj_configuration, sync_sharepoint_companies
+from app.schemas import ROLES_PURCHASE_LEDGER_ADMIN
 
 router = APIRouter()
 
@@ -97,7 +98,8 @@ def supplier_terms(
     http_request: Request,
     company: str,
     supplier: str,
-    user: User = Depends(get_current_user),
+    # Bank and account numbers: only the payment dialog (Purchase Ledger) needs them.
+    user: User = Depends(require_role(*ROLES_PURCHASE_LEDGER_ADMIN)),
 ) -> dict[str, object]:
     app = http_request.app
     profiles = app.state.supplier_terms_store.list_for_supplier(company, supplier)

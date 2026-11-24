@@ -207,6 +207,31 @@ class InvoiceLifecycle:
             invoice_id=invoice_id,
         )
 
+    def _send_stage_email(
+        self,
+        invoice_id: int,
+        stage: str,
+        *,
+        recipient: str,
+        subject: str,
+        body: str,
+    ) -> None:
+        """Send a workflow stage email without failing the step it follows.
+
+        The step's new status is already saved when this runs, so raising
+        would show the user an error for work that succeeded and skip what
+        comes after it. A failed send is logged for Purchase Ledger instead."""
+        try:
+            self._send_stage_email_once(
+                invoice_id, stage, recipient=recipient, subject=subject, body=body
+            )
+        except Exception as error:
+            self._log_purchase_ledger(
+                event_type="email_notification_failed",
+                message=f"The '{stage}' email to {recipient} failed: {error}",
+                invoice_id=invoice_id,
+            )
+
     def _log_purchase_ledger(
         self, *, event_type: str, message: str, invoice_id: int | None = None
     ) -> None:
@@ -645,6 +670,14 @@ class InvoiceLifecycle:
         correction_reason: str | None = None,
     ) -> InvoiceRecord:
         invoice = self._require_invoice(invoice_id)
+        # Confirming routes the invoice from the start again; doing that to
+        # one already in approval or payment (stale tab, double submit) would
+        # rewind it and move its PDF.
+        if invoice.status not in ("Needs Review", "Awaiting AI Extraction"):
+            raise InvoiceLifecycleError(
+                f"Invoice {invoice_id} is not awaiting confirmation "
+                f"(status: {invoice.status})."
+            )
         if invoice.document_type != "invoice":
             raise InvoiceLifecycleError(
                 "A supplier statement cannot enter the invoice workflow. "
@@ -825,7 +858,7 @@ class InvoiceLifecycle:
                     f"{recorded_by}; routed to PO Matching."
                 ),
             )
-            self._send_stage_email_once(
+            self._send_stage_email(
                 invoice_id,
                 "po_matching",
                 recipient=str(decision.notification_recipient),
@@ -1097,7 +1130,7 @@ class InvoiceLifecycle:
             approval_hold_started_at=None,
             approval_hold_reminder_sent_at=None,
         )
-        self._send_stage_email_once(
+        self._send_stage_email(
             invoice_id,
             "approval_1",
             recipient=entry.approver1.email,
@@ -1279,14 +1312,18 @@ class InvoiceLifecycle:
                 )
             return record
 
-        def move_pdf(destination_folder: str, destination_filename: str) -> None:
+        def move_pdf(destination: Callable[[], tuple[str, str]]) -> None:
+            # Any failure (a missing company folder, a Graph timeout, a lost
+            # local PDF) must put the invoice back in its queue: nothing else
+            # knows the "Processing Approval N" status, so it would be stuck.
             try:
+                destination_folder, destination_filename = destination()
                 self._move_pdf_in_sharepoint(
                     invoice,
                     destination_folder,
                     destination_filename,
                 )
-            except InvoiceLifecycleError:
+            except Exception:
                 self.invoice_store.update_fields_if_status(
                     invoice_id,
                     processing_status,
@@ -1347,8 +1384,7 @@ class InvoiceLifecycle:
                 "approval_hold_reminder_sent_at": None,
             }
             move_pdf(
-                REJECTED_INVOICES_FOLDER,
-                self._rejected_filename(invoice),
+                lambda: (REJECTED_INVOICES_FOLDER, self._rejected_filename(invoice))
             )
             record = commit_decision(**fields)
             self._log_purchase_ledger(
@@ -1380,11 +1416,13 @@ class InvoiceLifecycle:
                 "approval_hold_reminder_sent_at": None,
             }
             move_pdf(
-                self._company_folders(invoice).nominal_approver_2,
-                self._filed_filename(invoice),
+                lambda: (
+                    self._company_folders(invoice).nominal_approver_2,
+                    self._filed_filename(invoice),
+                )
             )
             record = commit_decision(**fields)
-            self._send_stage_email_once(
+            self._send_stage_email(
                 invoice_id,
                 "approval_2",
                 recipient=str(invoice.approver2_email),
@@ -1425,8 +1463,10 @@ class InvoiceLifecycle:
             "approval_hold_reminder_sent_at": None,
         }
         move_pdf(
-            self._company_folders(invoice).approved_for_payment,
-            self._filed_filename(invoice),
+            lambda: (
+                self._company_folders(invoice).approved_for_payment,
+                self._filed_filename(invoice),
+            )
         )
         record = commit_decision(**fields)
         # Once fully approved, the Purchase Ledger team should receive an
@@ -1435,7 +1475,7 @@ class InvoiceLifecycle:
         # Purchase Ledger performed the action themselves -- they need an
         # actual email, not just an activity feed entry they'd have to go
         # looking for.
-        self._send_stage_email_once(
+        self._send_stage_email(
             invoice_id,
             "approved_for_payment",
             recipient=os.environ.get(
@@ -2092,13 +2132,15 @@ class InvoiceLifecycle:
             self.invoice_store.delete(invoice_id)
         except KeyError as error:
             raise InvoiceLifecycleError(str(error)) from error
+        # No invoice_id: the row is gone, and PostgreSQL's foreign key from
+        # activity events to invoices would reject the event.
         self._log_purchase_ledger(
             event_type="invoice_deleted",
             message=(
-                f"'{invoice.original_filename}' was permanently deleted by "
-                f"{recorded_by} before approval/payment processing."
+                f"'{invoice.original_filename}' (invoice #{invoice_id}) was "
+                f"permanently deleted by {recorded_by} before approval/payment "
+                "processing."
             ),
-            invoice_id=invoice_id,
         )
 
     # ------------------------------------------------------------------
