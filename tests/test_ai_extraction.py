@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from pypdf import PdfReader, PdfWriter
 
+from app.approval_matrix import ApprovalMatrixStore
 from app.activity_feed import ActivityFeedStore
 from app.ai_extraction import (
     CERTAINTY_SCORES,
@@ -517,6 +518,7 @@ def lifecycle_for(
         ActivityFeedStore(tmp_path / "activity.db"),
         sharepoint,  # type: ignore[arg-type]
         companies_store=CompanyStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
         suppliers_store=SupplierStore(tmp_path / "config.db"),
         extraction_runner=extractor.extract,
     )
@@ -645,8 +647,14 @@ def test_default_runner_passes_the_configured_names_to_extraction(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(path: Path, *, reference: ReferenceData | None = None) -> object:
+    def fake_run(
+        path: Path,
+        *,
+        reference: ReferenceData | None = None,
+        threshold: float | None = None,
+    ) -> object:
         captured["reference"] = reference
+        captured["threshold"] = threshold
         raise ExtractionError("stop here")
 
     monkeypatch.setattr("app.lifecycle.base.run_ai_extraction", fake_run)
@@ -657,12 +665,18 @@ def test_default_runner_passes_the_configured_names_to_extraction(
         ActivityFeedStore(tmp_path / "activity.db"),
         None,
         companies_store=CompanyStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
         suppliers_store=SupplierStore(tmp_path / "config.db"),
+        # The Admin threshold comes from the lifecycle's own settings store.
+        configuration_getter=lambda key, default: (
+            "0.42" if key == "ai_confidence_threshold" else default
+        ),
     )
 
     with pytest.raises(ExtractionError):
         lifecycle.extraction_runner(pdf)
 
+    assert captured["threshold"] == 0.42
     reference = captured["reference"]
     assert isinstance(reference, ReferenceData)
     assert "Acme Trading Ltd" in reference.known_company_names()

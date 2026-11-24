@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from app.approval_matrix import ApprovalMatrixStore
 from app.activity_feed import ActivityFeedStore
 from app.ai_extraction import ExtractionResult
 from app.companies import CompanyStore
@@ -74,6 +75,7 @@ def _lifecycle_with_pattern(tmp_path: Path, invoice_number: str):
         ActivityFeedStore(tmp_path / "activity.db"),
         None,
         companies_store=CompanyStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
         suppliers_store=suppliers,
         extraction_runner=lambda path: ExtractionResult(
             company=None,

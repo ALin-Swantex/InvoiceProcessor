@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.approval_matrix import ApprovalMatrixStore
 from app.activity_feed import ActivityFeedStore
 from app.ai_extraction import ExtractionResult
 from app.companies import CompanyStore
@@ -30,6 +31,7 @@ def _lifecycle(tmp_path: Path) -> tuple[InvoiceLifecycle, InvoiceStore, int]:
         ActivityFeedStore(tmp_path / "activity.db"),
         None,
         companies_store=CompanyStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
         suppliers_store=SupplierStore(tmp_path / "config.db"),
         classification_runner=lambda path: DocumentClassification(
             document_type="invoice", confidence=0.99, reason="Looks like an invoice."

@@ -248,17 +248,3 @@ def _row_to_entry(row: sqlite3.Row) -> ApprovalMatrixEntry:
         approver1=Approver(name=row["approver1_name"], email=row["approver1_email"]),
         approver2=approver2,
     )
-
-
-_default_store: ApprovalMatrixStore | None = None
-
-
-def _store() -> ApprovalMatrixStore:
-    global _default_store
-    if _default_store is None:
-        _default_store = ApprovalMatrixStore()
-    return _default_store
-
-
-def find_approvers(company: str, supplier: str) -> ApprovalMatrixEntry | None:
-    return _store().find(company, supplier)

@@ -55,13 +55,13 @@ class ConfirmationStage(LifecycleBase):
                 "A supplier statement cannot enter the invoice workflow. "
                 "File it to its company statement folder or mark it as an invoice."
             )
-        company_profile = self._get_company(company)
+        company_profile = self.companies_store.get(company)
         if company_profile is None:
             raise InvoiceLifecycleError(
                 f"'{company}' is not a recognised company. Add it to app/companies.py "
                 "(or the production Companies SharePoint List) first."
             )
-        supplier_profile = self._get_supplier(supplier)
+        supplier_profile = self.suppliers_store.get(supplier)
         company = company_profile.name
         if supplier_profile is not None:
             supplier = supplier_profile.name
@@ -438,7 +438,7 @@ class ConfirmationStage(LifecycleBase):
             )
             return self.auto_route_for_payment(record.id)
 
-        entry = self._find_approvers(str(invoice.company), str(invoice.supplier))
+        entry = self.approval_matrix_store.find(str(invoice.company), str(invoice.supplier))
         missing_route_detail = None
         if entry is None:
             missing_route_detail = (
@@ -528,7 +528,7 @@ class ConfirmationStage(LifecycleBase):
             return False
         if not invoice.company:
             return True
-        existing = self._get_company(invoice.company)
+        existing = self.companies_store.get(invoice.company)
         existing_name = existing.name if existing is not None else invoice.company
         return existing_name.strip().casefold() == company_name.strip().casefold()
 

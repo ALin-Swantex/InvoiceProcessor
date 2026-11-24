@@ -213,21 +213,3 @@ def _normalize_aliases(aliases: list[str] | tuple[str, ...]) -> tuple[str, ...]:
             normalized.append(value)
             seen.add(key)
     return tuple(normalized)
-
-
-_default_store: SupplierStore | None = None
-
-
-def _store() -> SupplierStore:
-    global _default_store
-    if _default_store is None:
-        _default_store = SupplierStore()
-    return _default_store
-
-
-def list_suppliers() -> list[SupplierProfile]:
-    return _store().list()
-
-
-def get_supplier(name: str) -> SupplierProfile | None:
-    return _store().get(name)

@@ -438,8 +438,16 @@ class ClaudeInvoiceExtractor:
         self.client = client or self._build_client(settings)
 
     def extract(
-        self, pdf_path: Path, *, reference: ReferenceData | None = None
+        self,
+        pdf_path: Path,
+        *,
+        reference: ReferenceData | None = None,
+        threshold: float | None = None,
     ) -> ExtractionResult:
+        """``threshold`` is the Admin confidence threshold; the lifecycle passes
+        it from its own settings store. Without one it is read here."""
+        if threshold is None:
+            threshold = confidence_threshold()
         if not pdf_path.is_file():
             raise ExtractionError(f"Invoice PDF was not found: {pdf_path}")
         pdf_bytes = pdf_path.read_bytes()
@@ -453,7 +461,12 @@ class ClaudeInvoiceExtractor:
         first: ExtractionResult | None = None
         try:
             first = self._extract_once(
-                analysis_bytes, text_layer, reference, settings.model, settings.effort
+                analysis_bytes,
+                text_layer,
+                reference,
+                settings.model,
+                settings.effort,
+                threshold,
             )
         except ExtractionError:
             # The document could not be read by the first model (cut-off answer,
@@ -464,7 +477,7 @@ class ClaudeInvoiceExtractor:
         if not settings.escalation_enabled:
             assert first is not None
             return first
-        if first is not None and not _needs_escalation(first):
+        if first is not None and not _needs_escalation(first, threshold):
             return first
 
         try:
@@ -474,6 +487,7 @@ class ClaudeInvoiceExtractor:
                 reference,
                 settings.escalation_model,
                 settings.escalation_effort,
+                threshold,
             )
         except (
             ExtractionError,
@@ -489,7 +503,7 @@ class ClaudeInvoiceExtractor:
                 f"A second opinion from {settings.escalation_model} was not "
                 f"available ({error}); please check this invoice carefully.",
             )
-        return _combine(first, second, settings)
+        return _combine(first, second, settings, threshold)
 
     # -- request -----------------------------------------------------------
 
@@ -500,10 +514,15 @@ class ClaudeInvoiceExtractor:
         reference: ReferenceData | None,
         model: str,
         effort: str,
+        threshold: float,
     ) -> ExtractionResult:
         data = self._parse(self._request(pdf_bytes, reference, model, effort))
         return self._to_result(
-            data, text_layer=text_layer, reference=reference, model=model
+            data,
+            text_layer=text_layer,
+            reference=reference,
+            model=model,
+            threshold=threshold,
         )
 
     def _request(
@@ -689,6 +708,7 @@ class ClaudeInvoiceExtractor:
         text_layer: str,
         reference: ReferenceData | None,
         model: str,
+        threshold: float | None = None,
     ) -> ExtractionResult:
         document_type = str(data.get("document_type") or "invoice")
         type_certainty = CERTAINTY_SCORES.get(
@@ -762,7 +782,8 @@ class ClaudeInvoiceExtractor:
             if values[name] is not None
         }
 
-        threshold = confidence_threshold()
+        if threshold is None:
+            threshold = confidence_threshold()
         required_scores: list[float] = []
         for name in REQUIRED_FIELDS:
             if values[name] is None or values[name] == "":
@@ -837,7 +858,7 @@ class ClaudeInvoiceExtractor:
         return anthropic.Anthropic(timeout=settings.timeout_seconds, max_retries=2)
 
 
-def _needs_escalation(result: ExtractionResult) -> bool:
+def _needs_escalation(result: ExtractionResult, threshold: float) -> bool:
     """True when the first model had difficulty with an invoice.
 
     A statement is not a difficulty (it is routed on its own), and neither is a
@@ -847,7 +868,7 @@ def _needs_escalation(result: ExtractionResult) -> bool:
     """
     if result.document_type == "statement":
         return False
-    return result.confidence < confidence_threshold()
+    return result.confidence < threshold
 
 
 def _with_warning(result: ExtractionResult, warning: str) -> ExtractionResult:
@@ -864,6 +885,7 @@ def _combine(
     first: ExtractionResult | None,
     second: ExtractionResult,
     settings: ExtractionSettings,
+    threshold: float,
 ) -> ExtractionResult:
     """Use the stronger model's answer, flagging real disagreements.
 
@@ -878,7 +900,6 @@ def _combine(
 
     warnings = list(second.warnings)
     scores = dict(second.field_confidences)
-    threshold = confidence_threshold()
     for name in (*REQUIRED_FIELDS, "purchase_order_number"):
         before, after = getattr(first, name), getattr(second, name)
         if before is None or after is None or _same_value(before, after):
@@ -990,7 +1011,10 @@ def _translate_api_error(error: Exception) -> Exception:
 
 
 def run_ai_extraction(
-    pdf_path: Path, *, reference: ReferenceData | None = None
+    pdf_path: Path,
+    *,
+    reference: ReferenceData | None = None,
+    threshold: float | None = None,
 ) -> ExtractionResult:
     """Extract one invoice with the configured LLM provider.
 
@@ -1014,7 +1038,7 @@ def run_ai_extraction(
             ),
         )
     return _extractor_from_settings(settings_from_environment()).extract(
-        pdf_path, reference=reference
+        pdf_path, reference=reference, threshold=threshold
     )
 
 

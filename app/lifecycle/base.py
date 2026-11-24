@@ -8,12 +8,14 @@ from contextlib import contextmanager
 from typing import Callable, Iterator
 
 from app.activity_feed import ROLE_PURCHASE_LEDGER, ActivityFeedStore
-from app.ai_extraction import ExtractionResult, ReferenceData, run_ai_extraction
+from app.ai_extraction import (
+    ExtractionResult,
+    ReferenceData,
+    confidence_threshold,
+    run_ai_extraction,
+)
 from app.approval_matrix import ApprovalMatrixStore
-from app.approval_matrix import find_approvers as _default_find_approvers
 from app.companies import CompanyStore
-from app.companies import get_company as _default_get_company
-from app.companies import list_companies as _default_list_companies
 from app.company_folders import FLAGGED_INVOICES_FOLDER, CompanyFolderStructure
 from app.document_classification import (
     DocumentClassification,
@@ -23,8 +25,6 @@ from app.invoices import InvoiceRecord, InvoiceStore
 from app.irj import IrjNumberGenerator
 from app.sharepoint import SharePointClient, SharePointError
 from app.suppliers import SupplierStore
-from app.suppliers import get_supplier as _default_get_supplier
-from app.suppliers import list_suppliers as _default_list_suppliers
 from app.supplier_terms import SupplierTermsStore
 from app.workflow import clean_invoice_filename, prefixed_invoice_filename
 from app.statuses import Status
@@ -42,14 +42,10 @@ class LifecycleBase:
     step in the activity feed, so the rest of the process can be tested
     before SharePoint credentials exist.
 
-    `companies_store` / `approval_matrix_store` are optional. When omitted,
-    the module-level default stores (the process-wide singletons in
-    app/companies.py and app/approval_matrix.py) are used, which is fine for
-    a single running server. Pass explicit stores (e.g. the same instances
-    attached to app.state) when isolation matters, such as in tests, so
-    admin edits made through /api/admin/* are immediately visible here
-    instead of going through a different singleton bound to a different
-    database file.
+    The company, supplier and approval-matrix stores are required: the
+    web app and the worker pass the same stores they use everywhere else, so
+    an Admin edit is seen here at once. `supplier_terms_store` may be None;
+    payment routing then holds the invoice with a clear reason.
     """
 
     def __init__(
@@ -58,9 +54,9 @@ class LifecycleBase:
         irj_generator: IrjNumberGenerator,
         activity_feed: ActivityFeedStore,
         sharepoint_client: SharePointClient | None,
-        companies_store: CompanyStore | None = None,
-        approval_matrix_store: ApprovalMatrixStore | None = None,
-        suppliers_store: SupplierStore | None = None,
+        companies_store: CompanyStore,
+        approval_matrix_store: ApprovalMatrixStore,
+        suppliers_store: SupplierStore,
         supplier_terms_store: SupplierTermsStore | None = None,
         configuration_getter: Callable[[str, str | None], str | None] | None = None,
         extraction_runner: Callable[[Path], ExtractionResult] | None = None,
@@ -83,42 +79,25 @@ class LifecycleBase:
         self.classification_runner = classification_runner
 
     def _extract_with_reference_data(self, pdf_path: Path) -> ExtractionResult:
-        return run_ai_extraction(pdf_path, reference=self._reference_data())
+        # The Admin threshold from this lifecycle's own settings store, the
+        # same one the Admin page reads and writes.
+        return run_ai_extraction(
+            pdf_path,
+            reference=self._reference_data(),
+            threshold=confidence_threshold(self.configuration_getter),
+        )
 
     def _reference_data(self) -> ReferenceData | None:
         """Companies and suppliers (with aliases) for the extraction prompt."""
         try:
-            companies = (
-                self.companies_store.list()
-                if self.companies_store is not None
-                else _default_list_companies()
-            )
-            suppliers = (
-                self.suppliers_store.list()
-                if self.suppliers_store is not None
-                else _default_list_suppliers()
-            )
+            companies = self.companies_store.list()
+            suppliers = self.suppliers_store.list()
         except Exception:
             return None  # extraction still works, just without name hints
         return ReferenceData(
             companies=tuple((c.name, tuple(c.aliases)) for c in companies),
             suppliers=tuple((s.name, tuple(s.aliases)) for s in suppliers),
         )
-
-    def _get_company(self, name: str):
-        if self.companies_store is not None:
-            return self.companies_store.get(name)
-        return _default_get_company(name)
-
-    def _find_approvers(self, company: str, supplier: str):
-        if self.approval_matrix_store is not None:
-            return self.approval_matrix_store.find(company, supplier)
-        return _default_find_approvers(company, supplier)
-
-    def _get_supplier(self, name: str):
-        if self.suppliers_store is not None:
-            return self.suppliers_store.get(name)
-        return _default_get_supplier(name)
 
     def _log_purchase_ledger(
         self, *, event_type: str, message: str, invoice_id: int | None = None
@@ -307,7 +286,7 @@ class LifecycleBase:
             raise InvoiceLifecycleError(
                 f"Invoice {invoice.id} has no company folder configuration."
             )
-        company = self._get_company(invoice.company)
+        company = self.companies_store.get(invoice.company)
         if company is None:
             raise InvoiceLifecycleError(
                 f"Company '{invoice.company}' is not configured."

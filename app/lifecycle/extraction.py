@@ -106,7 +106,7 @@ class ExtractionStage(LifecycleBase):
         company_profile = None
         supplier_profile = None
         if company:
-            company_profile = self._get_company(company)
+            company_profile = self.companies_store.get(company)
             if company_profile is None:
                 warnings.append(
                     f"Company '{company}' does not match a configured company or alias."
@@ -114,7 +114,7 @@ class ExtractionStage(LifecycleBase):
             else:
                 company = company_profile.name
         if supplier:
-            supplier_profile = self._get_supplier(supplier)
+            supplier_profile = self.suppliers_store.get(supplier)
             if supplier_profile is None:
                 warnings.append(
                     f"Supplier '{supplier}' is not in the supplier register."

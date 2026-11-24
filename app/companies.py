@@ -190,27 +190,3 @@ def _row_to_profile(row: sqlite3.Row) -> CompanyProfile:
         vat_number=row["vat_number"],
         address=row["address"],
     )
-
-
-# ---------------------------------------------------------------------------
-# Module-level convenience wrapper (default store) so existing call sites
-# such as `from app.companies import list_companies` keep working without
-# every caller needing to construct a CompanyStore explicitly.
-# ---------------------------------------------------------------------------
-
-_default_store: CompanyStore | None = None
-
-
-def _store() -> CompanyStore:
-    global _default_store
-    if _default_store is None:
-        _default_store = CompanyStore()
-    return _default_store
-
-
-def list_companies() -> list[CompanyProfile]:
-    return _store().list()
-
-
-def get_company(name: str) -> CompanyProfile | None:
-    return _store().get(name)

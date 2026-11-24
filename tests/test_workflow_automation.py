@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from app.suppliers import SupplierStore
+from app.approval_matrix import ApprovalMatrixStore
 from app.activity_feed import ActivityFeedStore
 from app.companies import CompanyStore
 from app.invoice_lifecycle import InvoiceLifecycle
@@ -26,6 +28,8 @@ def lifecycle_with_invoice(tmp_path: Path) -> tuple[InvoiceLifecycle, InvoiceSto
         ActivityFeedStore(tmp_path / "activity.db"),
         None,
         companies_store=CompanyStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+        suppliers_store=SupplierStore(tmp_path / "config.db"),
         supplier_terms_store=SupplierTermsStore(tmp_path / "config.db"),
     )
     return lifecycle, store, invoice.id

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.approval_matrix import ApprovalMatrixStore
 from app.activity_feed import ActivityFeedStore
 from app.companies import CompanyStore
 from app.invoice_lifecycle import InvoiceLifecycle, InvoiceLifecycleError
@@ -29,6 +30,7 @@ def _lifecycle(tmp_path: Path) -> tuple[InvoiceLifecycle, InvoiceStore, int]:
         ActivityFeedStore(tmp_path / "activity.db"),
         None,
         companies_store=CompanyStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
         suppliers_store=SupplierStore(tmp_path / "config.db"),
     )
     return lifecycle, store, record.id

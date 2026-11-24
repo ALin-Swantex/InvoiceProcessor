@@ -25,7 +25,7 @@ class ReviewStage(LifecycleBase):
             raise InvoiceLifecycleError(
                 "Only a flagged document can be filed as a supplier statement."
             )
-        company_profile = self._get_company(company)
+        company_profile = self.companies_store.get(company)
         if company_profile is None:
             raise InvoiceLifecycleError(
                 f"'{company}' is not a recognised company."

@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import cast
 
+from app.suppliers import SupplierStore
+from app.approval_matrix import ApprovalMatrixStore
 from app.activity_feed import ActivityFeedStore
 from app.companies import CompanyStore
 from app.document_classification import (
@@ -84,6 +86,8 @@ def _statement_lifecycle(tmp_path: Path):
         ActivityFeedStore(tmp_path / "activity.db"),
         cast(SharePointClient, sharepoint),
         companies_store=CompanyStore(tmp_path / "config.db"),
+        approval_matrix_store=ApprovalMatrixStore(tmp_path / "config.db"),
+        suppliers_store=SupplierStore(tmp_path / "config.db"),
         extraction_runner=lambda path: (_ for _ in ()).throw(
             AssertionError("Invoice extraction must not run for a detected statement")
         ),
