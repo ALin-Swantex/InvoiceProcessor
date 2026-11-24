@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
 
+from app.activity_feed import ROLE_PURCHASE_LEDGER
+from app.outlook_graph import graph_client_from_environment
 from app.outlook_notifications import extract_message_id
+
+logger = logging.getLogger("invoice_processor")
 
 router = APIRouter()
 
@@ -96,6 +101,7 @@ async def outlook_notifications(
 @router.post("/api/outlook/lifecycle")
 async def outlook_lifecycle(
     request: Request,
+    background_tasks: BackgroundTasks,
     validation_token: str | None = Query(None, alias="validationToken"),
 ) -> Response:
     app = request.app
@@ -125,5 +131,64 @@ async def outlook_lifecycle(
                 status_code=401,
                 detail="Invalid lifecycle notification client state.",
             )
-    # Lifecycle persistence and alerting are added with production monitoring.
+    for notification in notifications:
+        if isinstance(notification, dict):
+            # After the 202: a renewal is a Graph call, and Microsoft expects
+            # a prompt answer.
+            background_tasks.add_task(_handle_lifecycle_event, request.app, notification)
     return Response(status_code=202)
+
+
+def _report_subscription(app: FastAPI, event_type: str, message: str) -> None:
+    if event_type == "outlook_subscription_problem":
+        logger.error("%s", message)
+    else:
+        logger.info("%s", message)
+    app.state.activity_feed.add_event(
+        event_type=event_type,
+        target_role=ROLE_PURCHASE_LEDGER,
+        message=message,
+    )
+
+
+def _handle_lifecycle_event(app: FastAPI, notification: dict[str, object]) -> None:
+    """Act on a Graph lifecycle event. Without this, a subscription that
+    Microsoft removes or stops sending to fails silently: invoice emails simply
+    stop arriving."""
+    event = notification.get("lifecycleEvent")
+    subscription_id = str(notification.get("subscriptionId") or "unknown")
+    if event == "reauthorizationRequired":
+        try:
+            graph_client_from_environment().renew_subscription(subscription_id)
+        except Exception as error:
+            _report_subscription(
+                app,
+                "outlook_subscription_problem",
+                f"The Outlook subscription {subscription_id} needs reauthorising "
+                f"and could not be renewed automatically ({error}). New invoice "
+                "emails may stop arriving. Renew it with: python -m "
+                f"app.outlook_subscription renew {subscription_id}",
+            )
+            return
+        _report_subscription(
+            app,
+            "outlook_subscription_renewed",
+            f"The Outlook subscription {subscription_id} was renewed after "
+            "Microsoft asked for reauthorisation.",
+        )
+    elif event == "subscriptionRemoved":
+        _report_subscription(
+            app,
+            "outlook_subscription_problem",
+            f"Microsoft removed the Outlook subscription {subscription_id}, so new "
+            "invoice emails are not being received. Create a new one with: "
+            "python -m app.outlook_subscription create",
+        )
+    elif event == "missed":
+        _report_subscription(
+            app,
+            "outlook_subscription_problem",
+            f"Microsoft reports missed Outlook notifications for subscription "
+            f"{subscription_id}; some invoice emails may not have been queued. "
+            "Check the inbox for invoices that are not in the app.",
+        )

@@ -2082,7 +2082,20 @@
               });
             }
 
+            // The IRJ mode per company (automatic or manual from paper
+            // records). Loaded here, not only in the admin panel, so Purchase
+            // Ledger's Sage registration knows a company's mode too.
+            async function loadIrjConfigurations() {
+              const response = await fetch("/api/irj-configurations");
+              if (!response.ok) return;
+              const settings = await response.json();
+              irjConfigurations = new Map(
+                settings.map(setting => [setting.company, setting])
+              );
+            }
+
             async function collectSageRegistration(invoice) {
+              await loadIrjConfigurations();
               const dialog = document.getElementById("sage-registration-dialog");
               const form = document.getElementById("sage-registration-form");
               const irjInput = document.getElementById("sage-registration-irj");
@@ -3250,13 +3263,7 @@
                     await sendJson(`/api/admin/companies/${encodeURIComponent(name)}`, "DELETE");
                     await loadAdminPanel();
                     await loadCompanies();
-                    const irjResponse = await fetch("/api/irj-configurations");
-                    if (irjResponse.ok) {
-                      const settings = await irjResponse.json();
-                      irjConfigurations = new Map(
-                        settings.map(setting => [setting.company, setting])
-                      );
-                    }
+                    await loadIrjConfigurations();
                   },
                   "name",
                   company => {

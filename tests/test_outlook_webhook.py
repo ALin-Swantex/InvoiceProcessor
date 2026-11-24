@@ -181,3 +181,88 @@ def test_renews_existing_subscription(tmp_path: Path) -> None:
     result = client.renew_subscription("subscription-1")
 
     assert result["id"] == "subscription-1"
+
+
+def _lifecycle_event(event: str) -> dict[str, object]:
+    return {
+        "value": [
+            {
+                "subscriptionId": "subscription-1",
+                "clientState": CLIENT_STATE,
+                "lifecycleEvent": event,
+            }
+        ]
+    }
+
+
+def _events(client: TestClient) -> list[tuple[str, str]]:
+    feed = client.app.state.activity_feed
+    return [(event.event_type, event.message) for event in feed.list_since(0)]
+
+
+def test_reauthorization_request_renews_the_subscription(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client, _ = webhook_client(tmp_path)
+    renewed: list[str] = []
+
+    class FakeGraph:
+        def renew_subscription(self, subscription_id: str) -> dict[str, object]:
+            renewed.append(subscription_id)
+            return {"id": subscription_id}
+
+    monkeypatch.setattr(
+        "app.routers.outlook.graph_client_from_environment", lambda: FakeGraph()
+    )
+
+    response = client.post(
+        "/api/outlook/lifecycle", json=_lifecycle_event("reauthorizationRequired")
+    )
+
+    assert response.status_code == 202
+    assert renewed == ["subscription-1"]
+    assert [kind for kind, _ in _events(client)] == ["outlook_subscription_renewed"]
+
+
+def test_a_failed_renewal_is_reported(tmp_path: Path, monkeypatch) -> None:
+    client, _ = webhook_client(tmp_path)
+
+    class BrokenGraph:
+        def renew_subscription(self, subscription_id: str) -> dict[str, object]:
+            raise RuntimeError("Graph returned 403")
+
+    monkeypatch.setattr(
+        "app.routers.outlook.graph_client_from_environment", lambda: BrokenGraph()
+    )
+
+    client.post(
+        "/api/outlook/lifecycle", json=_lifecycle_event("reauthorizationRequired")
+    )
+
+    events = _events(client)
+    assert [kind for kind, _ in events] == ["outlook_subscription_problem"]
+    assert "Graph returned 403" in events[0][1]
+    assert "app.outlook_subscription" in events[0][1]
+
+
+def test_a_removed_subscription_is_reported(tmp_path: Path) -> None:
+    client, _ = webhook_client(tmp_path)
+
+    response = client.post(
+        "/api/outlook/lifecycle", json=_lifecycle_event("subscriptionRemoved")
+    )
+
+    assert response.status_code == 202
+    events = _events(client)
+    assert [kind for kind, _ in events] == ["outlook_subscription_problem"]
+    assert "python -m app.outlook_subscription create" in events[0][1]
+
+
+def test_missed_notifications_are_reported(tmp_path: Path) -> None:
+    client, _ = webhook_client(tmp_path)
+
+    client.post("/api/outlook/lifecycle", json=_lifecycle_event("missed"))
+
+    events = _events(client)
+    assert [kind for kind, _ in events] == ["outlook_subscription_problem"]
+    assert "missed" in events[0][1]
