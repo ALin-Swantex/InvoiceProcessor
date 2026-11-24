@@ -460,12 +460,10 @@ class ClaudeInvoiceExtractor:
 
         first: ExtractionResult | None = None
         try:
-            first = self._extract_once(
-                analysis_bytes,
-                text_layer,
-                reference,
-                settings.model,
-                settings.effort,
+            first = _assess(
+                self._extract_once(
+                    analysis_bytes, text_layer, reference, settings.model, settings.effort
+                ),
                 threshold,
             )
         except ExtractionError:
@@ -487,7 +485,6 @@ class ClaudeInvoiceExtractor:
                 reference,
                 settings.escalation_model,
                 settings.escalation_effort,
-                threshold,
             )
         except (
             ExtractionError,
@@ -503,7 +500,7 @@ class ClaudeInvoiceExtractor:
                 f"A second opinion from {settings.escalation_model} was not "
                 f"available ({error}); please check this invoice carefully.",
             )
-        return _combine(first, second, settings, threshold)
+        return _assess(_combine(first, second, settings), threshold)
 
     # -- request -----------------------------------------------------------
 
@@ -514,15 +511,11 @@ class ClaudeInvoiceExtractor:
         reference: ReferenceData | None,
         model: str,
         effort: str,
-        threshold: float,
     ) -> ExtractionResult:
+        """One model's answer, before the Admin threshold is applied."""
         data = self._parse(self._request(pdf_bytes, reference, model, effort))
-        return self._to_result(
-            data,
-            text_layer=text_layer,
-            reference=reference,
-            model=model,
-            threshold=threshold,
+        return self._read(
+            data, text_layer=text_layer, reference=reference, model=model
         )
 
     def _request(
@@ -701,15 +694,16 @@ class ClaudeInvoiceExtractor:
 
     # -- mapping -----------------------------------------------------------
 
-    def _to_result(
+    def _read(
         self,
         data: Mapping[str, Any],
         *,
         text_layer: str,
         reference: ReferenceData | None,
         model: str,
-        threshold: float | None = None,
     ) -> ExtractionResult:
+        """Turn the model's answer into values, scores and check warnings.
+        The Admin threshold is applied afterwards, once, by _assess."""
         document_type = str(data.get("document_type") or "invoice")
         type_certainty = CERTAINTY_SCORES.get(
             str(data.get("document_type_certainty") or "low"), 0.40
@@ -782,38 +776,15 @@ class ClaudeInvoiceExtractor:
             if values[name] is not None
         }
 
-        if threshold is None:
-            threshold = confidence_threshold()
-        required_scores: list[float] = []
-        for name in REQUIRED_FIELDS:
-            if values[name] is None or values[name] == "":
-                warnings.append(f"Required field '{_display_name(name)}' is missing.")
-                required_scores.append(0.0)
-                continue
-            score = scores.get(name, 0.0)
-            required_scores.append(score)
-            if score < threshold:
-                warnings.append(
-                    f"'{_display_name(name)}' confidence {score:.0%} is below the "
-                    f"{threshold:.0%} threshold."
-                )
-        po = values["purchase_order_number"]
-        if po and scores.get("purchase_order_number", 0.0) < threshold:
-            warnings.append(
-                f"'purchase order number' confidence "
-                f"{scores.get('purchase_order_number', 0.0):.0%} is below the "
-                f"{threshold:.0%} threshold."
-            )
-
         return ExtractionResult(
             company=values["company"],
             supplier=values["supplier"],
             supplier_invoice_number=values["supplier_invoice_number"],
-            purchase_order_number=po,
+            purchase_order_number=values["purchase_order_number"],
             invoice_date=values["invoice_date"],
             invoice_value=values["invoice_value"],
             currency=values["currency"],
-            confidence=min(required_scores, default=0.0),
+            confidence=0.0,  # set by _assess
             needs_review=bool(warnings),
             field_confidences={
                 name: score
@@ -885,7 +856,6 @@ def _combine(
     first: ExtractionResult | None,
     second: ExtractionResult,
     settings: ExtractionSettings,
-    threshold: float,
 ) -> ExtractionResult:
     """Use the stronger model's answer, flagging real disagreements.
 
@@ -911,22 +881,47 @@ def _combine(
             f"{settings.model} read {_display_name(name)} as '{before}' but "
             f"{settings.escalation_model} read '{after}'; please check."
         )
-        if scores[name] < threshold:
+    return replace(
+        second, model=label, warnings=tuple(warnings), field_confidences=scores
+    )
+
+
+def _assess(result: ExtractionResult, threshold: float) -> ExtractionResult:
+    """Apply the Admin confidence threshold to one final answer, once.
+
+    A missing required field, or a required field (or a printed purchase
+    order number) whose confidence is below the threshold, needs a person.
+    The overall confidence is the lowest required-field score. A statement is
+    routed on its own and is left as it is.
+    """
+    if result.document_type == "statement":
+        return result
+    warnings = list(result.warnings)
+    scores = result.field_confidences
+    required_scores: list[float] = []
+    for name in REQUIRED_FIELDS:
+        value = getattr(result, name)
+        if value is None or value == "":
+            warnings.append(f"Required field '{_display_name(name)}' is missing.")
+            required_scores.append(0.0)
+            continue
+        score = scores.get(name, 0.0)
+        required_scores.append(score)
+        if score < threshold:
             warnings.append(
-                f"'{_display_name(name)}' confidence {scores[name]:.0%} is below the "
+                f"'{_display_name(name)}' confidence {score:.0%} is below the "
                 f"{threshold:.0%} threshold."
             )
-
-    required = [
-        0.0 if getattr(second, name) is None else scores.get(name, 0.0)
-        for name in REQUIRED_FIELDS
-    ]
+    po_score = scores.get("purchase_order_number", 0.0)
+    if result.purchase_order_number and po_score < threshold:
+        warnings.append(
+            f"'purchase order number' confidence {po_score:.0%} is below the "
+            f"{threshold:.0%} threshold."
+        )
     return replace(
-        second,
-        model=label,
+        result,
         warnings=tuple(warnings),
-        field_confidences=scores,
-        confidence=min(required, default=0.0),
+        confidence=min(required_scores, default=0.0),
         needs_review=bool(warnings),
     )
 

@@ -779,6 +779,23 @@ def test_confident_disagreement_between_the_models_needs_review(
     assert result.field_confidences["invoice_value"] <= 0.60
 
 
+def test_a_field_below_the_threshold_is_warned_about_once_after_escalation(
+    tmp_path: Path,
+) -> None:
+    # The stronger model also reads the total with only medium certainty, and
+    # differently. The threshold rule is applied once, to the final answer.
+    first = llm_data(invoice_value=field(1250.75, "medium"))
+    second = llm_data(invoice_value=field(1520.75, "medium"))
+    extractor, _ = cascade(first, second)
+
+    result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    below = [warning for warning in result.warnings if "below the" in warning]
+    assert len(below) == 1
+    assert result.needs_review is True
+    assert result.confidence == result.field_confidences["invoice_value"]
+
+
 def test_unreadable_first_answer_is_escalated(tmp_path: Path) -> None:
     client = RoutedClient({FIRST: llm_data(), SECOND: llm_data()})
     original = client.create
@@ -1106,7 +1123,7 @@ def test_supplier_is_checked_against_the_document_as_printed_not_as_registered(
     reference = ReferenceData(suppliers=(("Smith & Sons Limited", ()),))
     text = "Invoice from SMITH AND SONS LTD invoice number INV-1001 total 1250.75 " * 3
 
-    result = extractor._to_result(
+    result = extractor._read(
         llm_data(
             supplier=field("Smith and Sons Ltd"),
             supplier_invoice_number=field("INV-1001"),
