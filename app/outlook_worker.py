@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONCURRENCY = 3
 DEFAULT_STALE_PROCESSING_SECONDS = 900.0
+# Extraction normally takes well under a minute; an invoice still waiting after
+# this long lost its extraction (network drop, crash) and nothing else retries it.
+DEFAULT_STUCK_EXTRACTION_SECONDS = 900.0
 CANCELLED_CLAIM_NOTE = (
     "The worker stopped before finishing this item; it was returned to the queue."
 )
@@ -167,16 +170,18 @@ class OutlookInvoiceWorker:
         return queued
 
     @staticmethod
-    def _local_polling_start() -> datetime:
+    def _local_polling_start(catch_up_days: int = 0) -> datetime:
+        """Start of the polling window: midnight (London) today, moved back by
+        the lookback setting or ``catch_up_days``, whichever is longer."""
         lookback_days = env_int("OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS", 0)
         if lookback_days < 0:
             raise RuntimeError(
                 "OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS cannot be negative."
             )
         local_now = datetime.now(ZoneInfo("Europe/London"))
-        local_start = (local_now - timedelta(days=lookback_days)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        local_start = (
+            local_now - timedelta(days=max(lookback_days, catch_up_days))
+        ).replace(hour=0, minute=0, second=0, microsecond=0)
         return local_start.astimezone(timezone.utc)
 
     async def process_next(self) -> bool:
@@ -373,6 +378,32 @@ class OutlookInvoiceWorker:
     def reclaim_stale_notifications(self, older_than_seconds: float) -> int:
         return int(self.notification_store.reclaim_stale(older_than_seconds))
 
+    async def retry_stuck_extractions(self, older_than_seconds: float) -> int:
+        """Run extraction again for invoices left in Awaiting AI Extraction
+        (the extraction failed after the invoice was registered, for example
+        on a network drop). Returns how many were retried."""
+        if self.extraction_runner is None:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+        stuck = [
+            record
+            for record in await asyncio.to_thread(
+                self.invoice_store.list_all_with_status, [Status.AWAITING_EXTRACTION]
+            )
+            if _as_utc(record.created_at) <= cutoff
+        ]
+        for record in stuck:
+            try:
+                await asyncio.to_thread(self.extraction_runner, record.id)
+            except Exception as error:
+                # Left as it is: the next sweep tries again.
+                logger.warning(
+                    "Retrying extraction of invoice %s failed: %s", record.id, error
+                )
+        if stuck:
+            logger.info("Retried extraction of %d stuck invoice(s).", len(stuck))
+        return len(stuck)
+
     async def scan_sharepoint_incoming(self) -> int:
         if self.incoming_monitor is None:
             return 0
@@ -464,8 +495,13 @@ class WorkerLoopSettings:
     heartbeat_seconds: float = 30.0
     local_polling_enabled: bool = False
     local_polling_limit: int = 20
+    # The first mailbox poll after a start looks back this many days, so
+    # invoices that arrived while the worker was down are not missed.
+    local_polling_catch_up_days: int = 3
     stale_processing_seconds: float = DEFAULT_STALE_PROCESSING_SECONDS
     stale_check_seconds: float = 60.0
+    stuck_extraction_seconds: float = DEFAULT_STUCK_EXTRACTION_SECONDS
+    stuck_extraction_check_seconds: float = 300.0
 
     @classmethod
     def from_environment(cls) -> WorkerLoopSettings:
@@ -482,10 +518,21 @@ class WorkerLoopSettings:
             ).lower()
             in {"1", "true", "yes"},
             local_polling_limit=env_int("OUTLOOK_LOCAL_POLLING_LIMIT", 20),
+            local_polling_catch_up_days=max(
+                0, env_int("OUTLOOK_LOCAL_POLLING_CATCH_UP_DAYS", 3)
+            ),
+            stuck_extraction_seconds=env_float(
+                "STUCK_EXTRACTION_RETRY_SECONDS", DEFAULT_STUCK_EXTRACTION_SECONDS
+            ),
             stale_processing_seconds=env_float(
                 "OUTLOOK_PROCESSING_STALE_SECONDS", DEFAULT_STALE_PROCESSING_SECONDS
             ),
         )
+
+
+def _as_utc(timestamp: str) -> datetime:
+    parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _due(last: float | None, interval: float, now: float) -> bool:
@@ -514,6 +561,8 @@ async def run_worker_loop(
     last_scan: float | None = None
     last_reminder_scan: float | None = None
     last_stale_check: float | None = None
+    last_stuck_extraction_check: float | None = None
+    caught_up = False
     while not stop_event.is_set():
         processed = False
         try:
@@ -532,9 +581,33 @@ async def run_worker_loop(
                     )
             processed = await worker.process_next()
             if not processed and settings.local_polling_enabled and not stop_event.is_set():
+                received_since = (
+                    None
+                    if caught_up
+                    else OutlookInvoiceWorker._local_polling_start(
+                        settings.local_polling_catch_up_days
+                    )
+                )
                 processed = (
-                    await worker.enqueue_from_mailbox(settings.local_polling_limit)
+                    await worker.enqueue_from_mailbox(
+                        settings.local_polling_limit, received_since=received_since
+                    )
                 ) > 0
+                caught_up = True
+            if (
+                not stop_event.is_set()
+                and settings.stuck_extraction_seconds > 0
+                and _due(
+                    last_stuck_extraction_check,
+                    settings.stuck_extraction_check_seconds,
+                    clock(),
+                )
+            ):
+                last_stuck_extraction_check = clock()
+                retried = await worker.retry_stuck_extractions(
+                    settings.stuck_extraction_seconds
+                )
+                processed = processed or retried > 0
             if not stop_event.is_set() and _due(
                 last_scan, settings.sharepoint_scan_seconds, clock()
             ):

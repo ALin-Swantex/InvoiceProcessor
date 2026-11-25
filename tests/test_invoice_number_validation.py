@@ -122,3 +122,40 @@ def test_confirmation_rejects_uncorrected_supplier_invoice_number(
             invoice_value=100.0,
             currency="GBP",
         )
+
+
+@pytest.mark.parametrize(
+    ("value", "sources"),
+    [
+        # Today's real invoices: the number read is in the file name.
+        ("335835", ("335835.pdf", None)),
+        ("2813266", ("15462462_2813266_1788162991.pdf", None)),
+        ("INV-21747", ("Invoice INV-21747.pdf", None)),
+        ("SI00055502", ("SalesInvoice_SI00055502.pdf", None)),
+        # Nothing similar in the file name or subject: nothing to say.
+        ("2930", ("Invoice_from_Tokolosh_Ltd.pdf", "Your invoice")),
+        ("123", ("124.pdf", None)),  # too short to judge
+        (None, ("335835.pdf", None)),
+    ],
+)
+def test_no_near_miss_warning(value: str | None, sources: tuple[str | None, ...]) -> None:
+    from app.invoice_number_validation import near_miss_number_warnings
+
+    assert near_miss_number_warnings(value, *sources) == []
+
+
+@pytest.mark.parametrize(
+    ("value", "sources", "suggested"),
+    [
+        ("335235", ("335835.pdf", None), "335835"),  # a misread seen live
+        ("335826", ("335828.pdf", None), "335828"),  # another one
+        ("INV-1001", ("scan.pdf", "Invoice INV-1007 attached"), "INV-1007"),
+    ],
+)
+def test_near_miss_warning(
+    value: str, sources: tuple[str | None, ...], suggested: str
+) -> None:
+    from app.invoice_number_validation import near_miss_number_warnings
+
+    [warning] = near_miss_number_warnings(value, *sources)
+    assert f"suggests '{suggested}'" in warning

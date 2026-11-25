@@ -16,7 +16,10 @@ from app.ai_extraction import (
 from app.document_classification import DocumentClassification
 from app.duplicates import duplicate_reference, find_possible_duplicate
 from app.invoices import InvoiceRecord
-from app.invoice_number_validation import invoice_number_warnings
+from app.invoice_number_validation import (
+    invoice_number_warnings,
+    near_miss_number_warnings,
+)
 from app.statuses import Status
 from app.lifecycle.common import (
     AUTO_CONFIRM_ACTOR,
@@ -133,6 +136,13 @@ class ExtractionStage(LifecycleBase):
                     if supplier_profile is not None
                     else None
                 ),
+            )
+        )
+        warnings.extend(
+            near_miss_number_warnings(
+                result.supplier_invoice_number,
+                invoice.original_filename,
+                invoice.subject,
             )
         )
         duplicate = None

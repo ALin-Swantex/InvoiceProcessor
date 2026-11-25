@@ -176,6 +176,8 @@ class FakeLoopWorker:
         self.scans = 0
         self.reminders = 0
         self.reclaims: list[float] = []
+        self.polled_since: list[datetime | None] = []
+        self.stuck_checks = 0
         self.on_process = None
 
     def reclaim_stale_notifications(self, older_than_seconds: float) -> int:
@@ -192,7 +194,14 @@ class FakeLoopWorker:
             self.on_process()
         return True
 
-    async def enqueue_from_mailbox(self, limit: int) -> int:
+    async def enqueue_from_mailbox(
+        self, limit: int, *, received_since: datetime | None = None
+    ) -> int:
+        self.polled_since.append(received_since)
+        return 0
+
+    async def retry_stuck_extractions(self, older_than_seconds: float) -> int:
+        self.stuck_checks += 1
         return 0
 
     async def scan_sharepoint_incoming(self) -> int:
@@ -411,3 +420,91 @@ def test_legacy_claim_without_timestamp_falls_back_to_received_at(tmp_path: Path
 
     assert store.reclaim_stale(900) == 1
     assert len(store.list(status="pending")) == 1
+
+
+def _idle_loop(worker: FakeLoopWorker, settings: WorkerLoopSettings, ticks: int) -> None:
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        original = worker.process_next
+        count = 0
+
+        async def counting_process_next() -> bool:
+            nonlocal count
+            count += 1
+            if count >= ticks:
+                stop.set()
+            return await original()
+
+        worker.process_next = counting_process_next  # type: ignore[method-assign]
+        await run_worker_loop(
+            worker, settings, stop_event=stop, clock=lambda: worker.clock[0]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_first_mailbox_poll_catches_up_on_days_the_worker_was_down() -> None:
+    worker = FakeLoopWorker([0.0])
+    settings = WorkerLoopSettings(
+        poll_seconds=0, local_polling_enabled=True, local_polling_catch_up_days=3
+    )
+
+    _idle_loop(worker, settings, ticks=4)
+
+    first, *later = worker.polled_since
+    assert first is not None
+    assert datetime.now(timezone.utc) - first >= timedelta(days=3)
+    assert later and all(since is None for since in later)  # then the usual window
+
+
+def test_stuck_extraction_sweep_runs_on_its_own_interval() -> None:
+    worker = FakeLoopWorker([0.0])
+    settings = WorkerLoopSettings(poll_seconds=0, stuck_extraction_check_seconds=10)
+
+    _idle_loop(worker, settings, ticks=25)  # one simulated second per tick
+
+    assert worker.stuck_checks == 3  # t=1, 11, 21
+
+
+def test_invoices_stuck_in_extraction_are_retried(tmp_path: Path) -> None:
+    store = InvoiceStore(tmp_path / "invoices.db")
+    pdf = tmp_path / "invoice.pdf"
+    pdf.write_bytes(VALID_PDF_BYTES)
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    stuck = store.add_from_outlook(
+        message={"id": "message-1"},
+        attachment={"id": "attachment-1", "name": "invoice.pdf", "size": 10},
+        stored_path=pdf,
+        created_at=old,
+    )
+    fresh = store.add_from_outlook(
+        message={"id": "message-2"},
+        attachment={"id": "attachment-2", "name": "invoice.pdf", "size": 10},
+        stored_path=pdf,
+    )
+    done = store.add_from_outlook(
+        message={"id": "message-3"},
+        attachment={"id": "attachment-3", "name": "invoice.pdf", "size": 10},
+        stored_path=pdf,
+        created_at=old,
+    )
+    store.update_fields(done.id, status="Needs Review")
+    retried: list[int] = []
+
+    def runner(invoice_id: int) -> None:
+        retried.append(invoice_id)
+        if invoice_id == stuck.id:
+            raise RuntimeError("network still down")  # logged, tried again later
+
+    worker = OutlookInvoiceWorker(
+        OutlookNotificationStore(tmp_path / "notifications.db"),
+        store,
+        ManyAttachmentRetriever(tmp_path, 0),
+        runner,
+    )
+
+    count = asyncio.run(worker.retry_stuck_extractions(900))
+
+    assert count == 1
+    assert retried == [stuck.id]  # not the fresh one (may be mid-extraction)
+    assert fresh.id not in retried and done.id not in retried

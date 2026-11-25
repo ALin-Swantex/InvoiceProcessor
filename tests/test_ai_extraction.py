@@ -1322,6 +1322,21 @@ def test_unexpected_error_in_auto_confirm_leaves_invoice_in_needs_review(
     assert "ON CONFLICT" in str(held.review_reason)
 
 
+def test_number_near_the_file_name_holds_auto_confirm(tmp_path: Path) -> None:
+    # A scan of 'INV-1007.pdf' read as INV-1001: no text layer to check
+    # against, so the file name is the only cross-check.
+    extractor, _ = extractor_for(llm_data())
+    lifecycle, invoices, invoice_id = lifecycle_for(tmp_path, extractor)
+    invoices.update_fields(invoice_id, original_filename="INV-1007.pdf")
+    calls = _with_auto_confirm(lifecycle, True)
+
+    result = lifecycle.run_extraction(invoice_id)
+
+    assert result.status == "Needs Review"
+    assert calls == []
+    assert "suggests 'INV-1007'" in str(result.ai_review_warnings)
+
+
 def test_output_schema_stays_within_the_api_union_limit() -> None:
     """The live API rejects a structured-output schema with more than 16
     parameters typed as a union (anyOf or a list of types) with HTTP 400."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,11 @@ from app.invoices import (
     MetricInvoice,
     _norm,
 )
-from app.postgres_migrate import MIGRATIONS_DIRECTORY, apply_migrations
+from app.postgres_migrate import (
+    MIGRATIONS_DIRECTORY,
+    apply_migrations,
+    require_migrations_applied,
+)
 from app.postgres_settings import (
     ConnectionFactory,
     PostgresSettings,
@@ -21,6 +26,8 @@ from app.postgres_settings import (
 )
 from app.statuses import Status
 
+
+logger = logging.getLogger("invoice_processor")
 
 _RECORD_COLUMNS = tuple(InvoiceRecord.__dataclass_fields__)
 _UPDATABLE_COLUMNS = frozenset(_RECORD_COLUMNS) - {"id"}
@@ -439,7 +446,24 @@ def create_postgres_invoice_store(
     auto_migrate = environment.get(
         "AZURE_POSTGRES_AUTO_MIGRATE", "false"
     ).strip().lower() in {"1", "true", "yes"}
-    return PostgresInvoiceStore(
+    store = PostgresInvoiceStore(
         PostgresSettings.from_env(environment),
         initialize_schema=initialize_schema and auto_migrate,
     )
+    if initialize_schema and not auto_migrate:
+        from psycopg import OperationalError
+        from psycopg_pool import PoolTimeout
+
+        try:
+            require_migrations_applied(
+                store._connection_factory, store._migrations_directory
+            )
+        except (OperationalError, PoolTimeout) as error:
+            # An unreachable database is reported per request (503); do not
+            # stop the app from starting over it.
+            logger.warning(
+                "Could not check database migrations (%s: %s).",
+                type(error).__name__,
+                error,
+            )
+    return store

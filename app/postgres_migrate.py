@@ -60,6 +60,38 @@ def apply_migrations(
                 )
 
 
+def pending_migrations(
+    connection_factory: ConnectionFactory,
+    migrations_directory: Path = MIGRATIONS_DIRECTORY,
+) -> list[str]:
+    """Migration files not yet recorded in schema_migrations (read-only)."""
+    names = sorted(path.name for path in migrations_directory.glob("*.sql"))
+    with connection_factory() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('schema_migrations') AS name")
+            row = cursor.fetchone()
+            if row is None or row["name"] is None:
+                return names
+            cursor.execute("SELECT version FROM schema_migrations")
+            applied = {row["version"] for row in cursor.fetchall()}
+    return [name for name in names if name not in applied]
+
+
+def require_migrations_applied(
+    connection_factory: ConnectionFactory,
+    migrations_directory: Path = MIGRATIONS_DIRECTORY,
+) -> None:
+    """Refuse to start against a database the code is newer than: the missing
+    tables or indexes would otherwise only fail later, mid-workflow."""
+    missing = pending_migrations(connection_factory, migrations_directory)
+    if missing:
+        raise RuntimeError(
+            "The database is missing migration(s) "
+            + ", ".join(missing)
+            + ". Apply them first with: python -m app.postgres_migrate"
+        )
+
+
 def main() -> None:
     load_project_environment()
     try:
