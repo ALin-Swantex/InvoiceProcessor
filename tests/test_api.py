@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+import re
 from typing import cast
 
 from fastapi.testclient import TestClient
@@ -31,152 +31,164 @@ def client_for(tmp_path) -> TestClient:
     )
 
 
-def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
-    client = client_for(tmp_path)
-
+def interface_text(client: TestClient) -> str:
+    """The page plus every stylesheet and script it loads, with runs of
+    whitespace collapsed so indentation and file boundaries do not matter."""
     page = client.get("/")
     assert page.status_code == 200
-    stylesheet = client.get("/static/app.css")
-    script = client.get("/static/app.js")
-    assert stylesheet.status_code == 200
-    assert script.status_code == 200
-    assert '<link rel="stylesheet" href="/static/app.css">' in page.text
-    assert '<script src="/static/app.js"></script>' in page.text
-    # The page, stylesheet and script together make up the interface.
-    home = SimpleNamespace(text=page.text + stylesheet.text + script.text)
-    assert "<h1>Swantex</h1>" in home.text
-    assert "Continue with Microsoft 365" in home.text
-    assert "Protected by Microsoft Entra ID" in home.text
-    assert "OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED" not in home.text
-    assert '<aside class="sidebar">' in home.text
-    assert 'data-tab="needs-review"' in home.text
-    assert home.text.index('data-tab="search"') < home.text.index('data-tab="incoming"')
-    assert home.text.index('data-tab="statements"') < home.text.index('data-tab="incoming"')
-    assert 'data-tab="statements"' in home.text
-    assert "Flagged Documents — Purchase Ledger Review" in home.text
-    assert 'id="payment-method"' in home.text
-    assert '<select id="admin-import-company" required>' in home.text
-    assert "Supplier payment settings" in home.text
-    assert "<h3>Users</h3>" not in home.text
-    assert "<h3>Microsoft 365 roles</h3>" not in home.text
-    assert 'id="admin-user-form"' not in home.text
-    assert 'id="admin-bi-metrics"' in home.text
-    assert 'id="metrics-granularity"' in home.text
-    assert "Invoice volume interval" in home.text
-    assert "Total pending invoice value by company" in home.text
-    assert "Spend by supplier and company" in home.text
-    assert "function loadMetrics()" in home.text
-    assert "async function readResponseBody(response)" in home.text
-    assert '<details class="admin-block admin-collapsible">' in home.text
-    assert "<summary>Companies</summary>" in home.text
-    assert 'id="admin-company-root-folder" required disabled' in home.text
-    assert '<select id="admin-supplier-default-company">' in home.text
-    assert 'id="admin-supplier-invoice-pattern"' in home.text
-    assert "# = digit, @ = letter, * = letter or digit" in home.text
-    assert '<select id="admin-matrix-company" required>' in home.text
-    assert '<select id="admin-matrix-supplier" required>' in home.text
-    assert "All invoice companies" in home.text
-    assert 'id="admin-edit-dialog"' in home.text
-    assert "function openAdminEditor" in home.text
-    assert 'data-edit-index="${index}"' in home.text
-    assert '${escapeHtml(c.value(row) ?? "—")}' in home.text
-    assert 'data-delete-index="${index}"' in home.text
-    assert "${escapeHtml(r.reason)}</li>" in home.text
-    assert "supplier companies already exist" in home.text
-    assert 'formData.set("replace_existing", "true")' in home.text
-    assert '.join("\\n")' in home.text
-    assert 'id="admin-company-folder-preview"' in home.text
-    assert "Statement classification" in home.text
-    assert "IRJ number" in home.text
-    assert "Company being invoiced" in home.text
-    assert '<select id="preview-company">' in home.text
-    assert '<select id="preview-supplier" disabled>' in home.text
-    assert "Purchase Ledger confirmation (editable" not in home.text
-    assert "Invoice details (AI-extracted — review and correct before confirming)" in home.text
-    assert "Outlook email and PDF data will be loaded here." not in home.text
-    assert 'id="intake-notice"' not in home.text
-    assert "function renderCompanyGroupedTables" in home.text
-    assert "function suppliersGroupedByCompany" in home.text
-    assert "function refreshAdminMatrixSupplierOptions" in home.text
-    assert "/api/suppliers?company=${encodeURIComponent(company)}" in home.text
-    assert "Supplier invoice number" in home.text
-    assert "Purchase Order number" in home.text
-    assert "Invoice value" in home.text
-    assert "Overall confidence" in home.text
-    assert "PDF and extracted fields" in home.text
-    assert '${expanded ? "Hide" : "Show"} details' in home.text
-    assert "function invoiceAnalysisHtml" in home.text
-    assert "function invoiceHistoryHtml(invoice)" in home.text
-    assert "function invoiceAuditHtml(invoice)" in home.text
-    assert "function formatUkTimestamp(value)" in home.text
-    assert 'timeZone: "Europe/London"' in home.text
-    assert 'notes.join("\\n\\n")' in home.text
-    assert '${invoice.approver1_name || "Approval"} note' in home.text
-    assert '${invoice.approver2_name || "Approval"} note' in home.text
-    assert "Description and history" in home.text
-    assert "<h4>Audit trail</h4>" in home.text
-    assert "Approval query / on hold" in home.text
-    assert "Payment and reconciliation" in home.text
-    assert 'id="supplier-match-prompt"' in home.text
-    assert "function suggestedSupplier(extractedSupplier, suppliers)" in home.text
-    assert "Is this" in home.text
-    assert "not registered for" in home.text
-    assert 'data-expand-invoice="${invoice.id}"' in home.text
-    assert 'class="row-action-buttons"' in home.text
-    assert 'class="action-link"' in home.text
-    assert 'button.setAttribute("aria-busy", "true")' in home.text
-    assert 'button.textContent = "Working…"' in home.text
-    assert 'class="invoice-analysis-pdf"' in home.text
-    assert "Extracted invoice analysis" in home.text
-    assert "File as statement" in home.text
-    assert 'data-action="reject-flagged"' in home.text
-    assert "/api/invoices/${id}/reject-flagged" in home.text
-    assert "/api/invoices/${id}/file-statement" in home.text
-    assert "/api/invoices/${id}/mark-as-invoice" in home.text
-    assert "Search invoices" in home.text
-    assert 'data-tab="payment-bacs"' in home.text
-    assert 'data-tab="payment-bankline"' in home.text
-    assert 'data-tab="payment-foreign-poa"' in home.text
-    assert "Appeared on bank statement" in home.text
-    assert "Marked reconciled" in home.text
-    assert "Uploaded '${record.original_filename}' to ${destination}." in home.text
-    assert "Statements/{Company}" in home.text
-    assert 'id="statement-company"' in home.text
-    assert 'fetch("/api/statements")' in home.text
-    assert 'const ACTIVE_TAB_STORAGE_KEY = "invoice-processor-active-tab"' in home.text
-    assert 'fetch(\n                  "/api/invoices?limit=500",\n                  { cache: "no-store" }' in home.text
-    assert "function clearInvoicePreview()" in home.text
-    assert "function connectLiveUpdates()" in home.text
-    assert "new EventSource(" in home.text
-    assert 'activityEventSource.addEventListener("invoice-update"' in home.text
-    assert "window.setInterval(loadInvoices, 120000)" in home.text
-    assert "metricsRefreshTimer = window.setTimeout(loadMetrics, 3000)" in home.text
-    assert (
-        'id="admin-companies-config"' in home.text
-        and "loadSharePointFolderOptions();" in home.text
+    assets = re.findall(
+        r'<(?:link rel="stylesheet" href|script src)="(/static/[^"]+)"', page.text
     )
-    assert "function isFlaggedInvoice(invoice)" in home.text
-    assert 'return invoice.status === "Needs Review";' in home.text
-    assert "function invoiceDescription(invoice)" in home.text
-    assert "Flagged:" in home.text
-    assert "mini-description" in home.text
-    assert "let openedFlaggedInvoiceId = null;" in home.text
-    assert "openedFlaggedInvoiceId = id;" in home.text
-    assert "const invoiceId = displayedInvoiceId;" in home.text
-    assert 'document.addEventListener("visibilitychange"' in home.text
-    assert "window.clearInterval(invoicePollTimer)" in home.text
-    assert "let renderedInvoiceSnapshot = null;" in home.text
-    assert "if (refreshedSnapshot === renderedInvoiceSnapshot) return;" in home.text
-    assert "function activateTab(tab)" in home.text
-    assert 'window.addEventListener("beforeunload"' in home.text
-    assert "/api/invoice-search/filter?${params}" in home.text
-    assert "Purchase Ledger: confirm invoice" in home.text
-    assert 'id="delete-invoice-button" style="display:none">Delete duplicate' in home.text
-    assert 'sendJson(`/api/invoices/${invoice.id}`, "DELETE")' in home.text
-    assert "Manually add an invoice to Incoming Invoices" in home.text
-    assert "Confirmation and automatic routing" not in home.text
-    assert "Purchase Order number detected" not in home.text
-    assert "Simulate incoming email" not in home.text
+    assert any(asset.endswith(".js") for asset in assets)
+    parts = [page.text]
+    for asset in assets:
+        response = client.get(asset)
+        assert response.status_code == 200, asset
+        parts.append(response.text)
+    return " ".join("\n".join(parts).split())
+
+
+def test_invoice_review_interface_contains_required_sections(tmp_path) -> None:
+    client = client_for(tmp_path)
+    text = interface_text(client)
+
+    def has(snippet: str) -> bool:
+        return " ".join(snippet.split()) in text
+
+    assert has('<link rel="stylesheet" href="/static/app.css">')
+    assert has("<h1>Swantex</h1>")
+    assert has("Continue with Microsoft 365")
+    assert has("Protected by Microsoft Entra ID")
+    assert not has("OUTLOOK INTAKE CONNECTED - AI NOT CONNECTED")
+    assert has('<aside class="sidebar">')
+    assert has('data-tab="needs-review"')
+    assert text.index('data-tab="search"') < text.index('data-tab="incoming"')
+    assert text.index('data-tab="statements"') < text.index('data-tab="incoming"')
+    assert has('data-tab="statements"')
+    assert has("Flagged Documents — Purchase Ledger Review")
+    assert has('id="payment-method"')
+    assert has('<select id="admin-import-company" required>')
+    assert has("Supplier payment settings")
+    assert not has("<h3>Users</h3>")
+    assert not has("<h3>Microsoft 365 roles</h3>")
+    assert not has('id="admin-user-form"')
+    assert has('id="admin-bi-metrics"')
+    assert has('id="metrics-granularity"')
+    assert has("Invoice volume interval")
+    assert has("Total pending invoice value by company")
+    assert has("Spend by supplier and company")
+    assert has("function loadMetrics()")
+    assert has("async function readResponseBody(response)")
+    assert has('<details class="admin-block admin-collapsible">')
+    assert has("<summary>Companies</summary>")
+    assert has('id="admin-company-root-folder" required disabled')
+    assert has('<select id="admin-supplier-default-company">')
+    assert has('id="admin-supplier-invoice-pattern"')
+    assert has("# = digit, @ = letter, * = letter or digit")
+    assert has('<select id="admin-matrix-company" required>')
+    assert has('<select id="admin-matrix-supplier" required>')
+    assert has("All invoice companies")
+    assert has('id="admin-edit-dialog"')
+    assert has("function openAdminEditor")
+    assert has('data-edit-index="${index}"')
+    assert has('${escapeHtml(c.value(row) ?? "—")}')
+    assert has('data-delete-index="${index}"')
+    assert has("${escapeHtml(r.reason)}</li>")
+    assert has("supplier companies already exist")
+    assert has('formData.set("replace_existing", "true")')
+    assert has('.join("\\n")')
+    assert has('id="admin-company-folder-preview"')
+    assert has("Statement classification")
+    assert has("IRJ number")
+    assert has("Company being invoiced")
+    assert has('<select id="preview-company">')
+    assert has('<select id="preview-supplier" disabled>')
+    assert not has("Purchase Ledger confirmation (editable")
+    assert has("Invoice details (AI-extracted — review and correct before confirming)")
+    assert not has("Outlook email and PDF data will be loaded here.")
+    assert not has('id="intake-notice"')
+    assert has("function renderCompanyGroupedTables")
+    assert has("function suppliersGroupedByCompany")
+    assert has("function refreshAdminMatrixSupplierOptions")
+    assert has("/api/suppliers?company=${encodeURIComponent(company)}")
+    assert has("Supplier invoice number")
+    assert has("Purchase Order number")
+    assert has("Invoice value")
+    assert has("Overall confidence")
+    assert has("PDF and extracted fields")
+    assert has('${expanded ? "Hide" : "Show"} details')
+    assert has("function invoiceAnalysisHtml")
+    assert has("function invoiceHistoryHtml(invoice)")
+    assert has("function invoiceAuditHtml(invoice)")
+    assert has("function formatUkTimestamp(value)")
+    assert has('timeZone: "Europe/London"')
+    assert has('notes.join("\\n\\n")')
+    assert has('${invoice.approver1_name || "Approval"} note')
+    assert has('${invoice.approver2_name || "Approval"} note')
+    assert has("Description and history")
+    assert has("<h4>Audit trail</h4>")
+    assert has("Approval query / on hold")
+    assert has("Payment and reconciliation")
+    assert has('id="supplier-match-prompt"')
+    assert has("function suggestedSupplier(extractedSupplier, suppliers)")
+    assert has("Is this")
+    assert has("not registered for")
+    assert has('data-expand-invoice="${invoice.id}"')
+    assert has('class="row-action-buttons"')
+    assert has('class="action-link"')
+    assert has('button.setAttribute("aria-busy", "true")')
+    assert has('button.textContent = "Working…"')
+    assert has('class="invoice-analysis-pdf"')
+    assert has("Extracted invoice analysis")
+    assert has("File as statement")
+    assert has('data-action="reject-flagged"')
+    assert has("/api/invoices/${id}/reject-flagged")
+    assert has("/api/invoices/${id}/file-statement")
+    assert has("/api/invoices/${id}/mark-as-invoice")
+    assert has("Search invoices")
+    assert has('data-tab="payment-bacs"')
+    assert has('data-tab="payment-bankline"')
+    assert has('data-tab="payment-foreign-poa"')
+    assert has("Appeared on bank statement")
+    assert has("Marked reconciled")
+    assert has("Uploaded '${record.original_filename}' to ${destination}.")
+    assert has("Statements/{Company}")
+    assert has('id="statement-company"')
+    assert has('fetch("/api/statements")')
+    assert has('const ACTIVE_TAB_STORAGE_KEY = "invoice-processor-active-tab"')
+    assert has('fetch(\n                  "/api/invoices?limit=500",\n                  { cache: "no-store" }')
+    assert has("function clearInvoicePreview()")
+    assert has("function connectLiveUpdates()")
+    assert has("new EventSource(")
+    assert has('activityEventSource.addEventListener("invoice-update"')
+    assert has("window.setInterval(loadInvoices, 120000)")
+    assert has("metricsRefreshTimer = window.setTimeout(loadMetrics, 3000)")
+    assert (
+        has('id="admin-companies-config"')
+        and has("loadSharePointFolderOptions();")
+    )
+    assert has("function isFlaggedInvoice(invoice)")
+    assert has('return invoice.status === "Needs Review";')
+    assert has("function invoiceDescription(invoice)")
+    assert has("Flagged:")
+    assert has("mini-description")
+    assert has("let openedFlaggedInvoiceId = null;")
+    assert has("openedFlaggedInvoiceId = id;")
+    assert has("const invoiceId = displayedInvoiceId;")
+    assert has('document.addEventListener("visibilitychange"')
+    assert has("window.clearInterval(invoicePollTimer)")
+    assert has("let renderedInvoiceSnapshot = null;")
+    assert has("if (refreshedSnapshot === renderedInvoiceSnapshot) return;")
+    assert has("function activateTab(tab)")
+    assert has('window.addEventListener("beforeunload"')
+    assert has("/api/invoice-search/filter?${params}")
+    assert has("Purchase Ledger: confirm invoice")
+    assert has('id="delete-invoice-button" style="display:none">Delete duplicate')
+    assert has('sendJson(`/api/invoices/${invoice.id}`, "DELETE")')
+    assert has("Manually add an invoice to Incoming Invoices")
+    assert not has("Confirmation and automatic routing")
+    assert not has("Purchase Order number detected")
+    assert not has("Simulate incoming email")
 
 
 def test_simulated_email_endpoint_does_not_exist(tmp_path) -> None:

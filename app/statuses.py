@@ -1,6 +1,6 @@
 """Every invoice status, in workflow order.
 
-The values are stored in the database and shown in the UI (app/static/app.js
+The values are stored in the database and shown in the UI (app/static/js/core.js
 uses the same strings), so they must never change.
 """
 

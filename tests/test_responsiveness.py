@@ -88,14 +88,14 @@ def test_activity_latest_requires_login(tmp_path: Path) -> None:
 def test_static_assets_are_gzipped_and_revalidate(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
-    script = client.get("/static/app.js", headers={"Accept-Encoding": "gzip"})
+    script = client.get("/static/js/sections.js", headers={"Accept-Encoding": "gzip"})
     assert script.status_code == 200
     assert script.headers["content-encoding"] == "gzip"
     assert script.headers["cache-control"] == "no-cache"
     etag = script.headers["etag"]
 
     revalidated = client.get(
-        "/static/app.js",
+        "/static/js/sections.js",
         headers={"Accept-Encoding": "gzip", "If-None-Match": etag},
     )
     assert revalidated.status_code == 304
