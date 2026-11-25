@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.activity_feed import EMAIL_CLAIM_STALE_SECONDS, ActivityEvent
+from app.irj import is_irj_number
 from app.postgres_settings import (
     ConnectionFactory,
     PostgresSettings,
@@ -135,7 +136,7 @@ class PostgresIrjNumberGenerator:
     @staticmethod
     def _validate_number(irj_number: str) -> int:
         normalized = irj_number.strip()
-        if len(normalized) != 6 or not normalized.isdigit():
+        if not is_irj_number(normalized):
             raise ValueError("The IRJ number must contain exactly six digits.")
         return int(normalized)
 

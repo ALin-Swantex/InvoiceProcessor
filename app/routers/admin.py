@@ -43,6 +43,7 @@ from app.schemas import (
     ThresholdUpdateRequest,
 )
 from app.sharepoint import SharePointError
+from app.irj import is_irj_number
 
 router = APIRouter()
 
@@ -527,7 +528,7 @@ def admin_set_irj_configuration(
         )
     if request.current_irj is not None:
         current_irj = request.current_irj.strip()
-        if len(current_irj) != 6 or not current_irj.isdigit():
+        if not is_irj_number(current_irj):
             raise HTTPException(
                 status_code=422,
                 detail="The latest paper IRJ must contain exactly six digits.",

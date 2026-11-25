@@ -27,6 +27,31 @@ async def _json_body(request: Request) -> object:
         ) from error
 
 
+async def _graph_batch(
+    request: Request, invalid_payload: str
+) -> tuple[str, list[object]]:
+    """The configured client state and the batch's ``value`` list."""
+    expected_client_state = str(request.app.state.webhook_client_state)
+    if not expected_client_state:
+        raise HTTPException(
+            status_code=503,
+            detail="Outlook webhook client state is not configured.",
+        )
+    payload = await _json_body(request)
+    notifications = payload.get("value") if isinstance(payload, dict) else None
+    if not isinstance(notifications, list):
+        raise HTTPException(status_code=400, detail=invalid_payload)
+    return expected_client_state, notifications
+
+
+def _check_client_state(
+    notification: dict[str, object], expected: str, invalid_detail: str
+) -> None:
+    received = notification.get("clientState")
+    if not isinstance(received, str) or not secrets.compare_digest(received, expected):
+        raise HTTPException(status_code=401, detail=invalid_detail)
+
+
 @router.post("/api/outlook/notifications")
 async def outlook_notifications(
     request: Request,
@@ -36,19 +61,9 @@ async def outlook_notifications(
     if validation_token is not None:
         return PlainTextResponse(validation_token)
 
-    expected_client_state = str(app.state.webhook_client_state)
-    if not expected_client_state:
-        raise HTTPException(
-            status_code=503,
-            detail="Outlook webhook client state is not configured.",
-        )
-
-    payload = await _json_body(request)
-    notifications = payload.get("value") if isinstance(payload, dict) else None
-    if not isinstance(notifications, list):
-        raise HTTPException(
-            status_code=400, detail="Invalid Microsoft Graph notification payload."
-        )
+    expected_client_state, notifications = await _graph_batch(
+        request, "Invalid Microsoft Graph notification payload."
+    )
 
     # Validate the whole batch before enqueuing anything: a rejected batch
     # is retried by Graph, so a partial enqueue would be queued twice.
@@ -56,13 +71,9 @@ async def outlook_notifications(
     for notification in notifications:
         if not isinstance(notification, dict):
             continue
-        received_client_state = notification.get("clientState")
-        if not isinstance(received_client_state, str) or not secrets.compare_digest(
-            received_client_state, expected_client_state
-        ):
-            raise HTTPException(
-                status_code=401, detail="Invalid notification client state."
-            )
+        _check_client_state(
+            notification, expected_client_state, "Invalid notification client state."
+        )
 
         message_id = extract_message_id(notification)
         subscription_id = notification.get("subscriptionId")
@@ -104,33 +115,20 @@ async def outlook_lifecycle(
     background_tasks: BackgroundTasks,
     validation_token: str | None = Query(None, alias="validationToken"),
 ) -> Response:
-    app = request.app
     if validation_token is not None:
         return PlainTextResponse(validation_token)
 
-    expected_client_state = str(app.state.webhook_client_state)
-    if not expected_client_state:
-        raise HTTPException(
-            status_code=503,
-            detail="Outlook webhook client state is not configured.",
-        )
-    payload = await _json_body(request)
-    notifications = payload.get("value") if isinstance(payload, dict) else None
-    if not isinstance(notifications, list):
-        raise HTTPException(
-            status_code=400, detail="Invalid lifecycle notification payload."
-        )
+    expected_client_state, notifications = await _graph_batch(
+        request, "Invalid lifecycle notification payload."
+    )
     for notification in notifications:
         if not isinstance(notification, dict):
             continue
-        received_client_state = notification.get("clientState")
-        if not isinstance(received_client_state, str) or not secrets.compare_digest(
-            received_client_state, expected_client_state
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid lifecycle notification client state.",
-            )
+        _check_client_state(
+            notification,
+            expected_client_state,
+            "Invalid lifecycle notification client state.",
+        )
     for notification in notifications:
         if isinstance(notification, dict):
             # After the 202: a renewal is a Graph call, and Microsoft expects

@@ -4,6 +4,11 @@ import sqlite3
 from pathlib import Path
 
 
+def is_irj_number(value: str) -> bool:
+    """An IRJ number is exactly six digits (the caller strips whitespace)."""
+    return len(value) == 6 and value.isdigit()
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS irj_sequence (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -149,7 +154,7 @@ class IrjNumberGenerator:
     @staticmethod
     def _validate_number(irj_number: str) -> int:
         normalized = irj_number.strip()
-        if len(normalized) != 6 or not normalized.isdigit():
+        if not is_irj_number(normalized):
             raise ValueError("The IRJ number must contain exactly six digits.")
         return int(normalized)
 

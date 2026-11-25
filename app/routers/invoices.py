@@ -47,6 +47,7 @@ from app.schemas import (
 from app.sharepoint import SharePointError
 from app.sharepoint_intake import SharePointIncomingMonitor
 from app.workflow import ConfirmedInvoice, RoutingValidationError, route_confirmed_invoice
+from app.irj import is_irj_number
 
 router = APIRouter()
 
@@ -347,7 +348,7 @@ def search_invoice_by_irj(
 ) -> dict[str, object]:
     app = http_request.app
     normalized = irj_number.strip()
-    if len(normalized) != 6 or not normalized.isdigit():
+    if not is_irj_number(normalized):
         raise HTTPException(
             status_code=422,
             detail="An IRJ number must contain exactly six digits.",
@@ -385,9 +386,7 @@ def filter_invoices(
     normalized_irj = irj_number.strip() if irj_number else None
     normalized_company = company.strip().casefold() if company else None
     normalized_supplier = supplier.strip().casefold() if supplier else None
-    if normalized_irj and (
-        len(normalized_irj) != 6 or not normalized_irj.isdigit()
-    ):
+    if normalized_irj and not is_irj_number(normalized_irj):
         raise HTTPException(
             status_code=422,
             detail="An IRJ number must contain exactly six digits.",

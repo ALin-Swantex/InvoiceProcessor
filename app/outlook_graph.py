@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import httpx
 
+from app.environment import env_int
 from app.graph_http import (
     GraphSession,
     MsalClientCredentialTokenProvider,
@@ -468,12 +469,8 @@ def settings_from_environment() -> OutlookSettings:
         download_directory=Path(
             os.environ.get("OUTLOOK_DOWNLOAD_DIR", "outlook_downloads")
         ),
-        max_pdf_bytes=int(
-            os.environ.get("OUTLOOK_MAX_PDF_BYTES", str(20 * 1024 * 1024))
-        ),
-        max_excel_bytes=int(
-            os.environ.get("OUTLOOK_MAX_EXCEL_BYTES", str(50 * 1024 * 1024))
-        ),
+        max_pdf_bytes=env_int("OUTLOOK_MAX_PDF_BYTES", 20 * 1024 * 1024),
+        max_excel_bytes=env_int("OUTLOOK_MAX_EXCEL_BYTES", 50 * 1024 * 1024),
         excel_conversion_drive_id=os.environ.get(
             "EXCEL_CONVERSION_DRIVE_ID",
             os.environ.get("SHAREPOINT_DRIVE_ID", ""),

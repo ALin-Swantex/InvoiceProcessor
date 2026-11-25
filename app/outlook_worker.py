@@ -14,7 +14,12 @@ from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from app.ai_extraction import ai_extraction_configured
-from app.environment import load_project_environment, project_path_from_environment
+from app.environment import (
+    env_float,
+    env_int,
+    load_project_environment,
+    project_path_from_environment,
+)
 from app.invoice_lifecycle import InvoiceLifecycle
 from app.invoices import InvoiceStore
 from app.outlook_graph import (
@@ -36,26 +41,6 @@ DEFAULT_STALE_PROCESSING_SECONDS = 900.0
 CANCELLED_CLAIM_NOTE = (
     "The worker stopped before finishing this item; it was returned to the queue."
 )
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError as error:
-        raise RuntimeError(f"{name} must be a number.") from error
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError as error:
-        raise RuntimeError(f"{name} must be a whole number.") from error
 
 
 @dataclass(frozen=True)
@@ -151,7 +136,7 @@ class OutlookInvoiceWorker:
         self.incoming_monitor = incoming_monitor
         self.scheduled_notification_runner = scheduled_notification_runner
         if concurrency is None:
-            concurrency = _env_int("OUTLOOK_WORKER_CONCURRENCY", DEFAULT_CONCURRENCY)
+            concurrency = env_int("OUTLOOK_WORKER_CONCURRENCY", DEFAULT_CONCURRENCY)
         self.concurrency = max(1, concurrency)
         self.claim_keepalive_seconds = claim_keepalive_seconds
 
@@ -183,14 +168,7 @@ class OutlookInvoiceWorker:
 
     @staticmethod
     def _local_polling_start() -> datetime:
-        try:
-            lookback_days = int(
-                os.environ.get("OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS", "0")
-            )
-        except ValueError as error:
-            raise RuntimeError(
-                "OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS must be a whole number."
-            ) from error
+        lookback_days = env_int("OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS", 0)
         if lookback_days < 0:
             raise RuntimeError(
                 "OUTLOOK_LOCAL_POLLING_LOOKBACK_DAYS cannot be negative."
@@ -359,9 +337,9 @@ class OutlookInvoiceWorker:
             await asyncio.to_thread(self.extraction_runner, record.id)
 
     def _start_claim_keepalive(self, notification_id: int) -> asyncio.Task[None] | None:
-        touch = getattr(self.notification_store, "touch_claim", None)
+        touch = self.notification_store.touch_claim
         interval = self.claim_keepalive_seconds
-        if touch is None or not interval or interval <= 0:
+        if not interval or interval <= 0:
             return None
 
         async def keep_alive() -> None:
@@ -393,10 +371,7 @@ class OutlookInvoiceWorker:
             )
 
     def reclaim_stale_notifications(self, older_than_seconds: float) -> int:
-        reclaim = getattr(self.notification_store, "reclaim_stale", None)
-        if reclaim is None:
-            return 0
-        return int(reclaim(older_than_seconds))
+        return int(self.notification_store.reclaim_stale(older_than_seconds))
 
     async def scan_sharepoint_incoming(self) -> int:
         if self.incoming_monitor is None:
@@ -494,20 +469,20 @@ class WorkerLoopSettings:
 
     @classmethod
     def from_environment(cls) -> WorkerLoopSettings:
-        poll_seconds = _env_float("OUTLOOK_WORKER_POLL_SECONDS", 2.0)
+        poll_seconds = env_float("OUTLOOK_WORKER_POLL_SECONDS", 2.0)
         return cls(
             poll_seconds=poll_seconds,
             # Unset -> same cadence as queue polling (previous behaviour).
-            sharepoint_scan_seconds=_env_float(
+            sharepoint_scan_seconds=env_float(
                 "SHAREPOINT_INCOMING_POLL_SECONDS", poll_seconds
             ),
-            reminder_scan_seconds=_env_float("APPROVAL_REMINDER_SCAN_SECONDS", 300.0),
+            reminder_scan_seconds=env_float("APPROVAL_REMINDER_SCAN_SECONDS", 300.0),
             local_polling_enabled=os.environ.get(
                 "OUTLOOK_LOCAL_POLLING_ENABLED", "false"
             ).lower()
             in {"1", "true", "yes"},
-            local_polling_limit=_env_int("OUTLOOK_LOCAL_POLLING_LIMIT", 20),
-            stale_processing_seconds=_env_float(
+            local_polling_limit=env_int("OUTLOOK_LOCAL_POLLING_LIMIT", 20),
+            stale_processing_seconds=env_float(
                 "OUTLOOK_PROCESSING_STALE_SECONDS", DEFAULT_STALE_PROCESSING_SECONDS
             ),
         )

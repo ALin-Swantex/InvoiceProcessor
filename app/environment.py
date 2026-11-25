@@ -48,3 +48,23 @@ def project_path_from_environment(name: str, default: str) -> Path:
     if path.is_absolute():
         return path
     return Path(__file__).resolve().parents[1] / path
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be a number.") from error
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be a whole number.") from error

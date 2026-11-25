@@ -23,6 +23,7 @@ from app.lifecycle.common import (
     _is_unique_violation,
 )
 from app.lifecycle.base import LifecycleBase
+from app.irj import is_irj_number
 
 
 class ConfirmationStage(LifecycleBase):
@@ -378,7 +379,7 @@ class ConfirmationStage(LifecycleBase):
                 f"(status: {invoice.status})."
             )
         normalized_irj = irj_number.strip()
-        if len(normalized_irj) != 6 or not normalized_irj.isdigit():
+        if not is_irj_number(normalized_irj):
             raise InvoiceLifecycleError(
                 "The IRJ number must contain exactly six digits."
             )
