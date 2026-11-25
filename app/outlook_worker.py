@@ -340,6 +340,7 @@ class OutlookInvoiceWorker:
                     source_attachment=prepared.attachment,
                     content=prepared.content,
                     event_type="outlook_intake",
+                    check_identical_pdf=True,
                 )
             finally:
                 # Intake keeps its own copy; a retry downloads again.

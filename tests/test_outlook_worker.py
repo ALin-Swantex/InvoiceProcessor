@@ -364,6 +364,7 @@ def test_outlook_intake_flags_identical_pdf_before_extraction(
         source_attachment={"id": "new-attachment", "name": "resent.pdf"},
         content=VALID_PDF_BYTES,
         event_type="outlook_intake",
+        check_identical_pdf=True,
     )
 
     assert duplicate is not None
@@ -419,6 +420,7 @@ def test_identical_pdf_stays_flagged_when_the_flagged_move_fails(
             source_attachment={"id": "new-attachment", "name": "resent.pdf"},
             content=VALID_PDF_BYTES,
             event_type="outlook_intake",
+            check_identical_pdf=True,
         )
 
     record = invoices.get_by_sharepoint_item_id("new-sharepoint-item")

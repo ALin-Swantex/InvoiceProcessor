@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from threading import Lock
 from time import monotonic
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import quote
 
 import httpx
@@ -63,6 +63,9 @@ class SharePointClient:
     ) -> None:
         sharepoint_settings.validate()
         self.settings = sharepoint_settings
+        self._drive_url = (
+            f"{GRAPH_BASE_URL}/drives/{quote(sharepoint_settings.drive_id, safe='')}"
+        )
         self.token_provider = token_provider or default_token_provider(outlook_settings)
         self.http_client = http_client or httpx.Client(timeout=60.0)
         self.session = GraphSession(
@@ -99,9 +102,8 @@ class SharePointClient:
 
     def list_incoming_pdfs(self) -> list[dict[str, Any]]:
         """Return PDFs currently waiting in the configured Incoming folder."""
-        drive_id = quote(self.settings.drive_id, safe="")
         folder = quote(str(PurePosixPath(self.settings.incoming_folder)), safe="/")
-        url = f"{GRAPH_BASE_URL}/drives/{drive_id}/root:/{folder}:/children"
+        url = f"{self._drive_url}/root:/{folder}:/children"
         params: dict[str, str] = {
             "$select": "id,name,size,file,webUrl,createdDateTime",
             "$top": "200",
@@ -126,26 +128,18 @@ class SharePointClient:
 
     def download_item(self, item_id: str) -> bytes:
         """Download a DriveItem by ID for processing or preview caching."""
-        url = (
-            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
-            f"items/{quote(item_id, safe='')}/content"
-        )
         return self.session.request(
             "GET",
-            url,
+            f"{self._item_url(item_id)}/content",
             operation="SharePoint invoice download",
             follow_redirects=True,
         ).content
 
     def delete_item(self, item_id: str) -> None:
         """Permanently delete a DriveItem from the configured library."""
-        url = (
-            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
-            f"items/{quote(item_id, safe='')}"
-        )
         self.session.request(
             "DELETE",
-            url,
+            self._item_url(item_id),
             operation="SharePoint invoice deletion",
             ok_statuses={404},
         )
@@ -164,10 +158,7 @@ class SharePointClient:
         Returns the updated Graph DriveItem.
         """
         folder_id = self._ensure_folder(destination_folder)
-        url = (
-            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
-            f"items/{quote(source_item_id, safe='')}"
-        )
+        url = self._item_url(source_item_id)
         payload: dict[str, Any] = {
             "parentReference": {"id": folder_id},
             "name": destination_filename,
@@ -177,28 +168,6 @@ class SharePointClient:
         with self._cache_lock:
             self._statement_library_cache.clear()
         return response.json()
-
-    def upload_and_move(
-        self,
-        *,
-        filename: str,
-        content: bytes,
-        destination_folder: str,
-        destination_filename: str,
-    ) -> dict[str, Any]:
-        """Upload a PDF to incoming, then immediately move it to the
-        destination folder with the correct filename.
-
-        This is the main entry point called after routing confirmation.
-        Returns the final Graph DriveItem (post-move).
-        """
-        item = self.upload_to_incoming(filename, content)
-        item_id = item.get("id")
-        if not isinstance(item_id, str) or not item_id:
-            raise SharePointError(
-                "SharePoint did not return a valid item ID after upload."
-            )
-        return self.move_to_folder(item_id, destination_folder, destination_filename)
 
     def get_item_web_url(self, item: dict[str, Any]) -> str | None:
         return item.get("webUrl") if isinstance(item.get("webUrl"), str) else None
@@ -216,20 +185,12 @@ class SharePointClient:
             if cached is not None and monotonic() - cached[0] < self._cache_ttl_seconds:
                 return list(cached[1])
 
-        drive_prefix = (
-            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
-        )
         paths: set[str] = set()
-        for payload in self.session.paginate(
-            f"{drive_prefix}/root/delta",
-            params={"$top": "200"},
+        for page in self._delta_pages(
+            {"$top": "200"},
             operation="SharePoint folder inventory",
+            invalid_response="SharePoint returned an invalid folder inventory response.",
         ):
-            page = payload.get("value", [])
-            if not isinstance(page, list):
-                raise SharePointError(
-                    "SharePoint returned an invalid folder inventory response."
-                )
             for item in page:
                 if (
                     not isinstance(item, dict)
@@ -237,15 +198,9 @@ class SharePointClient:
                     or "deleted" in item
                 ):
                     continue
-                name = item.get("name")
-                parent = item.get("parentReference")
-                if not isinstance(name, str) or not isinstance(parent, dict):
+                path = self._drive_path(item)
+                if path is None:
                     continue
-                parent_path = parent.get("path")
-                if not isinstance(parent_path, str) or "/root:" not in parent_path:
-                    continue
-                relative_parent = parent_path.partition("/root:")[2].strip("/")
-                path = str(PurePosixPath(relative_parent) / name)
                 paths.add(path)
                 if len(paths) > max_folders:
                     raise SharePointError(
@@ -274,25 +229,17 @@ class SharePointClient:
             if cached is not None and monotonic() - cached[0] < self._cache_ttl_seconds:
                 return self._copy_statement_library(cached[1])
 
-        drive_prefix = (
-            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
-        )
         library: dict[str, list[dict[str, Any]]] = {}
         item_count = 0
         params = {
             "$select": "id,name,size,file,folder,webUrl,createdDateTime,lastModifiedDateTime,parentReference,deleted",
             "$top": "200",
         }
-        for payload in self.session.paginate(
-            f"{drive_prefix}/root/delta",
-            params=params,
+        for page in self._delta_pages(
+            params,
             operation="SharePoint statement library listing",
+            invalid_response="SharePoint returned an invalid statement library response.",
         ):
-            page = payload.get("value", [])
-            if not isinstance(page, list):
-                raise SharePointError(
-                    "SharePoint returned an invalid statement library response."
-                )
             item_count += len(page)
             if item_count > max_items:
                 raise SharePointError(
@@ -301,15 +248,10 @@ class SharePointClient:
             for item in page:
                 if not isinstance(item, dict) or "deleted" in item:
                     continue
-                name = item.get("name")
-                parent = item.get("parentReference")
-                if not isinstance(name, str) or not isinstance(parent, dict):
+                item_path = self._drive_path(item)
+                if item_path is None:
                     continue
-                parent_path = parent.get("path")
-                if not isinstance(parent_path, str) or "/root:" not in parent_path:
-                    continue
-                relative_parent = parent_path.partition("/root:")[2].strip("/")
-                item_path = str(PurePosixPath(relative_parent) / name)
+                name = item["name"]
                 parts = PurePosixPath(item_path).parts
                 if len(parts) == 2 and parts[0].casefold() == normalized_root.casefold():
                     if isinstance(item.get("folder"), dict):
@@ -348,6 +290,38 @@ class SharePointClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _item_url(self, item_id: str) -> str:
+        return f"{self._drive_url}/items/{quote(item_id, safe='')}"
+
+    def _delta_pages(
+        self,
+        params: dict[str, str],
+        *,
+        operation: str,
+        invalid_response: str,
+    ) -> Iterator[list[Any]]:
+        """Yield each page of the drive-wide delta listing."""
+        for payload in self.session.paginate(
+            f"{self._drive_url}/root/delta", params=params, operation=operation
+        ):
+            page = payload.get("value", [])
+            if not isinstance(page, list):
+                raise SharePointError(invalid_response)
+            yield page
+
+    @staticmethod
+    def _drive_path(item: dict[str, Any]) -> str | None:
+        """The item's path relative to the drive root, when Graph reports one."""
+        name = item.get("name")
+        parent = item.get("parentReference")
+        if not isinstance(name, str) or not isinstance(parent, dict):
+            return None
+        parent_path = parent.get("path")
+        if not isinstance(parent_path, str) or "/root:" not in parent_path:
+            return None
+        relative_parent = parent_path.partition("/root:")[2].strip("/")
+        return str(PurePosixPath(relative_parent) / name)
+
     def _upload(
         self,
         folder_path: str,
@@ -361,8 +335,7 @@ class SharePointClient:
         safe_folder = str(PurePosixPath(folder_path))
         safe_filename = quote(filename, safe="")
         url = (
-            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}/"
-            f"root:/{quote(safe_folder, safe='/')}/"
+            f"{self._drive_url}/root:/{quote(safe_folder, safe='/')}/"
             f"{safe_filename}:/content"
         )
         # A PUT to a fixed path that replaces (or fails on conflict) is safe to
@@ -423,13 +396,10 @@ class SharePointClient:
     def _get_or_create_folder(
         self, name: str, *, parent_id: str | None
     ) -> str:
-        drive_prefix = (
-            f"{GRAPH_BASE_URL}/drives/{quote(self.settings.drive_id, safe='')}"
-        )
         if parent_id is None:
-            url = f"{drive_prefix}/root/children"
+            url = f"{self._drive_url}/root/children"
         else:
-            url = f"{drive_prefix}/items/{quote(parent_id, safe='')}/children"
+            url = f"{self._item_url(parent_id)}/children"
 
         existing_id = self._find_child_folder(url, name)
         if existing_id is not None:

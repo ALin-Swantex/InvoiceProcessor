@@ -95,7 +95,11 @@ class SharePointIncomingMonitor:
         source_attachment: dict[str, object] | None = None,
         content: bytes | None = None,
         event_type: str = "sharepoint_intake",
+        check_identical_pdf: bool = False,
     ) -> InvoiceRecord | None:
+        """Register one Incoming DriveItem. ``check_identical_pdf`` flags a
+        byte-for-byte resend of an earlier invoice for duplicate review; only
+        Outlook intake asks for it."""
         item_id = self._required_string(item, "id")
         existing = self.invoice_store.get_by_sharepoint_item_id(item_id)
         if existing is not None:
@@ -160,7 +164,7 @@ class SharePointIncomingMonitor:
             # same file. Only the process whose insert created the row goes
             # on to duplicate checks and extraction.
             return None
-        if event_type == "outlook_intake":
+        if check_identical_pdf:
             duplicate = self._find_identical_pdf(record, pdf_content)
             if duplicate is not None:
                 reference = duplicate_reference(duplicate.id, duplicate.irj_number)

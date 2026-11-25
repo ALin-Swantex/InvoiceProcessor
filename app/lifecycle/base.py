@@ -247,20 +247,14 @@ class LifecycleBase:
             )
             return
         try:
-            if invoice.sharepoint_item_id:
-                item = self.sharepoint_client.move_to_folder(
-                    invoice.sharepoint_item_id,
-                    destination_folder,
-                    destination_filename,
-                )
-            else:
-                pdf_bytes = Path(invoice.stored_path).read_bytes()
-                item = self.sharepoint_client.upload_and_move(
-                    filename=invoice.original_filename,
-                    content=pdf_bytes,
-                    destination_folder=destination_folder,
-                    destination_filename=destination_filename,
-                )
+            item_id = invoice.sharepoint_item_id
+            if not item_id:
+                item_id = self._upload_to_incoming(invoice)
+            item = self.sharepoint_client.move_to_folder(
+                item_id,
+                destination_folder,
+                destination_filename,
+            )
             item_id = item.get("id")
             if not isinstance(item_id, str) or not item_id:
                 raise SharePointError(
@@ -280,6 +274,25 @@ class LifecycleBase:
             raise InvoiceLifecycleError(
                 f"SharePoint filing failed; invoice status was not advanced: {error}"
             ) from error
+
+    def _upload_to_incoming(self, invoice: InvoiceRecord) -> str:
+        """Upload a PDF that has no DriveItem yet and record the item at once,
+        so a failed move cannot leave an unregistered copy in Incoming."""
+        assert self.sharepoint_client is not None
+        item = self.sharepoint_client.upload_to_incoming(
+            invoice.original_filename, Path(invoice.stored_path).read_bytes()
+        )
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            raise SharePointError(
+                "SharePoint did not return a valid item ID after upload."
+            )
+        self.invoice_store.update_fields(
+            invoice.id,
+            sharepoint_item_id=item_id,
+            sharepoint_web_url=self.sharepoint_client.get_item_web_url(item),
+        )
+        return item_id
 
     def _company_folders(self, invoice: InvoiceRecord) -> CompanyFolderStructure:
         if not invoice.company:

@@ -445,3 +445,59 @@ def test_a_second_action_on_a_claimed_invoice_is_refused(
     assert seen == ["Processing Update"]
     assert record.status == "Reconciled / Complete"
     assert record.reconciliation_notes == "first"
+
+
+def test_a_failed_move_after_upload_keeps_the_sharepoint_item(tmp_path: Path) -> None:
+    """An invoice with no DriveItem is uploaded to Incoming, then moved. If the
+    move fails, the record must already point at the uploaded item: otherwise
+    the next Incoming scan registers that PDF as a second invoice, and a retry
+    uploads it again."""
+    import httpx
+
+    from app.outlook_graph import OutlookSettings
+    from app.sharepoint import SharePointClient, SharePointSettings
+    from app.sharepoint_intake import SharePointIncomingMonitor
+
+    lifecycle, store, invoice_id = _lifecycle(tmp_path)
+    requests: list[str] = []
+    move_fails = [True]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        if request.method == "PUT":
+            return httpx.Response(200, json={"id": "item-1", "name": "invoice.pdf"})
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"value": [{"id": "paid", "name": "Paid", "folder": {}}]}
+            )
+        if move_fails:
+            move_fails.pop()
+            return httpx.Response(400, json={"error": {"code": "invalidRequest"}})
+        return httpx.Response(200, json={"id": "item-1", "webUrl": "https://sp/paid"})
+
+    client = SharePointClient(
+        SharePointSettings(site_id="site", drive_id="drive", incoming_folder="Incoming"),
+        OutlookSettings(
+            tenant_id="tenant",
+            client_id="client",
+            client_secret="secret",
+            mailbox="invoices@example.test",
+            download_directory=tmp_path,
+        ),
+        token_provider=lambda: "token",
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+    lifecycle.sharepoint_client = client
+    invoice = store.get(invoice_id)
+
+    with pytest.raises(InvoiceLifecycleError, match="SharePoint filing failed"):
+        lifecycle._move_pdf_in_sharepoint(invoice, "Paid", "invoice.pdf")
+
+    assert store.get(invoice_id).sharepoint_item_id == "item-1"
+    monitor = SharePointIncomingMonitor(client, store, cache_directory=tmp_path / "cache")
+    assert monitor.ingest_item({"id": "item-1", "name": "invoice.pdf"}) is None
+    assert len(store.list()) == 1
+
+    lifecycle._move_pdf_in_sharepoint(store.get(invoice_id), "Paid", "invoice.pdf")
+    assert requests.count("PUT") == 1
+    assert store.get(invoice_id).sharepoint_web_url == "https://sp/paid"
