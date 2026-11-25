@@ -1,3 +1,27 @@
+// Opens a <dialog> holding its own form. Resolves to what submit()
+// returns, or null when cancelled or closed; submit() returning
+// undefined keeps the dialog open (for example to show an error).
+function modalForm(dialog, form, cancelButton, submit) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    form.onsubmit = event => {
+      event.preventDefault();
+      const value = submit();
+      if (value === undefined) return;
+      dialog.close();
+      finish(value);
+    };
+    cancelButton.onclick = () => dialog.close();
+    dialog.onclose = () => finish(null);
+    dialog.showModal();
+  });
+}
+
 async function collectDomesticPayment(invoice) {
   const response = await fetch(
     `/api/supplier-terms?company=${encodeURIComponent(invoice.company || "")}` +
@@ -35,28 +59,12 @@ async function collectDomesticPayment(invoice) {
       : formatMoney(invoice.invoice_value, invoice.currency),
   ].filter(Boolean).join(" · ");
 
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = value => {
-      if (settled) return;
-      settled = true;
-      resolve(value);
-    };
-    form.onsubmit = event => {
-      event.preventDefault();
-      const payment = {
-        payment_date: document.getElementById("payment-date").value,
-        supplier_account_number: account.value || null,
-        payment_reference: document.getElementById("payment-reference").value,
-        payment_method: method.value,
-      };
-      dialog.close();
-      finish(payment);
-    };
-    document.getElementById("payment-cancel").onclick = () => dialog.close();
-    dialog.onclose = () => finish(null);
-    dialog.showModal();
-  });
+  return modalForm(dialog, form, document.getElementById("payment-cancel"), () => ({
+    payment_date: document.getElementById("payment-date").value,
+    supplier_account_number: account.value || null,
+    payment_reference: document.getElementById("payment-reference").value,
+    payment_method: method.value,
+  }));
 }
 
 // The IRJ mode per company (automatic or manual from paper
@@ -88,28 +96,16 @@ async function collectSageRegistration(invoice) {
     : "This IRJ was allocated automatically.";
   errorEl.textContent = "";
 
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = value => {
-      if (settled) return;
-      settled = true;
-      resolve(value);
-    };
-    form.onsubmit = event => {
-      event.preventDefault();
-      const irjNumber = irjInput.value.trim();
-      if (!/^\d{6}$/.test(irjNumber)) {
-        errorEl.textContent = "Enter exactly six digits.";
-        return;
-      }
-      dialog.close();
-      finish(irjNumber);
-    };
-    document.getElementById("sage-registration-cancel").onclick = () => dialog.close();
-    dialog.onclose = () => finish(null);
-    dialog.showModal();
-    irjInput.focus();
+  const result = modalForm(dialog, form, document.getElementById("sage-registration-cancel"), () => {
+    const irjNumber = irjInput.value.trim();
+    if (!/^\d{6}$/.test(irjNumber)) {
+      errorEl.textContent = "Enter exactly six digits.";
+      return undefined;
+    }
+    return irjNumber;
   });
+  irjInput.focus();
+  return result;
 }
 
 // ---------------------------------------------------------

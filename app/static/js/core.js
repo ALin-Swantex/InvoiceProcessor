@@ -454,16 +454,21 @@ async function sendJson(url, method, body) {
   if (!response.ok) {
     throw new Error(detail.detail || `Request failed (${response.status}).`);
   }
-  showUpdatedInvoice(detail);
   return detail;
 }
 
-// An action's reply is the updated invoice. Show it straight away
-// instead of waiting for the full list to reload.
+// An invoice action's reply is the updated invoice. Show it straight
+// away instead of waiting for the full list to reload.
+async function invoiceAction(url, body) {
+  const record = await sendJson(url, "POST", body);
+  showUpdatedInvoice(record);
+  return record;
+}
+
 function showUpdatedInvoice(record) {
   if (!record || typeof record !== "object") return;
   if (!Number.isInteger(record.id) || typeof record.status !== "string") return;
-  if (!("message_id" in record)) return;
+  if (!("message_id" in record)) return;  // not a full invoice record
   const index = invoices.findIndex(invoice => invoice.id === record.id);
   if (index === -1) return;
   invoices[index] = record;

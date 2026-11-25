@@ -508,12 +508,7 @@ document.getElementById("confirm-supplier-match").addEventListener(
 
 function updateCounts() {
   for (const tab of Object.keys(SECTION_STATUSES)) {
-    const count = tab === "incoming"
-      ? incomingInvoices().length
-      : invoices.filter(i =>
-          SECTION_STATUSES[tab].includes(i.status) &&
-          (tab !== "on-hold" || i.status.includes("On Hold") || i.hold_level)
-        ).length;
+    const count = sectionInvoices(tab).length;
     const el = document.getElementById(`count-${tab}`);
     if (el) {
       el.textContent = String(count);
@@ -749,7 +744,7 @@ document.getElementById("flag-review-button").addEventListener("click", async ()
   });
   if (!reason) return;
   try {
-    await postJson(`/api/invoices/${invoiceId}/flag-review`, { reason });
+    await invoiceAction(`/api/invoices/${invoiceId}/flag-review`, { reason });
     await loadInvoices();
   } catch (error) {
     showToast(error.message, true);
@@ -798,7 +793,7 @@ document.getElementById("cancel-duplicate-button").addEventListener("click", asy
     tone: "danger",
   })) return;
   try {
-    await postJson(`/api/invoices/${invoiceId}/cancel-duplicate`, {});
+    await invoiceAction(`/api/invoices/${invoiceId}/cancel-duplicate`, {});
     showToast("Duplicate invoice cancelled.");
     await loadInvoices();
   } catch (error) {
@@ -811,7 +806,7 @@ document.getElementById("retry-approval-route-button").addEventListener("click",
   if (!invoice || !invoice.irj_number) return;
   await withBusyButton(event.currentTarget, async () => {
     try {
-      await postJson(`/api/invoices/${invoice.id}/register-sage`, {
+      await invoiceAction(`/api/invoices/${invoice.id}/register-sage`, {
         irj_number: invoice.irj_number,
       });
       showToast("Approver route checked again.");
@@ -845,7 +840,7 @@ async function submitConfirm(overrideDuplicate) {
     correction_reason: document.getElementById("correction-reason").value || null,
   };
   try {
-    await postJson(`/api/invoices/${invoiceId}/confirm`, body);
+    await invoiceAction(`/api/invoices/${invoiceId}/confirm`, body);
     openedFlaggedInvoiceId = null;
     showToast("Invoice routed successfully.");
     await loadInvoices();

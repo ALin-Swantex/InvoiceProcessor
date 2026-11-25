@@ -78,9 +78,9 @@ function elementsMatching(root, selector) {
   return matches;
 }
 
-function bindInvoiceRowEvents(root, containerId) {
-  // Every row repeats "View PDF", "Approve", "Reject"…; name the
-  // invoice so each control makes sense out of context.
+// Every row repeats "View PDF", "Approve", "Reject"…; name the
+// invoice so each control makes sense out of context.
+function labelInvoiceRows(root) {
   elementsMatching(root, "tr[data-expand-invoice]").forEach(row => {
     const invoice = invoices.find(
       item => String(item.id) === String(row.dataset.expandInvoice)
@@ -96,31 +96,7 @@ function bindInvoiceRowEvents(root, containerId) {
       select.setAttribute("aria-label", `Statement company for ${name}`);
     });
   });
-  elementsMatching(root, "[data-action]").forEach(button => {
-    button.addEventListener("click", () => handleRowAction(button));
-  });
   populateStatementCompanySelects(root);
-  elementsMatching(root, "[data-expand-invoice]").forEach(row => {
-    const toggle = event => {
-      if (event.target.closest("button, a, input, select, textarea")) return;
-      if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
-      event.preventDefault();
-      const id = String(row.dataset.expandInvoice);
-      if (expandedInvoiceIds.has(id)) {
-        expandedInvoiceIds.delete(id);
-      } else {
-        expandedInvoiceIds.add(id);
-      }
-      renderAllSections();
-      if (event.type === "keydown") {
-        document.getElementById(containerId)
-          ?.querySelector(`[data-expand-invoice="${CSS.escape(id)}"]`)
-          ?.focus();
-      }
-    };
-    row.addEventListener("click", toggle);
-    row.addEventListener("keydown", toggle);
-  });
 }
 
 function invoiceRowNodesFrom(tbody) {
@@ -134,18 +110,10 @@ function invoiceRowNodesFrom(tbody) {
   return rowNodes;
 }
 
-function renderSectionTable(
-  containerId,
-  statuses,
-  columns,
-  actionsFn,
-  rowFilter = () => true
-) {
+function renderSectionTable({ tab, containerId, columns, actions: actionsFn, empty }) {
   const container = document.getElementById(containerId);
   if (!container) return;
-  const rows = invoices.filter(
-    i => statuses.includes(i.status) && rowFilter(i)
-  );
+  const rows = sectionInvoices(tab);
   const context = sectionRenderContext();
   const rowSignatures = rows.map(invoice => JSON.stringify([
     invoice,
@@ -155,8 +123,7 @@ function renderSectionTable(
   const previous = renderedSectionState.get(containerId);
   if (previous && previous.signature === signature) return;
   if (!rows.length) {
-    const [emptyTitle, emptyDetail] = SECTION_EMPTY_COPY[containerId] ||
-      ["No documents in this section.", ""];
+    const [emptyTitle, emptyDetail] = empty;
     container.innerHTML = emptyStateHtml(emptyTitle, emptyDetail);
     renderedSectionState.set(containerId, { signature, tbody: null, rows: new Map() });
     return;
@@ -183,7 +150,7 @@ function renderSectionTable(
       const template = document.createElement("template");
       template.innerHTML = invoiceRowHtml(invoice, columns, actionsFn);
       const nodes = [...template.content.children];
-      nodes.forEach(node => bindInvoiceRowEvents(node, containerId));
+      nodes.forEach(node => labelInvoiceRows(node));
       const entry = { signature: rowSignatures[index], nodes };
       nextRows.set(id, entry);
       desired.push(nodes);
@@ -221,7 +188,7 @@ function renderSectionTable(
   }
   html += "</tbody></table></div>";
   container.innerHTML = html;
-  bindInvoiceRowEvents(container, containerId);
+  labelInvoiceRows(container);
   const tbody = container.querySelector("tbody");
   const rowNodes = invoiceRowNodesFrom(tbody);
   const renderedRows = new Map();
@@ -311,352 +278,419 @@ function sectionColumns(section, extra = []) {
   return [...base, ...extra];
 }
 
-const SECTION_EMPTY_COPY = {
-  "needs-review-table": ["Nothing flagged", "Documents the AI cannot route confidently, or that someone flags, will appear here for Purchase Ledger review."],
-  "po-matching-table": ["No invoices awaiting PO matching", "Invoices with a purchase order number arrive here after confirmation."],
-  "sage-registration-table": ["Nothing to register in Sage", "Confirmed nominal invoices appear here until their Sage registration and IRJ are confirmed."],
-  "approver1-table": ["No approvals waiting", "Invoices routed to you as first approver will appear here."],
-  "approver2-table": ["No approvals waiting", "Invoices that need a second approval will appear here."],
-  "on-hold-table": ["Nothing on hold", "Approval queries and routing issues will appear here until they are resolved."],
-  "approved-table": ["No approved invoices waiting", "Approved invoices pass through here on their way to a payment run."],
-  "payment-bacs-table": ["No BACS payments due", "Invoices routed for BACS payment will appear here."],
-  "payment-bankline-table": ["No Bankline payments due", "Invoices routed for Bankline payment will appear here."],
-  "payment-foreign-poa-table": ["No foreign payments due", "Foreign currency invoices awaiting payment or allocation will appear here."],
-  "reconciliation-table": ["Nothing to reconcile", "Paid invoices wait here until they appear on a bank statement."],
-  "complete-table": ["No completed documents yet", "Reconciled invoices and filed statements will appear here."],
-  "rejected-table": ["No rejected documents", "Rejected invoices and cancelled duplicates will appear here."],
-};
-
 function pdfLinkButton(invoice) {
   return `<a class="action-link" href="/api/invoices/${invoice.id}/pdf" ` +
     `target="_blank" rel="noopener">View PDF</a>`;
 }
 
-function renderAllSections() {
-  renderSectionTable(
-    "needs-review-table",
-    SECTION_STATUSES["needs-review"],
-    sectionColumns("needs-review", [
+function paymentRunActions(invoice) {
+  return `
+    ${pdfLinkButton(invoice)}
+    <button data-action="pay" data-id="${invoice.id}">Record payment</button>
+  `;
+}
+
+function approvalActions(level) {
+  return invoice => `
+    ${pdfLinkButton(invoice)}
+    <button data-action="approve" data-level="${level}" data-id="${invoice.id}">Approve</button>
+    ${invoice.hold_level === level ? "" : `
+      <button data-action="hold" data-level="${level}" data-id="${invoice.id}" class="secondary">Record query</button>
+    `}
+    <button data-action="reject" data-level="${level}" data-id="${invoice.id}" class="danger">Reject</button>
+  `;
+}
+
+const PAYMENT_ROUTE_COLUMN = { label: "Payment route", value: i => i.payment_method || "—" };
+
+// One entry per invoice queue. A queue lists the invoices whose
+// status is in SECTION_STATUSES[tab] (narrowed by `filter`) in the
+// table `#${tab}-table`. The tables, the nav counts and the empty
+// states all come from this list.
+const SECTIONS = [
+  {
+    tab: "needs-review",
+    filter: isFlaggedInvoice,
+    extraColumns: [
       { label: "Return stage", value: i => i.review_return_status || "Requires a dedicated resolution", className: "cell-note" },
-    ]),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                  ${invoice.document_type === "statement" ? `
-                    <button data-action="mark-invoice" data-id="${invoice.id}" class="secondary">Treat as invoice</button>
-                  ` : `
-                    <button data-action="open-review" data-id="${invoice.id}" class="secondary">Review</button>
-                  `}
-                  <select data-statement-company="${invoice.id}" aria-label="Statement company"></select>
-                  <button data-action="file-statement" data-id="${invoice.id}">File as statement</button>
-                  ${invoice.review_return_status ? `
-                    <button data-action="accept-review" data-id="${invoice.id}">Accept</button>
-                  ` : ""}
-                  ${invoice.document_type === "invoice" ? `
-                    <button data-action="reject-flagged" data-id="${invoice.id}" class="danger">Reject</button>
-                  ` : ""}
-                `,
-    isFlaggedInvoice
-  );
-  renderSectionTable(
-    "po-matching-table",
-    SECTION_STATUSES["po-matching"],
-    sectionColumns("po-matching", [
+    ],
+    actions: invoice => `
+      ${pdfLinkButton(invoice)}
+      ${invoice.document_type === "statement" ? `
+        <button data-action="mark-invoice" data-id="${invoice.id}" class="secondary">Treat as invoice</button>
+      ` : `
+        <button data-action="open-review" data-id="${invoice.id}" class="secondary">Review</button>
+      `}
+      <select data-statement-company="${invoice.id}" aria-label="Statement company"></select>
+      <button data-action="file-statement" data-id="${invoice.id}">File as statement</button>
+      ${invoice.review_return_status ? `
+        <button data-action="accept-review" data-id="${invoice.id}">Accept</button>
+      ` : ""}
+      ${invoice.document_type === "invoice" ? `
+        <button data-action="reject-flagged" data-id="${invoice.id}" class="danger">Reject</button>
+      ` : ""}
+    `,
+    empty: ["Nothing flagged", "Documents the AI cannot route confidently, or that someone flags, will appear here for Purchase Ledger review."],
+  },
+  {
+    tab: "po-matching",
+    extraColumns: [
       { label: "PO number", value: i => i.po_number || "—", className: "cell-ref" },
-    ]),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                  ${currentUser && currentUser.role === "purchasing" ? "" : `
-                    <button data-action="po-match" data-id="${invoice.id}">Mark matched</button>
-                    <button data-action="po-query" data-id="${invoice.id}">Record query</button>
-                    <button data-action="po-reject" data-id="${invoice.id}" class="danger">Reject</button>
-                  `}
-                `
-  );
-  renderSectionTable(
-    "sage-registration-table",
-    SECTION_STATUSES["sage-registration"],
-    sectionColumns("sage-registration"),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                  <button data-action="register-sage" data-id="${invoice.id}">Register in Sage</button>
-                `
-  );
-  renderSectionTable(
-    "approver1-table",
-    SECTION_STATUSES["approver1"],
-    sectionColumns("approver1"),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                  <button data-action="approve" data-level="1" data-id="${invoice.id}">Approve</button>
-                  ${invoice.hold_level === 1 ? "" : `
-                    <button data-action="hold" data-level="1" data-id="${invoice.id}" class="secondary">Record query</button>
-                  `}
-                  <button data-action="reject" data-level="1" data-id="${invoice.id}" class="danger">Reject</button>
-                `
-  );
-  renderSectionTable(
-    "approver2-table",
-    SECTION_STATUSES["approver2"],
-    sectionColumns("approver2"),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                  <button data-action="approve" data-level="2" data-id="${invoice.id}">Approve</button>
-                  ${invoice.hold_level === 2 ? "" : `
-                    <button data-action="hold" data-level="2" data-id="${invoice.id}" class="secondary">Record query</button>
-                  `}
-                  <button data-action="reject" data-level="2" data-id="${invoice.id}" class="danger">Reject</button>
-                `
-  );
-  renderSectionTable(
-    "on-hold-table",
-    SECTION_STATUSES["on-hold"],
-    sectionColumns("on-hold", [
+    ],
+    actions: invoice => `
+      ${pdfLinkButton(invoice)}
+      ${currentUser && currentUser.role === "purchasing" ? "" : `
+        <button data-action="po-match" data-id="${invoice.id}">Mark matched</button>
+        <button data-action="po-query" data-id="${invoice.id}">Record query</button>
+        <button data-action="po-reject" data-id="${invoice.id}" class="danger">Reject</button>
+      `}
+    `,
+    empty: ["No invoices awaiting PO matching", "Invoices with a purchase order number arrive here after confirmation."],
+  },
+  {
+    tab: "sage-registration",
+    actions: invoice => `
+      ${pdfLinkButton(invoice)}
+      <button data-action="register-sage" data-id="${invoice.id}">Register in Sage</button>
+    `,
+    empty: ["Nothing to register in Sage", "Confirmed nominal invoices appear here until their Sage registration and IRJ are confirmed."],
+  },
+  {
+    tab: "approver1",
+    actions: approvalActions(1),
+    empty: ["No approvals waiting", "Invoices routed to you as first approver will appear here."],
+  },
+  {
+    tab: "approver2",
+    actions: approvalActions(2),
+    empty: ["No approvals waiting", "Invoices that need a second approval will appear here."],
+  },
+  {
+    tab: "on-hold",
+    // The approval statuses are listed too, but only held ones belong here.
+    filter: invoice => invoice.status.includes("On Hold") || Boolean(invoice.hold_level),
+    extraColumns: [
       { label: "Payment method", value: i => i.payment_method || "—" },
-    ]),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                  ${invoice.status === "Payment Routing Issue / On Hold"
+    ],
+    actions: invoice => `
+      ${pdfLinkButton(invoice)}
+      ${invoice.status === "Payment Routing Issue / On Hold"
         ? `<button data-action="retry-payment-route" data-id="${invoice.id}">Retry routing</button>`
         : `<button data-action="resume" data-id="${invoice.id}">${invoice.status === "Workflow Issue / On Hold" ? "Resolve issue" : "Resume approval"}</button>`}
-                `,
-    invoice => invoice.status.includes("On Hold") || Boolean(invoice.hold_level)
-  );
-  renderSectionTable(
-    "approved-table",
-    SECTION_STATUSES["approved"],
-    sectionColumns("approved", [
+    `,
+    empty: ["Nothing on hold", "Approval queries and routing issues will appear here until they are resolved."],
+  },
+  {
+    tab: "approved",
+    extraColumns: [
       { label: "Payment method", value: i => i.payment_method || "Awaiting automatic routing" },
-    ]),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                `
-  );
-  for (const [containerId, section] of [
-    ["payment-bacs-table", "payment-bacs"],
-    ["payment-bankline-table", "payment-bankline"],
-    ["payment-foreign-poa-table", "payment-foreign-poa"],
-  ]) {
-    renderSectionTable(
-      containerId,
-      SECTION_STATUSES[section],
-      sectionColumns(section, [
-        { label: "Payment route", value: i => i.payment_method || "—" },
-      ]),
-      invoice => `
-                    ${pdfLinkButton(invoice)}
-                    <button data-action="pay" data-id="${invoice.id}">Record payment</button>
-                  `
-    );
-  }
-  renderSectionTable(
-    "reconciliation-table",
-    SECTION_STATUSES["reconciliation"],
-    sectionColumns("reconciliation", [
+    ],
+    actions: pdfLinkButton,
+    empty: ["No approved invoices waiting", "Approved invoices pass through here on their way to a payment run."],
+  },
+  {
+    tab: "payment-bacs",
+    extraColumns: [PAYMENT_ROUTE_COLUMN],
+    actions: paymentRunActions,
+    empty: ["No BACS payments due", "Invoices routed for BACS payment will appear here."],
+  },
+  {
+    tab: "payment-bankline",
+    extraColumns: [PAYMENT_ROUTE_COLUMN],
+    actions: paymentRunActions,
+    empty: ["No Bankline payments due", "Invoices routed for Bankline payment will appear here."],
+  },
+  {
+    tab: "payment-foreign-poa",
+    extraColumns: [PAYMENT_ROUTE_COLUMN],
+    actions: paymentRunActions,
+    empty: ["No foreign payments due", "Foreign currency invoices awaiting payment or allocation will appear here."],
+  },
+  {
+    tab: "reconciliation",
+    extraColumns: [
       { label: "Payment date", value: i => formatUkDate(i.payment_date), className: "cell-date" },
       { label: "Paid by", value: i => i.paid_by || "—" },
-    ]),
-    invoice => `
-                  ${pdfLinkButton(invoice)}
-                  <button data-action="reconcile" data-id="${invoice.id}">Mark reconciled</button>
-                `
-  );
-  renderSectionTable(
-    "complete-table",
-    SECTION_STATUSES["complete"],
-    sectionColumns("complete", [
+    ],
+    actions: invoice => `
+      ${pdfLinkButton(invoice)}
+      <button data-action="reconcile" data-id="${invoice.id}">Mark reconciled</button>
+    `,
+    empty: ["Nothing to reconcile", "Paid invoices wait here until they appear on a bank statement."],
+  },
+  {
+    tab: "complete",
+    extraColumns: [
       { label: "Marked reconciled", value: i => formatUkTimestamp(i.reconciled_at), className: "cell-date" },
       { label: "Appeared on bank statement", value: i => formatUkDate(i.reconciliation_date), className: "cell-date" },
       { label: "Completed by", value: i => i.reconciled_by || i.foreign_allocated_by || "—" },
-    ]),
-    invoice => pdfLinkButton(invoice)
-  );
-  renderSectionTable(
-    "rejected-table",
-    SECTION_STATUSES["rejected"],
-    sectionColumns("rejected"),
-    invoice => pdfLinkButton(invoice)
+    ],
+    actions: pdfLinkButton,
+    empty: ["No completed documents yet", "Reconciled invoices and filed statements will appear here."],
+  },
+  {
+    tab: "rejected",
+    actions: pdfLinkButton,
+    empty: ["No rejected documents", "Rejected invoices and cancelled duplicates will appear here."],
+  },
+];
+for (const section of SECTIONS) {
+  section.containerId = `${section.tab}-table`;
+  section.columns = sectionColumns(section.tab, section.extraColumns);
+}
+const SECTION_BY_TAB = new Map(SECTIONS.map(section => [section.tab, section]));
+
+// The invoices a queue (or its nav count) shows.
+function sectionInvoices(tab) {
+  if (tab === "incoming") return incomingInvoices();
+  const statuses = SECTION_STATUSES[tab];
+  const filter = SECTION_BY_TAB.get(tab)?.filter;
+  return invoices.filter(
+    invoice => statuses.includes(invoice.status) && (!filter || filter(invoice))
   );
 }
 
+function renderAllSections() {
+  for (const section of SECTIONS) renderSectionTable(section);
+}
+
+// One listener per queue handles every row: action buttons, and
+// expanding or collapsing a row by click or Enter / Space.
+function handleSectionEvent(event, container) {
+  const button = event.type === "click" && event.target.closest("[data-action]");
+  if (button && container.contains(button)) {
+    handleRowAction(button);
+    return;
+  }
+  const row = event.target.closest("tr[data-expand-invoice]");
+  if (!row || !container.contains(row)) return;
+  if (event.target.closest("button, a, input, select, textarea")) return;
+  if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
+  event.preventDefault();
+  const id = String(row.dataset.expandInvoice);
+  if (expandedInvoiceIds.has(id)) {
+    expandedInvoiceIds.delete(id);
+  } else {
+    expandedInvoiceIds.add(id);
+  }
+  renderAllSections();
+  if (event.type === "keydown") {
+    container.querySelector(`[data-expand-invoice="${CSS.escape(id)}"]`)?.focus();
+  }
+}
+
+for (const section of SECTIONS) {
+  const container = document.getElementById(section.containerId);
+  container.addEventListener("click", event => handleSectionEvent(event, container));
+  container.addEventListener("keydown", event => handleSectionEvent(event, container));
+}
+
+// Each row action asks for whatever it needs, then sends it. A
+// result of false means nothing was sent (cancelled, or the action
+// only navigated), so the invoice list is not reloaded.
+const ROW_ACTIONS = {
+  "po-match": ({ id }) =>
+    invoiceAction(`/api/invoices/${id}/po-match`, { matched: true, notes: null }),
+
+  "open-review": async ({ id }) => {
+    openedFlaggedInvoiceId = id;
+    showFlaggedNext = true;
+    document.querySelector('#section-nav button[data-tab="incoming"]').click();
+    await refreshPicker();
+    return false;
+  },
+
+  "file-statement": async ({ id, button }) => {
+    const company = button.closest("tr")
+      ?.querySelector("[data-statement-company]")?.value;
+    if (!company) {
+      throw new Error("Select the statement company first.");
+    }
+    await invoiceAction(`/api/invoices/${id}/file-statement`, { company });
+    showToast(`Statement filed to Statements/${company}.`);
+  },
+
+  "mark-invoice": async ({ id }) => {
+    await invoiceAction(`/api/invoices/${id}/mark-as-invoice`, {});
+    showToast("Document returned to invoice review.");
+  },
+
+  "accept-review": ({ id }) =>
+    invoiceAction(`/api/invoices/${id}/review-decision`, { accepted: true, reason: null }),
+
+  "reject-flagged": async ({ id, subject }) => {
+    const reason = await promptDialog({
+      context: subject,
+      title: "Reject invoice",
+      label: "Reason for rejecting this invoice",
+      required: true,
+      confirmLabel: "Reject invoice",
+      tone: "danger",
+    });
+    if (!reason) return false;
+    await invoiceAction(`/api/invoices/${id}/reject-flagged`, { reason });
+  },
+
+  "po-query": async ({ id, subject }) => {
+    const query = await formDialog({
+      context: subject,
+      title: "Record PO query",
+      message: "The query is routed back for resolution before the invoice can be matched.",
+      confirmLabel: "Record query",
+      fields: [
+        { name: "notes", label: "Describe the PO matching issue", multiline: true },
+        {
+          name: "category",
+          label: "Query category",
+          placeholder: "e.g. price discrepancy, missing PO, quantity mismatch",
+        },
+        {
+          name: "contact",
+          label: "Purchasing contact to route this query to (optional)",
+        },
+      ],
+    });
+    if (query === null) return false;
+    await invoiceAction(`/api/invoices/${id}/po-match`, {
+      matched: false,
+      notes: query.notes,
+      query_category: query.category || null,
+      purchasing_contact: query.contact || null,
+    });
+  },
+
+  "po-reject": async ({ id, subject }) => {
+    const reason = await promptDialog({
+      context: subject,
+      title: "Reject PO invoice",
+      label: "Reason for rejecting this PO invoice",
+      required: true,
+      confirmLabel: "Reject invoice",
+      tone: "danger",
+    });
+    if (!reason) return false;
+    await invoiceAction(`/api/invoices/${id}/reject`, { reason });
+  },
+
+  "register-sage": async ({ id, invoice }) => {
+    if (!invoice) throw new Error("Invoice could not be found.");
+    const irjNumber = await collectSageRegistration(invoice);
+    if (!irjNumber) return false;
+    await invoiceAction(`/api/invoices/${id}/register-sage`, { irj_number: irjNumber });
+  },
+
+  "approve": async ({ id, button, subject }) => {
+    const comments = await promptDialog({
+      context: subject,
+      title: "Approve invoice",
+      label: "Approval comments (optional)",
+      confirmLabel: "Approve",
+    });
+    if (comments === null) return false;
+    await invoiceAction(`/api/invoices/${id}/approve`, {
+      level: Number(button.dataset.level),
+      decision: "approved",
+      comments: comments || null,
+    });
+  },
+
+  "reject": async ({ id, button, subject }) => {
+    const comments = await promptDialog({
+      context: subject,
+      title: "Reject invoice",
+      label: "Reason for rejection",
+      confirmLabel: "Reject invoice",
+      tone: "danger",
+    });
+    if (comments === null) return false;
+    await invoiceAction(`/api/invoices/${id}/approve`, {
+      level: Number(button.dataset.level),
+      decision: "rejected",
+      comments: comments || null,
+    });
+  },
+
+  "hold": async ({ id, button, subject }) => {
+    const comments = await promptDialog({
+      context: subject,
+      title: "Place on hold / record query",
+      label: "Reason for placing this invoice on hold / query",
+      required: true,
+      confirmLabel: "Place on hold",
+    });
+    if (!comments) return false;
+    await invoiceAction(`/api/invoices/${id}/approve`, {
+      level: Number(button.dataset.level),
+      decision: "on_hold",
+      comments,
+    });
+  },
+
+  "resume": async ({ id, label, subject }) => {
+    const notes = await promptDialog({
+      context: subject,
+      title: label.trim() || "Resume approval",
+      label: "Resolution notes for resuming approval (optional)",
+      confirmLabel: "Resume",
+    });
+    if (notes === null) return false;
+    await invoiceAction(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
+  },
+
+  "retry-payment-route": ({ id }) =>
+    invoiceAction(`/api/invoices/${id}/retry-payment-route`, {}),
+
+  "pay": async ({ id, invoice }) => {
+    if (!invoice) throw new Error("Invoice could not be found.");
+    const payment = await collectDomesticPayment(invoice);
+    if (!payment) return false;
+    await invoiceAction(`/api/invoices/${id}/pay`, payment);
+  },
+
+  "reconcile": async ({ id, subject }) => {
+    const reconciliation = await formDialog({
+      context: subject,
+      title: "Mark reconciled",
+      confirmLabel: "Mark reconciled",
+      fields: [
+        {
+          name: "date",
+          label: "Date shown on bank statement",
+          type: "date",
+          value: localTodayIsoDate(),
+          required: true,
+        },
+        { name: "notes", label: "Reconciliation notes (optional)", multiline: true },
+      ],
+    });
+    if (reconciliation === null || !reconciliation.date) return false;
+    await invoiceAction(`/api/invoices/${id}/reconcile`, {
+      reconciliation_date: reconciliation.date,
+      notes: reconciliation.notes || null,
+    });
+  },
+};
+
 async function handleRowAction(button) {
-  const action = button.dataset.action;
+  const action = ROW_ACTIONS[button.dataset.action];
   const id = button.dataset.id;
-  const originalText = button.textContent;
-  const dialogSubject = invoiceAccessibleName(
-    invoices.find(item => String(item.id) === String(id))
-  );
+  const label = button.textContent;
+  const invoice = invoices.find(item => String(item.id) === String(id));
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
   button.textContent = "Working…";
   try {
-    if (action === "po-match") {
-      await postJson(`/api/invoices/${id}/po-match`, { matched: true, notes: null });
-    } else if (action === "open-review") {
-      openedFlaggedInvoiceId = id;
-      showFlaggedNext = true;
-      document.querySelector('#section-nav button[data-tab="incoming"]').click();
-      await refreshPicker();
-      return;
-    } else if (action === "file-statement") {
-      const company = button.closest("tr")
-        ?.querySelector("[data-statement-company]")?.value;
-      if (!company) {
-        throw new Error("Select the statement company first.");
-      }
-      await postJson(`/api/invoices/${id}/file-statement`, { company });
-      showToast(`Statement filed to Statements/${company}.`);
-    } else if (action === "mark-invoice") {
-      await postJson(`/api/invoices/${id}/mark-as-invoice`, {});
-      showToast("Document returned to invoice review.");
-    } else if (action === "accept-review") {
-      await postJson(`/api/invoices/${id}/review-decision`, {
-        accepted: true,
-        reason: null,
-      });
-    } else if (action === "reject-flagged") {
-      const reason = await promptDialog({
-        context: dialogSubject,
-        title: "Reject invoice",
-        label: "Reason for rejecting this invoice",
-        required: true,
-        confirmLabel: "Reject invoice",
-        tone: "danger",
-      });
-      if (!reason) return;
-      await postJson(`/api/invoices/${id}/reject-flagged`, { reason });
-    } else if (action === "po-query") {
-      const query = await formDialog({
-        context: dialogSubject,
-        title: "Record PO query",
-        message: "The query is routed back for resolution before the invoice can be matched.",
-        confirmLabel: "Record query",
-        fields: [
-          { name: "notes", label: "Describe the PO matching issue", multiline: true },
-          {
-            name: "category",
-            label: "Query category",
-            placeholder: "e.g. price discrepancy, missing PO, quantity mismatch",
-          },
-          {
-            name: "contact",
-            label: "Purchasing contact to route this query to (optional)",
-          },
-        ],
-      });
-      if (query === null) return;
-      const notes = query.notes;
-      const queryCategory = query.category;
-      const purchasingContact = query.contact;
-      await postJson(`/api/invoices/${id}/po-match`, {
-        matched: false,
-        notes,
-        query_category: queryCategory || null,
-        purchasing_contact: purchasingContact || null,
-      });
-    } else if (action === "po-reject") {
-      const reason = await promptDialog({
-        context: dialogSubject,
-        title: "Reject PO invoice",
-        label: "Reason for rejecting this PO invoice",
-        required: true,
-        confirmLabel: "Reject invoice",
-        tone: "danger",
-      });
-      if (!reason) return;
-      await postJson(`/api/invoices/${id}/reject`, { reason });
-    } else if (action === "register-sage") {
-      const invoice = invoices.find(item => String(item.id) === String(id));
-      if (!invoice) throw new Error("Invoice could not be found.");
-      const irjNumber = await collectSageRegistration(invoice);
-      if (!irjNumber) return;
-      await postJson(`/api/invoices/${id}/register-sage`, {
-        irj_number: irjNumber,
-      });
-    } else if (action === "approve" || action === "reject") {
-      const comments = await promptDialog(action === "reject"
-        ? {
-            context: dialogSubject,
-            title: "Reject invoice",
-            label: "Reason for rejection",
-            confirmLabel: "Reject invoice",
-            tone: "danger",
-          }
-        : {
-            context: dialogSubject,
-            title: "Approve invoice",
-            label: "Approval comments (optional)",
-            confirmLabel: "Approve",
-          });
-      if (comments === null) return;
-      await postJson(`/api/invoices/${id}/approve`, {
-        level: Number(button.dataset.level),
-        decision: action === "approve" ? "approved" : "rejected",
-        comments: comments || null,
-      });
-    } else if (action === "hold") {
-      const comments = await promptDialog({
-        context: dialogSubject,
-        title: "Place on hold / record query",
-        label: "Reason for placing this invoice on hold / query",
-        required: true,
-        confirmLabel: "Place on hold",
-      });
-      if (!comments) return;
-      await postJson(`/api/invoices/${id}/approve`, {
-        level: Number(button.dataset.level),
-        decision: "on_hold",
-        comments,
-      });
-    } else if (action === "resume") {
-      const notes = await promptDialog({
-        context: dialogSubject,
-        title: originalText.trim() || "Resume approval",
-        label: "Resolution notes for resuming approval (optional)",
-        confirmLabel: "Resume",
-      });
-      if (notes === null) return;
-      await postJson(`/api/invoices/${id}/resume-approval`, { resolution_notes: notes || null });
-    } else if (action === "retry-payment-route") {
-      await postJson(`/api/invoices/${id}/retry-payment-route`, {});
-    } else if (action === "pay") {
-      const invoice = invoices.find(item => String(item.id) === String(id));
-      if (!invoice) throw new Error("Invoice could not be found.");
-      const payment = await collectDomesticPayment(invoice);
-      if (!payment) return;
-      await postJson(`/api/invoices/${id}/pay`, payment);
-    } else if (action === "reconcile") {
-      const reconciliation = await formDialog({
-        context: dialogSubject,
-        title: "Mark reconciled",
-        confirmLabel: "Mark reconciled",
-        fields: [
-          {
-            name: "date",
-            label: "Date shown on bank statement",
-            type: "date",
-            value: localTodayIsoDate(),
-            required: true,
-          },
-          { name: "notes", label: "Reconciliation notes (optional)", multiline: true },
-        ],
-      });
-      if (reconciliation === null) return;
-      const reconciliationDate = reconciliation.date;
-      if (!reconciliationDate) return;
-      const notes = reconciliation.notes;
-      await postJson(`/api/invoices/${id}/reconcile`, {
-        reconciliation_date: reconciliationDate,
-        notes: notes || null,
-      });
-    }
-    await loadInvoices();
+    const result = action
+      ? await action({ id, button, label, invoice, subject: invoiceAccessibleName(invoice) })
+      : undefined;
+    if (result !== false) await loadInvoices();
   } catch (error) {
     showToast(error.message, true);
   } finally {
     if (button.isConnected) {
       button.disabled = false;
       button.removeAttribute("aria-busy");
-      button.textContent = originalText;
+      button.textContent = label;
       // A dialog may have taken focus; give it back to the row
       // action unless the user has already moved elsewhere.
       if (document.activeElement === document.body) button.focus();

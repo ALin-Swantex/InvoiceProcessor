@@ -14,284 +14,319 @@ async function loadAdminPanel() {
     adminMatrix = matrix;
     adminSupplierTerms = supplierTerms;
     loadAdminReferenceOptions(companies, suppliers);
-    renderSimpleTable(
-      document.getElementById("admin-companies-table"),
-      [
-        { label: "Name", value: c => c.name },
-        { label: "SharePoint company folder", value: c => c.sharepoint_root_folder },
-        {
-          label: "Workflow destinations",
-          // Trusted markup: every label and path is escaped below.
-          html: true,
-          value: c => `<div class="path-list">${[
-              ["Nominal", c.folder_structure.nominal_invoices],
-              ["PO Match", c.folder_structure.po_match],
-              ["Approved", c.folder_structure.approved_for_payment],
-              ["Paid", c.folder_structure.paid],
-              ["Reconciled", c.folder_structure.reconciled],
-            ].map(([label, path]) =>
-              `<div><strong>${escapeHtml(label)}</strong>` +
-              `<span class="path-value">${escapeHtml(path)}</span></div>`
-            ).join("")}</div>`
-        },
-        { label: "Aliases", value: c => (c.aliases || []).join(", ") },
-      ],
-      companies,
-      async name => {
-        await sendJson(`/api/admin/companies/${encodeURIComponent(name)}`, "DELETE");
-        await loadAdminPanel();
-        await loadCompanies();
-        await loadIrjConfigurations();
-      },
-      "name",
-      company => {
-        const rootOptions = includeCurrentOption(
-          [
-            ["", "Select SharePoint company folder…"],
-            ...[...sharePointCompanyFolders.values()].map(structure => [
-              structure.root,
-              structure.root.split("/").pop(),
-            ]),
-          ],
-          company.sharepoint_root_folder
-        );
-        openAdminEditor(`Edit ${company.name}`, [
-          {
-            key: "sharepoint_root_folder",
-            label: "SharePoint company folder",
-            type: "select",
-            options: rootOptions,
-            value: company.sharepoint_root_folder,
-            required: true,
-            fullWidth: true,
-          },
-          {
-            key: "aliases",
-            label: "Aliases (comma separated)",
-            value: (company.aliases || []).join(", "),
-            fullWidth: true,
-          },
-          {
-            key: "vat_number",
-            label: "VAT number",
-            value: company.vat_number,
-            nullWhenBlank: true,
-          },
-          {
-            key: "address",
-            label: "Address",
-            type: "textarea",
-            value: company.address,
-            nullWhenBlank: true,
-            fullWidth: true,
-          },
-        ], async values => {
-          values.aliases = splitCommaList(values.aliases);
-          await putJson(
-            `/api/admin/companies/${encodeURIComponent(company.name)}`,
-            values
-          );
-          await loadAdminPanel();
-          await loadCompanies();
-        });
-      }
-    );
-    renderCompanyGroupedTables(
-      document.getElementById("admin-suppliers-table"),
-      suppliersGroupedByCompany(suppliers, matrix, supplierTerms),
-      [
-        { label: "Name", value: s => s.name },
-        { label: "Aliases", value: s => (s.aliases || []).join(", ") },
-        { label: "Default company", value: s => s.default_company },
-        { label: "Contact", value: s => s.contact_email },
-        { label: "Invoice no. pattern", value: s => s.invoice_number_pattern },
-      ],
-      async name => {
-        await sendJson(`/api/admin/suppliers/${encodeURIComponent(name)}`, "DELETE");
-        await loadAdminPanel();
-        await loadSuppliers();
-      },
-      "name",
-      supplier => {
-        openAdminEditor(`Edit ${supplier.name}`, [
-          {
-            key: "aliases",
-            label: "Aliases (comma separated)",
-            value: (supplier.aliases || []).join(", "),
-            fullWidth: true,
-          },
-          {
-            key: "default_company",
-            label: "Default company",
-            type: "select",
-            options: includeCurrentOption(
-              [["", "No default company"], ...companyOptions().slice(1)],
-              supplier.default_company
-            ),
-            value: supplier.default_company,
-            nullWhenBlank: true,
-          },
-          {
-            key: "contact_email",
-            label: "Contact email",
-            type: "email",
-            value: supplier.contact_email,
-            nullWhenBlank: true,
-          },
-          {
-            key: "invoice_number_pattern",
-            label: "Invoice number pattern (# digit, @ letter, * alphanumeric)",
-            value: supplier.invoice_number_pattern,
-            nullWhenBlank: true,
-            fullWidth: true,
-          },
-        ], async values => {
-          values.aliases = splitCommaList(values.aliases);
-          await putJson(
-            `/api/admin/suppliers/${encodeURIComponent(supplier.name)}`,
-            values
-          );
-          await loadAdminPanel();
-          await loadSuppliers();
-        });
-      }
-    );
-    renderCompanyGroupedTables(
-      document.getElementById("admin-supplier-terms-table"),
-      rowsGroupedByCompany(supplierTerms),
-      [
-        { label: "Supplier company", value: t => t.supplier },
-        { label: "Account no.", value: t => t.supplier_account_number },
-        { label: "Payment method", value: t => t.default_payment_method },
-        { label: "Terms", value: t => t.payment_terms_notice },
-        { label: "Bank account", value: t => t.bank_account },
-      ],
-      null,
-      "id",
-      terms => {
-        openAdminEditor("Edit supplier payment settings", [
-          {
-            key: "company",
-            label: "Invoice company",
-            type: "select",
-            options: includeCurrentOption(
-              companyOptions(true),
-              terms.company,
-              terms.company === "*" ? "All invoice companies" : terms.company
-            ),
-            value: terms.company,
-            required: true,
-          },
-          {
-            key: "supplier",
-            label: "Supplier company",
-            type: "select",
-            options: includeCurrentOption(
-              supplierOptions(),
-              terms.supplier
-            ),
-            value: terms.supplier,
-            required: true,
-          },
-          {
-            key: "supplier_account_number",
-            label: "Supplier account number",
-            value: terms.supplier_account_number,
-            nullWhenBlank: true,
-          },
-          {
-            key: "default_payment_method",
-            label: "Default payment method",
-            value: terms.default_payment_method,
-            nullWhenBlank: true,
-          },
-          {
-            key: "payment_terms_notice",
-            label: "Payment terms",
-            value: terms.payment_terms_notice,
-            nullWhenBlank: true,
-          },
-          {
-            key: "bank_account",
-            label: "Bank account",
-            value: terms.bank_account,
-            nullWhenBlank: true,
-          },
-        ], async values => {
-          await putJson(`/api/admin/supplier-terms/${terms.id}`, values);
-          await loadAdminPanel();
-        });
-      }
-    );
+    renderAdminCompanies(companies);
+    renderAdminSuppliers(suppliers, matrix, supplierTerms);
+    renderAdminSupplierTerms(supplierTerms);
     renderAdminMatrixTable();
     document.getElementById("admin-threshold-value").value = threshold.threshold ?? 0.8;
-    irjConfigurations = new Map(
-      irjSettings.map(setting => [setting.company, setting])
-    );
-    document.getElementById("admin-irj-settings").innerHTML =
-      '<table class="section-table"><thead><tr>' +
-      '<th>Company</th><th>Mode</th><th>Latest paper IRJ</th><th></th>' +
-      '</tr></thead><tbody>' +
-      irjSettings.map(setting => `
-                    <tr>
-                      <td>${escapeHtml(setting.company)}</td>
-                      <td>
-                        <select data-irj-mode="${escapeAttr(setting.company)}" aria-label="IRJ mode for ${escapeAttr(setting.company)}">
-                          <option value="automatic" ${setting.mode === "automatic" ? "selected" : ""}>Automatic</option>
-                          <option value="manual" ${setting.mode === "manual" ? "selected" : ""}>Manual at Sage</option>
-                        </select>
-                      </td>
-                      <td>
-                        <input
-                          data-irj-current="${escapeAttr(setting.company)}"
-                          aria-label="Latest paper IRJ for ${escapeAttr(setting.company)}"
-                          inputmode="numeric"
-                          pattern="[0-9]{6}"
-                          maxlength="6"
-                          value="${escapeAttr(setting.current_irj || "")}"
-                          placeholder="e.g. 004321"
-                          ${setting.mode === "manual" ? "disabled" : ""}
-                        >
-                      </td>
-                      <td><button data-save-irj="${escapeAttr(setting.company)}" aria-label="Save IRJ settings for ${escapeAttr(setting.company)}">Save</button></td>
-                    </tr>
-                  `).join("") + '</tbody></table>';
-    document.querySelectorAll("[data-irj-mode]").forEach(select => {
-      select.addEventListener("change", () => {
-        document.querySelector(
-          `[data-irj-current="${CSS.escape(select.dataset.irjMode)}"]`
-        ).disabled = select.value === "manual";
-      });
-    });
-    document.querySelectorAll("[data-save-irj]").forEach(button => {
-      button.addEventListener("click", async () => {
-        const company = button.dataset.saveIrj;
-        const mode = document.querySelector(
-          `[data-irj-mode="${CSS.escape(company)}"]`
-        ).value;
-        const currentInput = document.querySelector(
-          `[data-irj-current="${CSS.escape(company)}"]`
-        );
-        const currentIrj = currentInput.value.trim();
-        if (mode === "automatic" && currentIrj && !/^\d{6}$/.test(currentIrj)) {
-          showToast("Latest paper IRJ must contain exactly six digits.", true);
-          return;
-        }
-        try {
-          await putJson(
-            `/api/admin/irj-configurations/${encodeURIComponent(company)}`,
-            { mode, current_irj: currentIrj || null }
-          );
-          showToast(`${company} IRJ settings saved.`);
-          await loadAdminPanel();
-        } catch (error) {
-          showToast(error.message, true);
-        }
-      });
-    });
+    renderIrjSettings(irjSettings);
   } catch (error) {
     showToast(`Failed to load admin panel: ${error.message}`, true);
   }
+}
+
+function renderAdminCompanies(companies) {
+  renderSimpleTable(
+    document.getElementById("admin-companies-table"),
+    [
+      { label: "Name", value: c => c.name },
+      { label: "SharePoint company folder", value: c => c.sharepoint_root_folder },
+      {
+        label: "Workflow destinations",
+        // Trusted markup: every label and path is escaped below.
+        html: true,
+        value: c => `<div class="path-list">${[
+            ["Nominal", c.folder_structure.nominal_invoices],
+            ["PO Match", c.folder_structure.po_match],
+            ["Approved", c.folder_structure.approved_for_payment],
+            ["Paid", c.folder_structure.paid],
+            ["Reconciled", c.folder_structure.reconciled],
+          ].map(([label, path]) =>
+            `<div><strong>${escapeHtml(label)}</strong>` +
+            `<span class="path-value">${escapeHtml(path)}</span></div>`
+          ).join("")}</div>`
+      },
+      { label: "Aliases", value: c => (c.aliases || []).join(", ") },
+    ],
+    companies,
+    async name => {
+      await sendJson(`/api/admin/companies/${encodeURIComponent(name)}`, "DELETE");
+      await loadAdminPanel();
+      await loadCompanies();
+      await loadIrjConfigurations();
+    },
+    "name",
+    company => {
+      const rootOptions = includeCurrentOption(
+        [
+          ["", "Select SharePoint company folder…"],
+          ...[...sharePointCompanyFolders.values()].map(structure => [
+            structure.root,
+            structure.root.split("/").pop(),
+          ]),
+        ],
+        company.sharepoint_root_folder
+      );
+      openAdminEditor(`Edit ${company.name}`, [
+        {
+          key: "sharepoint_root_folder",
+          label: "SharePoint company folder",
+          type: "select",
+          options: rootOptions,
+          value: company.sharepoint_root_folder,
+          required: true,
+          fullWidth: true,
+        },
+        {
+          key: "aliases",
+          label: "Aliases (comma separated)",
+          value: (company.aliases || []).join(", "),
+          fullWidth: true,
+        },
+        {
+          key: "vat_number",
+          label: "VAT number",
+          value: company.vat_number,
+          nullWhenBlank: true,
+        },
+        {
+          key: "address",
+          label: "Address",
+          type: "textarea",
+          value: company.address,
+          nullWhenBlank: true,
+          fullWidth: true,
+        },
+      ], async values => {
+        values.aliases = splitCommaList(values.aliases);
+        await putJson(
+          `/api/admin/companies/${encodeURIComponent(company.name)}`,
+          values
+        );
+        await loadAdminPanel();
+        await loadCompanies();
+      });
+    }
+  );
+}
+
+function renderAdminSuppliers(suppliers, matrix, supplierTerms) {
+  renderCompanyGroupedTables(
+    document.getElementById("admin-suppliers-table"),
+    suppliersGroupedByCompany(suppliers, matrix, supplierTerms),
+    [
+      { label: "Name", value: s => s.name },
+      { label: "Aliases", value: s => (s.aliases || []).join(", ") },
+      { label: "Default company", value: s => s.default_company },
+      { label: "Contact", value: s => s.contact_email },
+      { label: "Invoice no. pattern", value: s => s.invoice_number_pattern },
+    ],
+    async name => {
+      await sendJson(`/api/admin/suppliers/${encodeURIComponent(name)}`, "DELETE");
+      await loadAdminPanel();
+      await loadSuppliers();
+    },
+    "name",
+    supplier => {
+      openAdminEditor(`Edit ${supplier.name}`, [
+        {
+          key: "aliases",
+          label: "Aliases (comma separated)",
+          value: (supplier.aliases || []).join(", "),
+          fullWidth: true,
+        },
+        {
+          key: "default_company",
+          label: "Default company",
+          type: "select",
+          options: includeCurrentOption(
+            [["", "No default company"], ...companyOptions().slice(1)],
+            supplier.default_company
+          ),
+          value: supplier.default_company,
+          nullWhenBlank: true,
+        },
+        {
+          key: "contact_email",
+          label: "Contact email",
+          type: "email",
+          value: supplier.contact_email,
+          nullWhenBlank: true,
+        },
+        {
+          key: "invoice_number_pattern",
+          label: "Invoice number pattern (# digit, @ letter, * alphanumeric)",
+          value: supplier.invoice_number_pattern,
+          nullWhenBlank: true,
+          fullWidth: true,
+        },
+      ], async values => {
+        values.aliases = splitCommaList(values.aliases);
+        await putJson(
+          `/api/admin/suppliers/${encodeURIComponent(supplier.name)}`,
+          values
+        );
+        await loadAdminPanel();
+        await loadSuppliers();
+      });
+    }
+  );
+}
+
+function renderAdminSupplierTerms(supplierTerms) {
+  renderCompanyGroupedTables(
+    document.getElementById("admin-supplier-terms-table"),
+    rowsGroupedByCompany(supplierTerms),
+    [
+      { label: "Supplier company", value: t => t.supplier },
+      { label: "Account no.", value: t => t.supplier_account_number },
+      { label: "Payment method", value: t => t.default_payment_method },
+      { label: "Terms", value: t => t.payment_terms_notice },
+      { label: "Bank account", value: t => t.bank_account },
+    ],
+    null,
+    "id",
+    terms => {
+      openAdminEditor("Edit supplier payment settings", [
+        {
+          key: "company",
+          label: "Invoice company",
+          type: "select",
+          options: includeCurrentOption(
+            companyOptions(true),
+            terms.company,
+            terms.company === "*" ? "All invoice companies" : terms.company
+          ),
+          value: terms.company,
+          required: true,
+        },
+        {
+          key: "supplier",
+          label: "Supplier company",
+          type: "select",
+          options: includeCurrentOption(
+            supplierOptions(),
+            terms.supplier
+          ),
+          value: terms.supplier,
+          required: true,
+        },
+        {
+          key: "supplier_account_number",
+          label: "Supplier account number",
+          value: terms.supplier_account_number,
+          nullWhenBlank: true,
+        },
+        {
+          key: "default_payment_method",
+          label: "Default payment method",
+          value: terms.default_payment_method,
+          nullWhenBlank: true,
+        },
+        {
+          key: "payment_terms_notice",
+          label: "Payment terms",
+          value: terms.payment_terms_notice,
+          nullWhenBlank: true,
+        },
+        {
+          key: "bank_account",
+          label: "Bank account",
+          value: terms.bank_account,
+          nullWhenBlank: true,
+        },
+      ], async values => {
+        await putJson(`/api/admin/supplier-terms/${terms.id}`, values);
+        await loadAdminPanel();
+      });
+    }
+  );
+}
+
+function renderIrjSettings(irjSettings) {
+  irjConfigurations = new Map(
+    irjSettings.map(setting => [setting.company, setting])
+  );
+  document.getElementById("admin-irj-settings").innerHTML =
+    '<table class="section-table"><thead><tr>' +
+    '<th>Company</th><th>Mode</th><th>Latest paper IRJ</th><th></th>' +
+    '</tr></thead><tbody>' +
+    irjSettings.map(setting => `
+                  <tr>
+                    <td>${escapeHtml(setting.company)}</td>
+                    <td>
+                      <select data-irj-mode="${escapeAttr(setting.company)}" aria-label="IRJ mode for ${escapeAttr(setting.company)}">
+                        <option value="automatic" ${setting.mode === "automatic" ? "selected" : ""}>Automatic</option>
+                        <option value="manual" ${setting.mode === "manual" ? "selected" : ""}>Manual at Sage</option>
+                      </select>
+                    </td>
+                    <td>
+                      <input
+                        data-irj-current="${escapeAttr(setting.company)}"
+                        aria-label="Latest paper IRJ for ${escapeAttr(setting.company)}"
+                        inputmode="numeric"
+                        pattern="[0-9]{6}"
+                        maxlength="6"
+                        value="${escapeAttr(setting.current_irj || "")}"
+                        placeholder="e.g. 004321"
+                        ${setting.mode === "manual" ? "disabled" : ""}
+                      >
+                    </td>
+                    <td><button data-save-irj="${escapeAttr(setting.company)}" aria-label="Save IRJ settings for ${escapeAttr(setting.company)}">Save</button></td>
+                  </tr>
+                `).join("") + '</tbody></table>';
+  document.querySelectorAll("[data-irj-mode]").forEach(select => {
+    select.addEventListener("change", () => {
+      document.querySelector(
+        `[data-irj-current="${CSS.escape(select.dataset.irjMode)}"]`
+      ).disabled = select.value === "manual";
+    });
+  });
+  document.querySelectorAll("[data-save-irj]").forEach(button => {
+    button.addEventListener("click", async () => {
+      const company = button.dataset.saveIrj;
+      const mode = document.querySelector(
+        `[data-irj-mode="${CSS.escape(company)}"]`
+      ).value;
+      const currentInput = document.querySelector(
+        `[data-irj-current="${CSS.escape(company)}"]`
+      );
+      const currentIrj = currentInput.value.trim();
+      if (mode === "automatic" && currentIrj && !/^\d{6}$/.test(currentIrj)) {
+        showToast("Latest paper IRJ must contain exactly six digits.", true);
+        return;
+      }
+      try {
+        await putJson(
+          `/api/admin/irj-configurations/${encodeURIComponent(company)}`,
+          { mode, current_irj: currentIrj || null }
+        );
+        showToast(`${company} IRJ settings saved.`);
+        await loadAdminPanel();
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
+  });
+}
+
+// Add forms: send, clear the form, confirm, then reload what changed.
+function bindAdminForm(formId, successMessage, reloads, send) {
+  document.getElementById(formId).addEventListener("submit", async event => {
+    event.preventDefault();
+    const form = event.target;
+    setFormError(form, "");
+    await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
+      try {
+        await send();
+        form.reset();
+        showToast(successMessage);
+        for (const reload of reloads) await reload();
+      } catch (error) {
+        setFormError(form, error.message);
+      }
+    });
+  });
 }
 
 document.getElementById("admin-import-form").addEventListener("submit", async event => {
@@ -385,25 +420,13 @@ ${duplicates}
   }
 });
 
-document.getElementById("admin-company-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  const form = event.target;
-  setFormError(form, "");
-  await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
-  try {
-    await postJson("/api/admin/companies", {
-      name: document.getElementById("admin-company-name").value,
-      sharepoint_root_folder: document.getElementById("admin-company-root-folder").value,
-      aliases: splitCommaList(document.getElementById("admin-company-aliases").value),
-    });
-    form.reset();
-    showToast("Company added.");
-    await loadAdminPanel();
-  } catch (error) {
-    setFormError(form, error.message);
-  }
-  });
-});
+bindAdminForm("admin-company-form", "Company added.", [loadAdminPanel], () =>
+  postJson("/api/admin/companies", {
+    name: document.getElementById("admin-company-name").value,
+    sharepoint_root_folder: document.getElementById("admin-company-root-folder").value,
+    aliases: splitCommaList(document.getElementById("admin-company-aliases").value),
+  })
+);
 
 document.getElementById("admin-company-root-folder").addEventListener("change", event => {
   const structure = sharePointCompanyFolders.get(event.target.value);
@@ -438,57 +461,32 @@ document.getElementById("admin-company-root-folder").addEventListener("change", 
   }
 });
 
-document.getElementById("admin-supplier-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  const form = event.target;
-  setFormError(form, "");
-  await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
-  try {
-    await postJson("/api/admin/suppliers", {
-      name: document.getElementById("admin-supplier-name").value,
-      aliases: splitCommaList(document.getElementById("admin-supplier-aliases").value),
-      default_company: document.getElementById("admin-supplier-default-company").value || null,
-      contact_email: document.getElementById("admin-supplier-contact").value || null,
-      invoice_number_pattern:
-        document.getElementById("admin-supplier-invoice-pattern").value || null,
-    });
-    form.reset();
-    showToast("Supplier added.");
-    await loadAdminPanel();
-    await loadSuppliers();
-  } catch (error) {
-    setFormError(form, error.message);
-  }
-  });
-});
+bindAdminForm("admin-supplier-form", "Supplier added.", [loadAdminPanel, loadSuppliers], () =>
+  postJson("/api/admin/suppliers", {
+    name: document.getElementById("admin-supplier-name").value,
+    aliases: splitCommaList(document.getElementById("admin-supplier-aliases").value),
+    default_company: document.getElementById("admin-supplier-default-company").value || null,
+    contact_email: document.getElementById("admin-supplier-contact").value || null,
+    invoice_number_pattern:
+      document.getElementById("admin-supplier-invoice-pattern").value || null,
+  })
+);
 
 document.getElementById("admin-matrix-company").addEventListener(
   "change",
   () => refreshAdminMatrixSupplierOptions()
 );
 
-document.getElementById("admin-matrix-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  const form = event.target;
-  setFormError(form, "");
-  await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
-  try {
-    await postJson("/api/admin/approval-matrix", {
-      company: document.getElementById("admin-matrix-company").value,
-      supplier: document.getElementById("admin-matrix-supplier").value,
-      approver1_name: document.getElementById("admin-matrix-approver1-name").value,
-      approver1_email: document.getElementById("admin-matrix-approver1-email").value,
-      approver2_name: document.getElementById("admin-matrix-approver2-name").value || null,
-      approver2_email: document.getElementById("admin-matrix-approver2-email").value || null,
-    });
-    form.reset();
-    showToast("Approval route saved.");
-    await loadAdminPanel();
-  } catch (error) {
-    setFormError(form, error.message);
-  }
-  });
-});
+bindAdminForm("admin-matrix-form", "Approval route saved.", [loadAdminPanel], () =>
+  postJson("/api/admin/approval-matrix", {
+    company: document.getElementById("admin-matrix-company").value,
+    supplier: document.getElementById("admin-matrix-supplier").value,
+    approver1_name: document.getElementById("admin-matrix-approver1-name").value,
+    approver1_email: document.getElementById("admin-matrix-approver1-email").value,
+    approver2_name: document.getElementById("admin-matrix-approver2-name").value || null,
+    approver2_email: document.getElementById("admin-matrix-approver2-email").value || null,
+  })
+);
 
 document.getElementById("admin-threshold-form").addEventListener("submit", async event => {
   event.preventDefault();
@@ -503,12 +501,7 @@ document.getElementById("admin-threshold-form").addEventListener("submit", async
   await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
   try {
     const threshold = Number(document.getElementById("admin-threshold-value").value);
-    const response = await fetch("/api/admin/ai-threshold", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ threshold }),
-    });
-    if (!response.ok) throw new Error("Failed to save threshold.");
+    await putJson("/api/admin/ai-threshold", { threshold });
     showToast("AI confidence threshold saved.");
   } catch (error) {
     setFormError(form, error.message);
@@ -534,12 +527,7 @@ document.getElementById("admin-auto-confirm-form").addEventListener("submit", as
   await withBusyButton(form.querySelector('button[type="submit"]'), async () => {
     try {
       const enabled = document.getElementById("admin-auto-confirm").checked;
-      const response = await fetch("/api/admin/ai-auto-confirm", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled }),
-      });
-      if (!response.ok) throw new Error("Failed to save the setting.");
+      await putJson("/api/admin/ai-auto-confirm", { enabled });
       showToast(enabled
         ? "Confident invoices will now be confirmed automatically."
         : "Every invoice will now wait for Purchase Ledger confirmation.");
