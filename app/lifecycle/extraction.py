@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from app.lifecycle.common import (
     InvoiceLifecycleError,
 )
 from app.lifecycle.base import LifecycleBase
+
+logger = logging.getLogger("invoice_processor")
 
 
 class ExtractionStage(LifecycleBase):
@@ -298,8 +301,10 @@ class ExtractionStage(LifecycleBase):
         """Route a confident invoice on without waiting for Purchase Ledger.
 
         confirm_and_route repeats the duplicate, invoice-number and approver
-        checks. If any of them refuses, the invoice simply stays in Needs
-        Review with the reason, exactly as when auto-confirm is off."""
+        checks. If any of them refuses, or routing fails unexpectedly (a
+        database or SharePoint error), the invoice simply stays in Needs
+        Review with the reason, exactly as when auto-confirm is off: the
+        upload or email that brought it in still succeeds."""
         try:
             return self.confirm_and_route(
                 record.id,
@@ -312,7 +317,9 @@ class ExtractionStage(LifecycleBase):
                 currency=record.currency,
                 recorded_by=AUTO_CONFIRM_ACTOR,
             )
-        except InvoiceLifecycleError as error:
+        except Exception as error:
+            if not isinstance(error, InvoiceLifecycleError):
+                logger.exception("Automatic confirmation of invoice %s failed.", record.id)
             held = self.invoice_store.update_fields_if_status(
                 record.id,
                 Status.NEEDS_REVIEW,

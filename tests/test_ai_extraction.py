@@ -134,6 +134,29 @@ def test_request_carries_the_pdf_schema_and_known_names(tmp_path: Path) -> None:
     assert names["cache_control"] == {"type": "ephemeral"}
 
 
+def test_prompt_leaves_date_age_to_the_code_check(tmp_path: Path) -> None:
+    # The model does not know today's date: it once called 1 October 2026 "in
+    # the future" on 25 November 2026. run_checks judges the date instead.
+    extractor, client = extractor_for(llm_data())
+
+    extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    prompt = client.messages.calls[0]["system"][0]["text"]
+    assert "do not note whether a date is in the past" in " ".join(prompt.split())
+
+
+def test_prompt_keeps_notes_to_real_doubts(tmp_path: Path) -> None:
+    # Every note holds an invoice back from auto-confirm, so harmless remarks
+    # (a cover page, a PO printed as "TBC") must not be noted.
+    extractor, client = extractor_for(llm_data())
+
+    extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    prompt = " ".join(client.messages.calls[0]["system"][0]["text"].split())
+    assert "notes lists only what makes a returned value doubtful" in prompt
+    assert "Do not note ordinary layout" in prompt
+
+
 def test_blank_effort_leaves_the_parameter_out(tmp_path: Path) -> None:
     client = FakeClient(llm_data())
     ClaudeInvoiceExtractor(ExtractionSettings(effort=""), client=client).extract(
@@ -732,20 +755,35 @@ def test_confident_first_answer_never_calls_the_stronger_model(tmp_path: Path) -
     assert result.needs_review is False
 
 
-def test_difficult_invoice_is_escalated_and_the_stronger_answer_is_used(
+def test_unsure_first_answer_goes_to_review_without_the_stronger_model(
     tmp_path: Path,
 ) -> None:
+    # Only "low" sure, but nothing missing or contradicted: a person checks
+    # the first model's reading rather than paying for a second opinion.
     unsure = llm_data(supplier_invoice_number=field("INV-10O1", "low"))
     extractor, client = cascade(unsure, llm_data())
 
     result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
+
+    assert client.models_called() == [FIRST]
+    assert result.supplier_invoice_number == "INV-10O1"
+    assert result.model == FIRST
+    assert result.needs_review is True
+
+
+def test_value_contradicted_by_the_document_is_escalated(tmp_path: Path) -> None:
+    # The invoice number is not printed in the document text: a real error.
+    wrong = llm_data(supplier_invoice_number=field("INV-10O1"))
+    extractor, client = cascade(wrong, llm_data())
+
+    result = extractor.extract(text_pdf(tmp_path))
 
     assert client.models_called() == [FIRST, SECOND]
     assert client.calls[0]["output_config"]["effort"] == "medium"
     assert client.calls[1]["output_config"]["effort"] == "high"
     assert result.supplier_invoice_number == "INV-1001"
     assert result.model == f"{FIRST} -> {SECOND}"
-    assert result.needs_review is False  # a low-certainty first read is not a conflict
+    assert result.needs_review is False  # a contradicted first read is not a conflict
 
 
 def test_missing_field_filled_in_by_the_stronger_model(tmp_path: Path) -> None:
@@ -763,9 +801,11 @@ def test_missing_field_filled_in_by_the_stronger_model(tmp_path: Path) -> None:
 def test_confident_disagreement_between_the_models_needs_review(
     tmp_path: Path,
 ) -> None:
-    # Medium certainty triggers the escalation; the stronger model then reads the
-    # total differently, which is a conflict worth a person's attention.
-    first = llm_data(invoice_value=field(1250.75, "medium"))
+    # The missing date triggers the escalation; the stronger model then reads
+    # the total differently, which is a conflict worth a person's attention.
+    first = llm_data(
+        invoice_value=field(1250.75, "medium"), invoice_date=field(None, "low", None)
+    )
     second = llm_data(invoice_value=field(1520.75, "high"))
     extractor, _ = cascade(first, second)
 
@@ -784,7 +824,9 @@ def test_a_field_below_the_threshold_is_warned_about_once_after_escalation(
 ) -> None:
     # The stronger model also reads the total with only medium certainty, and
     # differently. The threshold rule is applied once, to the final answer.
-    first = llm_data(invoice_value=field(1250.75, "medium"))
+    first = llm_data(
+        invoice_value=field(1250.75, "medium"), invoice_date=field(None, "low", None)
+    )
     second = llm_data(invoice_value=field(1520.75, "medium"))
     extractor, _ = cascade(first, second)
 
@@ -832,13 +874,13 @@ def test_temporary_failure_of_the_first_model_is_retried_not_escalated(
 def test_unavailable_stronger_model_keeps_the_first_answer_for_review(
     tmp_path: Path,
 ) -> None:
-    unsure = llm_data(supplier_invoice_number=field("INV-10O1", "low"))
-    extractor, client = cascade(unsure, InternalServerError("overloaded"))
+    incomplete = llm_data(invoice_date=field(None, "low", None))
+    extractor, client = cascade(incomplete, InternalServerError("overloaded"))
 
     result = extractor.extract(write_pdf(tmp_path / "invoice.pdf"))
 
     assert client.models_called() == [FIRST, SECOND]
-    assert result.supplier_invoice_number == "INV-10O1"
+    assert result.invoice_date is None
     assert result.model == FIRST
     assert result.needs_review is True
     assert any(SECOND in warning and "not available" in warning for warning in result.warnings)
@@ -1251,3 +1293,57 @@ def test_auto_confirm_uses_the_real_routing_and_holds_duplicates(
     assert held.duplicate_of_invoice_id == invoice_id
     assert held.irj_number is None  # no IRJ number allocated to a duplicate
     assert "duplicate" in str(held.review_reason)
+
+
+def test_unexpected_error_in_auto_confirm_leaves_invoice_in_needs_review(
+    tmp_path: Path,
+) -> None:
+    # A database or SharePoint failure inside routing must not fail the upload
+    # or the email: the invoice waits for Purchase Ledger with the reason.
+    from app.approval_matrix import ApprovalMatrixStore
+
+    extractor, _ = extractor_for(llm_data())
+    lifecycle, _, invoice_id = lifecycle_for(tmp_path, extractor)
+    lifecycle.approval_matrix_store = ApprovalMatrixStore(tmp_path / "config.db")
+    lifecycle.configuration_getter = lambda key, default=None: (
+        "true" if key == "ai_auto_confirm" else default
+    )
+
+    def database_down(company: str) -> str:
+        raise RuntimeError("no unique or exclusion constraint matching ON CONFLICT")
+
+    lifecycle.irj_generator.generate = database_down  # type: ignore[method-assign]
+
+    held = lifecycle.run_extraction(invoice_id)
+
+    assert held.status == "Needs Review"
+    assert held.irj_number is None
+    assert "Automatic confirmation was not possible" in str(held.review_reason)
+    assert "ON CONFLICT" in str(held.review_reason)
+
+
+def test_output_schema_stays_within_the_api_union_limit() -> None:
+    """The live API rejects a structured-output schema with more than 16
+    parameters typed as a union (anyOf or a list of types) with HTTP 400."""
+
+    def unions(node: object) -> int:
+        if isinstance(node, dict):
+            own = int("anyOf" in node or isinstance(node.get("type"), list))
+            return own + sum(unions(value) for value in node.values())
+        if isinstance(node, list):
+            return sum(unions(item) for item in node)
+        return 0
+
+    assert unions(OUTPUT_SCHEMA) <= 16
+
+
+def test_blank_evidence_counts_as_no_evidence(tmp_path: Path) -> None:
+    """The schema sends "" (not null) for a missing quote; it must still cap
+    the confidence like missing evidence does."""
+    from app.ai_extraction import UNEVIDENCED_CAP, _read_field
+
+    value, score = _read_field(
+        "supplier", {"value": "Supplier Ltd", "evidence": "", "page": 0, "certainty": "high"}, []
+    )
+    assert value == "Supplier Ltd"
+    assert score <= UNEVIDENCED_CAP

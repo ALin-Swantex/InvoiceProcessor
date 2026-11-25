@@ -266,9 +266,10 @@ extraction.
 Set `ANTHROPIC_API_KEY`. `EXTRACTION_MODEL` (default `claude-opus-5-5`) reads
 every invoice. Optionally set `EXTRACTION_ESCALATION_MODEL` (for example Sonnet
 as the first model and Opus as the escalation model): when the first model has
-difficulty (a required field missing, uncertain or failing a check, or it cannot
-read the document), the stronger model reads the invoice again and its answer is
-used. If the first model was confident about a field and the second reads it
+got something wrong (a required field missing, a value contradicted by a check
+on the document text, or it cannot read the document), the stronger model reads
+the invoice again and its answer is used. A field the first model is merely
+unsure of is not escalated: the invoice goes to Needs Review with its reading. If the first model was confident about a field and the second reads it
 differently, the invoice goes to Needs Review. Escalated invoices cost two model
 calls, and the recorded model shows both (`first -> second`). Tune with
 `EXTRACTION_EFFORT` and `EXTRACTION_ESCALATION_EFFORT`. With no key the application does
