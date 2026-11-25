@@ -4,7 +4,7 @@ deployed database. Add a new numbered file instead (019 onwards)."""
 import hashlib
 import re
 
-from app.postgres_invoices import MIGRATIONS_DIRECTORY
+from app.postgres_migrate import MIGRATIONS_DIRECTORY
 
 FROZEN_MIGRATIONS = {
     "001_authoritative_schema.sql": "5123c3f23ddd528445250b31bfa8c2551cf7c868f857508770f10e347c2acf91",

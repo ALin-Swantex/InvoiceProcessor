@@ -52,7 +52,7 @@ class PostgresAuthStore:
             raise AuthError(f"Unknown role '{user.role}'.")
         token = secrets.token_urlsafe(32)
         now = datetime.now(timezone.utc)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -75,7 +75,7 @@ class PostgresAuthStore:
 
     def save_oauth_flow(self, state: str, flow: dict[str, object]) -> None:
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -89,7 +89,7 @@ class PostgresAuthStore:
                 )
 
     def pop_oauth_flow(self, state: str) -> dict[str, object] | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "DELETE FROM oauth_flows WHERE state = %s "
@@ -105,7 +105,7 @@ class PostgresAuthStore:
         return flow if isinstance(flow, dict) else None
 
     def get_user_by_session(self, token: str) -> User | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -129,7 +129,7 @@ class PostgresAuthStore:
         )
 
     def delete_session(self, token: str) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "DELETE FROM auth_sessions WHERE token_hash = %s",

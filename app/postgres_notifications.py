@@ -28,7 +28,7 @@ class PostgresOutlookNotificationStore:
         change_type: str,
         payload: dict[str, Any],
     ) -> bool:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -51,7 +51,7 @@ class PostgresOutlookNotificationStore:
     def list(self, *, status: str = "pending", limit: int = 100) -> list[QueuedNotification]:
         if limit < 1 or limit > 500:
             raise ValueError("Notification limit must be between 1 and 500.")
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -68,7 +68,7 @@ class PostgresOutlookNotificationStore:
         return [self._notification(row) for row in rows]
 
     def claim_next(self) -> QueuedNotification | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -103,7 +103,7 @@ class PostgresOutlookNotificationStore:
         self._set_status(notification_id, "completed")
 
     def mark_failed(self, notification_id: int, error: str) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -123,7 +123,7 @@ class PostgresOutlookNotificationStore:
     # claimed before this existed fall back to received_at. Mirrors the SQLite
     # store. NOTE: not yet exercised against a live PostgreSQL database.
     def touch_claim(self, notification_id: int) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -144,7 +144,7 @@ class PostgresOutlookNotificationStore:
             "Reclaimed: the worker processing this item stopped responding "
             f"for more than {int(older_than_seconds)} seconds."
         )
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -160,7 +160,7 @@ class PostgresOutlookNotificationStore:
                 return cursor.rowcount
 
     def _set_status(self, notification_id: int, status: str) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "UPDATE outlook_notifications SET status = %s WHERE id = %s",

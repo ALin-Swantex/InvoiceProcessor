@@ -24,7 +24,7 @@ class PostgresWorkerMonitor:
         error: str | None = None,
         details: dict[str, object] | None = None,
     ) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -51,7 +51,7 @@ class PostgresWorkerMonitor:
                 )
 
     def status(self, worker_name: str = "outlook-invoice-worker") -> dict[str, object] | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """

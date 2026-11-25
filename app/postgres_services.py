@@ -24,7 +24,7 @@ class PostgresIrjNumberGenerator:
     def generate(self, company: str | None = None) -> str:
         if company is not None:
             return self._generate_for_company(company)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -48,7 +48,7 @@ class PostgresIrjNumberGenerator:
             self._reserve_for_company(company, irj_number)
             return
         number = int(irj_number)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -64,7 +64,7 @@ class PostgresIrjNumberGenerator:
                 )
 
     def current(self, company: str) -> str | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -80,7 +80,7 @@ class PostgresIrjNumberGenerator:
 
     def set_current(self, company: str, irj_number: str) -> None:
         number = self._validate_number(irj_number)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -93,7 +93,7 @@ class PostgresIrjNumberGenerator:
                 )
 
     def _generate_for_company(self, company: str) -> str:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -117,7 +117,7 @@ class PostgresIrjNumberGenerator:
 
     def _reserve_for_company(self, company: str, irj_number: str) -> None:
         number = self._validate_number(irj_number)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -167,7 +167,7 @@ class PostgresActivityFeedStore:
         message: str,
         invoice_id: int | None = None,
     ) -> ActivityEvent:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -187,7 +187,7 @@ class PostgresActivityFeedStore:
     def list_since(
         self, since_id: int = 0, limit: int = 50
     ) -> list[ActivityEvent]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -207,7 +207,7 @@ class PostgresActivityFeedStore:
     def list_for_invoice(
         self, invoice_id: int, limit: int = 200
     ) -> list[ActivityEvent]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -240,7 +240,7 @@ class PostgresActivityFeedStore:
         A stage that was claimed but never marked sent, and whose claim is older
         than ``stale_after_seconds``, is taken over so the email is not lost.
         """
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -259,7 +259,7 @@ class PostgresActivityFeedStore:
 
     def mark_email_stage_sent(self, invoice_id: int, stage: str) -> None:
         """Record that the claimed email was delivered, so it is never retaken."""
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -271,7 +271,7 @@ class PostgresActivityFeedStore:
                 )
 
     def release_email_stage(self, invoice_id: int, stage: str) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -282,7 +282,7 @@ class PostgresActivityFeedStore:
                 )
 
     def latest_id(self) -> int:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 # Same grace as list_since: the live stream signals an id
                 # only once list_since will return it.

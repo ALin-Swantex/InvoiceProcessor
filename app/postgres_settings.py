@@ -4,13 +4,16 @@ import importlib
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Mapping
+from contextlib import AbstractContextManager
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, unquote, urlparse
 
 
 AAD_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
 LOCAL_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-ConnectionFactory = Callable[[], object]
+# Returns a pooled psycopg connection (rows as dicts), used as a context
+# manager. psycopg is imported lazily, so the type stays structural.
+ConnectionFactory = Callable[[], AbstractContextManager[Any]]
 
 # Pools created by this module, so short-lived commands (migrations, one-off
 # scripts) can close them explicitly instead of hanging on their worker threads.

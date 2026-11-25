@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +13,7 @@ from app.invoices import (
     MetricInvoice,
     _norm,
 )
+from app.postgres_migrate import MIGRATIONS_DIRECTORY, apply_migrations
 from app.postgres_settings import (
     ConnectionFactory,
     PostgresSettings,
@@ -22,7 +22,6 @@ from app.postgres_settings import (
 from app.statuses import Status
 
 
-MIGRATIONS_DIRECTORY = Path(__file__).with_name("postgres_migrations")
 _RECORD_COLUMNS = tuple(InvoiceRecord.__dataclass_fields__)
 _UPDATABLE_COLUMNS = frozenset(_RECORD_COLUMNS) - {"id"}
 _SELECT_COLUMNS = ", ".join(_RECORD_COLUMNS)
@@ -47,43 +46,7 @@ class PostgresInvoiceStore:
             self.initialize_schema()
 
     def initialize_schema(self) -> None:
-        migrations = sorted(self._migrations_directory.glob("*.sql"))
-        if not migrations:
-            raise RuntimeError("No PostgreSQL schema migrations were found.")
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
-            with connection.cursor() as cursor:
-                # Serialize startup so two workers cannot apply the same migration.
-                cursor.execute("SELECT pg_advisory_xact_lock(734921684)")
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS schema_migrations (
-                        version text PRIMARY KEY,
-                        checksum text NOT NULL,
-                        applied_at timestamptz NOT NULL DEFAULT now()
-                    )
-                    """
-                )
-                cursor.execute("SELECT version, checksum FROM schema_migrations")
-                applied = {row["version"]: row["checksum"] for row in cursor.fetchall()}
-                for migration in migrations:
-                    sql = migration.read_text(encoding="utf-8")
-                    normalized_sql = sql.replace("\r\n", "\n").replace("\r", "\n")
-                    checksum = hashlib.sha256(normalized_sql.encode()).hexdigest()
-                    previous = applied.get(migration.name)
-                    if previous and previous != checksum:
-                        raise RuntimeError(
-                            f"Applied migration {migration.name} has changed."
-                        )
-                    if previous:
-                        continue
-                    cursor.execute(sql)
-                    cursor.execute(
-                        """
-                        INSERT INTO schema_migrations (version, checksum)
-                        VALUES (%s, %s)
-                        """,
-                        (migration.name, checksum),
-                    )
+        apply_migrations(self._connection_factory, self._migrations_directory)
 
     def add_from_outlook(
         self,
@@ -122,7 +85,7 @@ class PostgresInvoiceStore:
             sharepoint_item_id,
             sharepoint_web_url,
         )
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -184,7 +147,7 @@ class PostgresInvoiceStore:
 
     def highest_irj_number(self, company: str) -> int | None:
         """The highest all-digit IRJ number assigned to the company, if any."""
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT max(CASE WHEN irj_number ~ '^[0-9]+$' "
@@ -303,7 +266,7 @@ class PostgresInvoiceStore:
         )
 
     def list_for_metrics(self) -> list[MetricInvoice]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"SELECT {', '.join(METRIC_COLUMNS)} FROM invoices "
@@ -313,7 +276,7 @@ class PostgresInvoiceStore:
         return [MetricInvoice(**{c: row[c] for c in METRIC_COLUMNS}) for row in rows]
 
     def get(self, invoice_id: int) -> InvoiceRecord | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"SELECT {_SELECT_COLUMNS} FROM invoices WHERE id = %s",
@@ -325,7 +288,7 @@ class PostgresInvoiceStore:
     def get_by_irj_number(
         self, irj_number: str, company: str | None = None
     ) -> InvoiceRecord | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 if company is None:
                     cursor.execute(
@@ -345,7 +308,7 @@ class PostgresInvoiceStore:
         return self._record(row) if row is not None else None
 
     def get_by_sharepoint_item_id(self, item_id: str) -> InvoiceRecord | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"SELECT {_SELECT_COLUMNS} FROM invoices "
@@ -358,7 +321,7 @@ class PostgresInvoiceStore:
     def get_by_source_attachment(
         self, message_id: str, attachment_id: str
     ) -> InvoiceRecord | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"SELECT {_SELECT_COLUMNS} FROM invoices "
@@ -381,7 +344,7 @@ class PostgresInvoiceStore:
         # Identifiers come only from the static dataclass whitelist; values remain bound.
         assignments = ", ".join(f"{name} = %s" for name in fields)
         parameters = (*fields.values(), invoice_id)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"UPDATE invoices SET {assignments} WHERE id = %s "
@@ -409,7 +372,7 @@ class PostgresInvoiceStore:
 
         assignments = ", ".join(f"{name} = %s" for name in fields)
         parameters = (*fields.values(), invoice_id, expected_status)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"UPDATE invoices SET {assignments} "
@@ -421,7 +384,7 @@ class PostgresInvoiceStore:
         return self._record(row) if row is not None else None
 
     def delete(self, invoice_id: int) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 # The duplicate_of_invoice_id foreign key has no ON DELETE
                 # action, so clear references to this invoice first (same
@@ -442,7 +405,7 @@ class PostgresInvoiceStore:
     def _query_many(
         self, sql: str, parameters: tuple[object, ...]
     ) -> list[InvoiceRecord]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(sql, parameters)
                 rows = cursor.fetchall()

@@ -31,10 +31,19 @@ class _PostgresStore:
             settings
         )
 
+    # Set by stores that delete rows by a WHERE clause.
+    _table: str
+
+    def _delete_many(self, where: str, values: tuple[object, ...]) -> int:
+        with self._connection_factory() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"DELETE FROM {self._table} WHERE {where}", values)
+                return cursor.rowcount
+
 
 class PostgresCompanyStore(_PostgresStore):
     def list(self) -> list[CompanyProfile]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -76,7 +85,7 @@ class PostgresCompanyStore(_PostgresStore):
             address=address,
         )
         try:
-            with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with self._connection_factory() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
@@ -121,7 +130,7 @@ class PostgresCompanyStore(_PostgresStore):
         if not fields:
             return existing
         assignments = ", ".join(f"{key} = %s" for key in fields)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -139,7 +148,7 @@ class PostgresCompanyStore(_PostgresStore):
         return updated
 
     def delete(self, name: str) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 # suppliers.default_company_id has no ON DELETE action; unlink
                 # it first (same transaction). The supplier keeps its other
@@ -160,7 +169,7 @@ class PostgresCompanyStore(_PostgresStore):
 
 class PostgresSupplierStore(_PostgresStore):
     def list(self) -> list[SupplierProfile]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -200,7 +209,7 @@ class PostgresSupplierStore(_PostgresStore):
         )
         company_id = self._company_id(profile.default_company)
         try:
-            with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with self._connection_factory() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
@@ -258,7 +267,7 @@ class PostgresSupplierStore(_PostgresStore):
         if not fields:
             return existing
         assignments = ", ".join(f"{key} = %s" for key in fields)
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -278,7 +287,7 @@ class PostgresSupplierStore(_PostgresStore):
     def _company_id(self, company: str | None) -> int | None:
         if not company:
             return None
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -297,7 +306,7 @@ class PostgresSupplierStore(_PostgresStore):
         existing = self.get(name)
         if existing is None:
             raise KeyError(f"Supplier '{name}' was not found.")
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "DELETE FROM suppliers WHERE lower(name) = lower(%s)",
@@ -325,7 +334,7 @@ class PostgresSupplierStore(_PostgresStore):
         ],
     ) -> None:
         """Persist a parsed workbook in one transaction using pipelined batches."""
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -487,8 +496,10 @@ class PostgresSupplierStore(_PostgresStore):
 
 
 class PostgresApprovalMatrixStore(_PostgresStore):
+    _table = "approval_matrix"
+
     def list(self) -> list[ApprovalMatrixEntry]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -520,7 +531,7 @@ class PostgresApprovalMatrixStore(_PostgresStore):
 
     def create(self, **fields: object) -> ApprovalMatrixEntry:
         try:
-            with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with self._connection_factory() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
@@ -576,7 +587,7 @@ class PostgresApprovalMatrixStore(_PostgresStore):
             return result
         assignments = ", ".join(f"{key} = %s" for key in fields)
         try:
-            with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with self._connection_factory() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         f"UPDATE approval_matrix SET {assignments} WHERE id = %s",
@@ -610,7 +621,7 @@ class PostgresApprovalMatrixStore(_PostgresStore):
         return self._delete_many("lower(company) = lower(%s)", (company,))
 
     def _get_by_id(self, entry_id: int) -> ApprovalMatrixEntry | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -628,16 +639,12 @@ class PostgresApprovalMatrixStore(_PostgresStore):
         if count == 0:
             raise KeyError(f"{label} was not found.")
 
-    def _delete_many(self, where: str, values: tuple[object, ...]) -> int:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
-            with connection.cursor() as cursor:
-                cursor.execute(f"DELETE FROM approval_matrix WHERE {where}", values)
-                return cursor.rowcount
-
 
 class PostgresSupplierTermsStore(_PostgresStore):
+    _table = "supplier_terms"
+
     def list(self) -> list[SupplierTerms]:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -672,7 +679,7 @@ class PostgresSupplierTermsStore(_PostgresStore):
         company = str(fields["company"])
         supplier = str(fields["supplier"])
         account = fields.get("supplier_account_number")
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -744,7 +751,7 @@ class PostgresSupplierTermsStore(_PostgresStore):
             return result
         assignments = ", ".join(f"{key} = %s" for key in fields)
         try:
-            with self._connection_factory() as connection:  # type: ignore[attr-defined]
+            with self._connection_factory() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         f"UPDATE supplier_terms SET {assignments} WHERE id = %s",
@@ -783,7 +790,7 @@ class PostgresSupplierTermsStore(_PostgresStore):
         return self._delete_many("lower(company) = lower(%s)", (company,))
 
     def _get_by_id(self, terms_id: int) -> SupplierTerms | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -796,16 +803,10 @@ class PostgresSupplierTermsStore(_PostgresStore):
                 row = cursor.fetchone()
         return _terms(row) if row else None
 
-    def _delete_many(self, where: str, values: tuple[object, ...]) -> int:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
-            with connection.cursor() as cursor:
-                cursor.execute(f"DELETE FROM supplier_terms WHERE {where}", values)
-                return cursor.rowcount
-
 
 class PostgresProcessConfigurationStore(_PostgresStore):
     def get(self, key: str, default: str | None = None) -> str | None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT value FROM process_configuration WHERE key = %s",
@@ -815,7 +816,7 @@ class PostgresProcessConfigurationStore(_PostgresStore):
         return str(row["value"]) if row else default
 
     def set(self, key: str, value: str) -> None:
-        with self._connection_factory() as connection:  # type: ignore[attr-defined]
+        with self._connection_factory() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
